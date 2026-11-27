@@ -28,7 +28,10 @@ so a category's spots are independent draws from that generator's accepted spots
 design 'independent'): its accuracy estimates the share of that population a player answers best (the `estimand`
 of each category). quiz-2 capped any one best answer at MAX_SHARE of a category (design 'answer_quota'), so its
 generated spots are not an independent sample and its scores are descriptive. The basics have no sampling
-population. Spot ids name the same candidate in every version (`spot_def`).
+population. Spot ids name the same candidate in every version (`spot_def`). They stay internal: since quiz-4 a
+prompt names its spot only by an opaque `prompt_id` (a hash of the id), since the basics' descriptive ids name an
+action ('river-fold-vs-value'). Earlier versions put the id in the prompt; `prompt_leak` lists the spots of such a
+file whose prompt may have leaked the answer, and the judge and the viewer flag those scores.
 
 A player answers each spot in a fresh conversation, through its usual backend, with the game's JSON reply;
 the answer is checked by the engine (`apply`) and must be one of the spot's options, else it is sent back
@@ -66,7 +69,9 @@ from .games import get_game, ranges
 from .games.base import Request
 from .cards import DECK, VALUE, evaluate
 
-VERSION = 'quiz-3'
+VERSION = 'quiz-4'
+OPAQUE_SINCE = 4              # quiz-N with N below this named the descriptive spot id in the prompt
+ANSWER_WORDS = re.compile(r'fold|call|raise|shove|bet|check|all[_ -]?in', re.I)
 SIMS = 40000
 MIN_GAP_BB = 1.0
 MIN_EQUITY_GAP = 0.04
@@ -588,6 +593,41 @@ Reply with only a JSON object (no code fence, no other text):
 {"reasoning": "your brief reasoning", "action": "fold" | "check" | "call" | "raise" | "all_in", "amount": null unless you raise or bet (then the total you bet this street), "say": "", "notes": null}"""
 
 
+def prompt_id(sid) -> str:
+    """The opaque name a prompt gives a spot: nothing in it says what the spot is or what its answer is."""
+    return 'Q-' + hashlib.sha256(f'poker-arena-quiz:{sid}'.encode()).hexdigest()[:8].upper()
+
+
+def _version_number(v) -> int:
+    m = re.fullmatch(r'quiz-(\d+)', str(v or ''))
+    return int(m.group(1)) if m else 0
+
+
+def _id_answer(sid, correct) -> bool:
+    """Whether the action word in a spot id is the spot's best answer."""
+    words = {w.lower().replace('-', '_').replace(' ', '_') for w in ANSWER_WORDS.findall(str(sid))}
+    said = {{'shove': 'all_in', 'allin': 'all_in', 'raise': 'bet', 'bet': 'bet'}.get(w, w) for w in words}
+    best = 'bet' if str(correct).startswith('bet_') else str(correct)
+    return best in said
+
+
+def prompt_leak(doc: dict) -> dict | None:
+    """For a quiz.json of a version before quiz-4 (whose prompts named each spot by its descriptive id), the spots
+    whose id names an action, so the prompt may have leaked the answer: {version, spots, named_answer (those whose
+    id names the best answer itself), about}; None for a quiz-4+ file or when no spot id names an action."""
+    suite = doc.get('suite')
+    version = doc.get('version') or (suite.get('version') if isinstance(suite, dict) else None)
+    if _version_number(version) >= OPAQUE_SINCE:
+        return None
+    spots = [x for x in doc.get('spots') or [] if isinstance(x, dict) and ANSWER_WORDS.search(str(x.get('id')))]
+    if not spots:
+        return None
+    return {'version': version, 'spots': [str(x['id']) for x in spots],
+            'named_answer': [str(x['id']) for x in spots if _id_answer(x['id'], x.get('correct'))],
+            'about': f'from an earlier quiz version ({version or "unversioned"}): its prompts named each spot by a '
+                     f'descriptive id, and these ids name an action, so the prompt may have leaked the answer'}
+
+
 def _option_word(o: str) -> str:
     return {'fold': '"fold"', 'call': '"call"', 'all_in': '"all_in"', 'check': '"check"'}.get(o) or \
         f'a bet of {o.split("_")[1]} ("raise" with "amount": {o.split("_")[1]})'
@@ -595,7 +635,7 @@ def _option_word(o: str) -> str:
 
 def question(spot: dict, ep, hero) -> str:
     opts = ', '.join(_option_word(o) for o in spot['options'][:-1]) + ' or ' + _option_word(spot['options'][-1])
-    lines = [f'Question {spot["id"]}. Stacks were {spot["stack_bb"]} big blinds ({2 * spot["stack_bb"]} chips) each '
+    lines = [f'Question {prompt_id(spot["id"])}. Stacks were {spot["stack_bb"]} big blinds ({2 * spot["stack_bb"]} chips) each '
              f'at the start of the hand.']
     kind = spot['kind']
     if kind == 'shove':
@@ -805,8 +845,8 @@ async def ask(pid: str, spec: dict, definition, seed: int = 0) -> dict:
     option, _ = _executed(ep, hero, action)
     loss = _loss(spot, option, fallback)
     say = str(d.action.get('say') or '') if d.action else ''
-    answer = {'spot': spot['id'], 'spot_sha': spot_sha(spot), 'category': spot['category'],
-              'requested': {'action': d.action.get('action'), 'amount': d.action.get('amount')} if d.action else None,
+    answer = {'spot': spot['id'], 'prompt_id': prompt_id(spot['id']), 'spot_sha': spot_sha(spot),
+              'category': spot['category'], 'requested': {'action': d.action.get('action'), 'amount': d.action.get('amount')} if d.action else None,
               'executed': option, 'action': option, 'correct': not fallback and option == spot['correct'],
               'outcome': 'error' if error else 'fallback' if fallback else 'valid',
               'ev_loss_bb': loss, 'ev_lost_bb': loss, 'say': say, 'fallback': fallback, 'reasoning': d.reasoning,
@@ -909,7 +949,7 @@ async def run_quiz(players: dict, ids: list[str], out, *, limit: int | None = No
             for d in [x for x in suite([c]) if solve(x)['clear_cut']][:limit]]
     path = out / 'quiz.json'
     doc = json.loads(path.read_text()) if path.exists() else {}
-    if doc.get('spots_hash') not in (None, spots_hash()):
+    if doc.get('spots_hash') not in (None, spots_hash()) or doc.get('version') not in (None, VERSION):
         doc = {'replaced': {'version': doc.get('version'), 'spots_hash': doc.get('spots_hash')},
                'superseded': doc.get('superseded', []) + [{k: v for k, v in doc.items() if k != 'superseded'}]}
     counts = {c: sum(s['category'] == c for s in every) for c in CATEGORIES}

@@ -20,7 +20,8 @@ the tool's raw output (`raw`), the CLI session before and after, and every faile
 that may have advanced a CLI's own conversation is followed by a rebuild, so the retry never builds on a
 turn the record lacks. `meta['tool_use']` lists any tool the model ran or tried in its turn (the seat rejects
 such a reply). `meta['audit']` says how far the turn could be checked: 'verified' (the backend's own record of
-the turn was read in full), 'unverified' (a record should exist but couldn't be read: the seat rejects the reply
+the turn was read in full), 'unverified' (a record should exist but couldn't be read, or a line of it couldn't be
+parsed, `audit_reason` says which; the raw lines are kept: the seat rejects the reply
 and asks again, as for tool use; gemini output without tool counts is one) or 'opaque' (this backend never exposes
 one; its protocol says so, and the judge never counts such turns towards a decided result unless the design
 preregistered it). Every reply also says who answered: `observed_models`, every model the backend's own output
@@ -393,6 +394,26 @@ class Backend:
         return out_s
 
 
+UNREADABLE_OUTPUT = 'unreadable output line'
+UNREADABLE_TRANSCRIPT = 'unreadable transcript line'
+
+
+def _unreadable(line) -> bool:
+    """A non-blank line of a JSONL stream that isn't a JSON object."""
+    if not line.strip():
+        return False
+    try:
+        return not isinstance(json.loads(line), dict)
+    except ValueError:
+        return True
+
+
+def _audit_of(parsed) -> dict:
+    """{'audit': 'unverified', 'audit_reason': ...} when a parsed stream had lines that couldn't be read (what they
+    held, a tool call included, is unknown), else {}."""
+    return {'audit': 'unverified', 'audit_reason': UNREADABLE_OUTPUT} if parsed.get('unreadable') else {}
+
+
 def _ids(stdout: str, key: str, types=None) -> str | None:
     """The last `key` in a JSONL stream (optionally only from events of the given types)."""
     found = None
@@ -440,7 +461,7 @@ class ClaudeCLI(Backend):
             raise BackendError(f'claude returned no result: {out.strip()[-1500:]}')
         self.session = p['session'] or self.session
         models = p['models']
-        meta = {'session': self.session, 'observed_model': p['answered'][0] if len(p['answered']) == 1 else None,
+        meta = {'session': self.session, **_audit_of(p), 'observed_model': p['answered'][0] if len(p['answered']) == 1 else None,
                 **({'observed_models': models} if models else {}),
                 **({'answered_by': p['answered']} if p['answered'] else {}),
                 **({'init_model': p['init_model']} if p['init_model'] else {}),
@@ -454,6 +475,7 @@ class ClaudeCLI(Backend):
         empty when no assistant message names one."""
         thinking, result, usage, session, is_error, tools = [], None, {}, None, False, []
         init, answered = None, []
+        unreadable = [line for line in out.splitlines() if _unreadable(line)]
         for line in out.splitlines():
             try:
                 ev = json.loads(line)
@@ -480,14 +502,16 @@ class ClaudeCLI(Backend):
                 session = session or ev['session_id']
         models = sorted(set(answered) | ({init} if init and answered else set()))
         return {'thinking': thinking, 'result': result, 'usage': usage, 'session': session, 'is_error': is_error,
-                'tools': tools, 'init_model': init, 'answered': sorted(set(answered)), 'models': models}
+                'tools': tools, 'init_model': init, 'answered': sorted(set(answered)), 'models': models,
+                'unreadable': unreadable}
 
     @classmethod
     def evidence(cls, raw):
         if not isinstance(raw, dict) or not isinstance(raw.get('stdout'), str):
             return None
         p = cls.parse(raw['stdout'])
-        return {'text': p['result'], 'tools': p['tools'], 'models': p['models'], 'audit': cls.AUDIT}
+        return {'text': p['result'], 'tools': p['tools'], 'models': p['models'],
+                'audit': _audit_of(p).get('audit', cls.AUDIT)}
 
     def _session_from(self, stdout):
         return _ids(stdout, 'session_id')
@@ -547,12 +571,13 @@ class CodexCLI(Backend):
             raise BackendError(f'codex: {p["failed"][:1500]}')
         if not p['messages']:
             raise BackendError(f'codex returned no message: {out.strip()[-1500:]}')
-        meta = {'session': self.session, **({'tool_use': p['tools']} if p['tools'] else {})}
+        meta = {'session': self.session, **_audit_of(p), **({'tool_use': p['tools']} if p['tools'] else {})}
         return Reply(p['messages'][-1], '\n'.join(p['thinking']), p['usage'], meta=meta)
 
     @staticmethod
     def parse(out: str) -> dict:
         messages, thinking, usage, tools, session, failed = [], [], {}, {}, None, None
+        unreadable = [line for line in out.splitlines() if _unreadable(line)]
         for line in out.splitlines():
             try:
                 ev = json.loads(line)
@@ -580,7 +605,7 @@ class CodexCLI(Backend):
             elif t in ('turn.failed', 'error') and failed is None:
                 failed = json.dumps(ev)
         return {'messages': messages, 'thinking': thinking, 'usage': usage, 'tools': list(tools.values()),
-                'session': session, 'failed': failed}
+                'session': session, 'failed': failed, 'unreadable': unreadable}
 
     @classmethod
     def evidence(cls, raw):
@@ -588,7 +613,7 @@ class CodexCLI(Backend):
             return None
         p = cls.parse(raw['stdout'])
         return {'text': p['messages'][-1] if p['messages'] and not p['failed'] else None, 'tools': p['tools'],
-                'models': [], 'audit': cls.AUDIT}
+                'models': [], 'audit': _audit_of(p).get('audit', cls.AUDIT)}
 
     def _session_from(self, stdout):
         return _ids(stdout, 'thread_id', {'thread.started'})
@@ -602,6 +627,7 @@ subagent: false
 ---
 
 """
+UNREADABLE_KEY = 'unreadable_line'
 AGY_DENY = {'permissions': {'deny': ['mcp(*)', 'command(*)', 'read_url(*)', 'execute_url(*)', 'read_file(*)',
                                      'write_file(*)']}}
 
@@ -639,24 +665,40 @@ class AgyCLI(Backend):
         input included; None when the transcript can't be read."""
         path = os.path.join(self.BRAIN, self.session or '', '.system_generated', 'logs', 'transcript.jsonl')
         try:
-            with open(path) as f:
+            with open(path, 'rb') as f:
                 lines = f.read().splitlines()
         except OSError:
             return None
         rows = []
         for line in lines:
-            try:
-                rows.append(json.loads(line))
-            except ValueError:
+            if not line.strip():
                 continue
-        start = max((i for i, r in enumerate(rows) if isinstance(r, dict) and r.get('type') == 'USER_INPUT'),
-                    default=-1)
-        return rows[start:] if start >= 0 else []
+            try:
+                row = json.loads(line)
+            except ValueError:
+                row = None
+            rows.append(row if isinstance(row, dict) else {UNREADABLE_KEY: line.decode('utf-8', 'surrogateescape')})
+        start = max((i for i, r in enumerate(rows) if r.get('type') == 'USER_INPUT'), default=-1)
+        return rows[start:] if start >= 0 else [r for r in rows if UNREADABLE_KEY in r]
+
+    @staticmethod
+    def turn_problem(rows) -> str | None:
+        """Why a turn's transcript rows can't verify it: None when they can."""
+        if rows is None:
+            return 'no readable transcript'
+        if any(not isinstance(r, dict) or UNREADABLE_KEY in r for r in rows):
+            return UNREADABLE_TRANSCRIPT
+        if not (rows and rows[0].get('type') == 'USER_INPUT'):
+            return 'no user input for this turn in the transcript'
+        if not any(r.get('type') == 'PLANNER_RESPONSE' for r in rows[1:]):
+            return 'no response to this turn in the transcript'
+        return None
 
     @staticmethod
     def read_turn(rows) -> tuple:
         """(thinking, models, tool calls, audit) of a turn's transcript rows. audit is 'unverified' when there are
-        none or they hold no response for this turn: then nothing is known about the tools the turn ran."""
+        none, one of them couldn't be read, or they hold no response for this turn: then nothing is known about
+        the tools the turn ran."""
         if rows is None:
             return '', [], [], 'unverified'
         thinking, models, tools, seen = '', [], [], False
@@ -669,7 +711,8 @@ class AgyCLI(Backend):
                     models.append(rec['model'])
                 tools += [{'type': 'tool_call', 'name': c.get('name'), 'input': json.dumps(c.get('args'))[:500]}
                           for c in rec.get('tool_calls') or []]
-        return thinking, sorted(set(models)), tools, 'verified' if started and seen else 'unverified'
+        ok = started and seen and AgyCLI.turn_problem(rows) is None
+        return thinking, sorted(set(models)), tools, 'verified' if ok else 'unverified'
 
     @staticmethod
     def _response(out: str) -> dict | None:
@@ -714,7 +757,8 @@ class AgyCLI(Backend):
         if rows is not None:
             self.last_call['raw']['transcript'] = rows
         thinking, models, tools, audit = self.read_turn(rows)
-        meta = {'session': self.session, 'audit': audit, 'observed_model': models[0] if len(models) == 1 else None,
+        meta = {'session': self.session, 'audit': audit,
+                **({'audit_reason': self.turn_problem(rows)} if audit == 'unverified' else {}), 'observed_model': models[0] if len(models) == 1 else None,
                 **({'observed_models': models} if models else {}), **({'tool_use': tools} if tools else {})}
         return Reply(data.get('response') or '', thinking, data.get('usage') or {}, meta=meta)
 

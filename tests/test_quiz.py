@@ -33,7 +33,8 @@ class Oracle(Backend):
     ANSWER = None
 
     async def _call(self, text):
-        sid = re.findall(r'Question (\S+)\.', text)[-1]
+        qid = re.findall(r'Question (\S+)\.', text)[-1]
+        sid = next(d['id'] for d in quiz.suite() if quiz.prompt_id(d['id']) == qid)
         spot = spot_of(sid)
         act = {'action': 'raise', 'amount': 50} if sid in Oracle.WRONG and 'could not be played' not in text \
             else reply_for(spot['correct'])
@@ -203,7 +204,7 @@ class TestHarderAnswersIndependently(unittest.TestCase):
             s = quiz.solve(d)
             self.assertEqual(ep.to_act, hero)
             text = quiz.question(s, ep, hero)
-            self.assertIn(f'Question {s["id"]}.', text)
+            self.assertIn(f'Question {quiz.prompt_id(s["id"])}.', text)
             self.assertIn(s['villain_range'], text)
             self.assertTrue(text.rstrip().endswith('.') and 'Your options: ' in text)
             if s['kind'] == 'inference':

@@ -248,7 +248,9 @@ policy, `ratings.attestation`, judges games and the quiz alike: attested, unatte
 never; a counted result that involves an unattested player carries `identity_qualified: true` into every
 headline, and `plan --strict-identity` (stored in the registered design) counts none of them), every
 model action has exactly one decision record with its calls, every used reply was audited for tool use (the plain
-`command` backend can't be, so it is never decided unless a design allows it; where decisions are linked to
+`command` backend can't be, so it is never decided unless a design allows it; a turn whose record has a line
+that can't be parsed, in agy's transcript or Claude's and Codex's output streams, is unverified, kept raw, and
+asked again; where decisions are linked to
 their calls and raw output by a decision id, the judge derives each one's audit from those links), each player's
 settings are the same in every match, every duplicate pair checks out and replays, and no deal is beyond the
 bound. Otherwise the pairing stops as **ineligible**, with the reasons.
@@ -434,7 +436,8 @@ registration says so with its reason): nothing in it is decided, and any sample-
     (hatched on the axis): it leaves out how much fresh matches differ. The **decided order** comes first: decided
     ranks in order, then the players whose order is not decided, grouped by the places they share ("Places 3–4: the
     order of these two is not decided", listed by points within). An **Order: By points** control shows everyone by
-    fitted strength instead, labelled descriptive. A numeral is shown only for a decided rank; a group with none is
+    fitted strength instead, labelled descriptive. A numeral is shown only for a decided rank; players whose
+    decided matchups form a cycle are grouped with those results and no numeral; a group with neither is
     titled **Order on points**. The standings and matchups count only verified, committed hands (both plays replayed
     and checked); the style table says which hands it counts. Flags: *identity unresolved*, *model unconfirmed* (the model's tool
     never reported which model answered), *wrong model* or *partly confirmed*. A reference policy is tagged

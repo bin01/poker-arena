@@ -498,7 +498,7 @@
   const byStrength = ps => [...ps].sort((x, y) => (y.strength ?? -1e9) - (x.strength ?? -1e9));
   function standingBlocks(ps) {
     const decided = ps.filter(p => p.rank_kind === 'decided' && p.rank != null).sort((x, y) => x.rank - y.rank);
-    if (!decided.length) return [{ kind: 'points', players: byStrength(ps) }];
+    if (!decided.length && !ps.some(p => (p.rank_cycle || []).length)) return [{ kind: 'points', players: byStrength(ps) }];
     const blocks = [];
     for (const p of decided) {
       const last = blocks[blocks.length - 1];
@@ -508,13 +508,23 @@
     const open = new Map();
     for (const p of ps.filter(x => !decided.includes(x))) {
       const r = Array.isArray(p.rank_range) && p.rank_range.length === 2 && p.rank_range[0] != null ? p.rank_range : null;
-      const k = r ? r.join('-') : 'open';
-      if (!open.has(k)) open.set(k, { kind: 'unresolved', range: r, players: [] });
+      const cyc = (p.rank_cycle || []).length ? [p.player, ...p.rank_cycle].sort().join('|') : null;
+      const k = cyc ? `cycle:${cyc}` : r ? r.join('-') : 'open';
+      if (!open.has(k)) open.set(k, { kind: cyc ? 'cycle' : 'unresolved', range: r, players: [] });
       open.get(k).players.push(p);
     }
     const rest = [...open.values()].sort((x, y) => (x.range ? x.range[0] : 1e9) - (y.range ? y.range[0] : 1e9));
     rest.forEach(b => { b.players = byStrength(b.players); });
     return blocks.concat(rest);
+  }
+
+  // The decided results among the players of a cycle, e.g. [{winner: 'b', loser: 'a'}, ...]: why none is ranked.
+  function cycleResults(members, pairings) {
+    const set = new Set(members);
+    return (pairings || []).filter(x => x.track !== 'adaptation' && set.has(x.a) && set.has(x.b) && countsForLeader(x)
+      && (x.verdict === 'a' || x.verdict === 'b'))
+      .map(x => x.verdict === 'a' ? { winner: x.a, loser: x.b } : { winner: x.b, loser: x.a })
+      .sort((x, y) => members.indexOf(x.winner) - members.indexOf(y.winner) || members.indexOf(x.loser) - members.indexOf(y.loser));
   }
 
   // ---- cohorts: the groups of players who met, named by who is in them and how they played ------------
@@ -623,6 +633,15 @@
     if (s.kind === 'multistreet') return `${at}: ${sit || 'facing a bet'}, river plan known`;
     if (s.kind === 'inference') return `${at}: ${sit || 'facing a bet'}, range from its line`;
     return sit ? `${at}: ${sit}` : at;
+  }
+
+  // A quiz score from an earlier version whose prompts named spots by ids that say an action: {short, long} or null.
+  function leakNote(x) {
+    const L = x && x.prompt_leak;
+    if (!L || !(L.spots || []).length) return null;
+    const n = L.spots.length, k = (L.named_answer || []).length;
+    return { short: `earlier version${L.version ? ` (${L.version})` : ''}: answers may have leaked`,
+      long: `Run with an earlier quiz version${L.version ? ` (${L.version})` : ''}, whose prompts named each spot by a descriptive id. ${plural(n, 'spot')} answered here had an id naming an action${k ? `, ${k} of them the best answer itself` : ''} (${L.spots.join(', ')}), so the prompt may have given the answer away: treat this score as an upper bound.` };
   }
 
   function quizOf(raw) {
@@ -741,7 +760,7 @@
       checked: !c.length || c.some(x => x.status === 'verified') };
   }
 
-  return { STABLE_NOTE, dealSequence, sequenceSwings, sequenceTotals, standingBlocks, cohorts, cohortName, protocolOf, populationOf, testOf, isFallback, provenanceOf, quizOf, firstDifference, bigSwings, IDENTITY, esc, MINUS, signed, plural, trim, approx, nameParts, family, isContract, normalize, verdict, verdictSides, powerLine, correction, actText,
+  return { STABLE_NOTE, dealSequence, sequenceSwings, sequenceTotals, standingBlocks, cycleResults, cohorts, cohortName, protocolOf, populationOf, testOf, isFallback, provenanceOf, leakNote, quizOf, firstDifference, bigSwings, IDENTITY, esc, MINUS, signed, plural, trim, approx, nameParts, family, isContract, normalize, verdict, verdictSides, powerLine, correction, actText,
     isDecided, decidedLeader, driftQualified, countsForLeader, driftWords, officialInterval, ciKind, DESCRIPTIVE_TIP, spotPrompt, spotTitle, handCode, playerId, rateOf, targetEdge, isUnregistered, scenarios, conversationsShort,
     assumptionsOf, ineligible, sourceOf, basisOf, fitOf, identityOf, ASSUME };
 });

@@ -65,8 +65,13 @@ guarantee: a false leader needs at least one false verdict. A verdict whose chec
 (`outside_calibration: 'count'`), and neither does one reached while the edge drifted (`decided_with_drift`,
 below) or, under the design's `strict_identity`, one with an unattested player (`decided_identity_unattested`).
 A leader is a player with a counting decided win over every other player of
-its group; a rank is decided when a player has a counting decided win or loss against every other player of its
-group (and the verdicts form no cycle). A group whose only would-be leader relies on a verdict whose checks
+its group. Ranks come from the graph of counting decided wins: players whose wins form a cycle (a beat b, b beat
+c, c beat a, however long the loop) share a strongly connected component of it, and inside such a component no
+one gets a strict rank or a single place: each gets `rank: null`, `rank_cycle` (the others in it), `rank_note`
+*decided matchups form a cycle* and the range of places the component spans, and the viewer shows the direct
+results instead of numerals. One component is above another only when every pair across them is a counting
+decided win for its side; a rank is decided when a player is alone in its component and so ordered against
+every other player of its group. A group whose only would-be leader relies on a verdict whose checks
 failed has `leader: null` and names it in `leader_outside_calibration`.
 
 Everything else is **descriptive**: strengths and their intervals, the order by points, the group's front
@@ -706,7 +711,11 @@ competence**, never as poker strength. Two things narrow the gap, both reported 
   outcome and loss must be what the replies give), checks that the answer key hashes to the recorded
   `spots_hash` and names each spot's best option, that each spot is answered once, and that every call ran the
   player's recorded CLI file (path, version and sha256). An answer that fails any of it is `unverified`: never
-  correct, worth the worst option. The scores are recounted from the verified answers (`accuracy` over every
+  correct, worth the worst option. A prompt names its spot only by an opaque id (`quiz.prompt_id`, a hash): the
+  descriptive ids (`river-fold-vs-value`) stay internal. Before quiz-4 the prompt carried the descriptive id, and
+  every basics id names an action; the judge labels such a file (`prompt_leak`: the spots, and those whose id
+  names the best answer itself) and each player's score on them, and the viewer flags those scores as from an
+  earlier version whose prompts may have leaked the answer. The scores are recounted from the verified answers (`accuracy` over every
   spot asked, `valid_accuracy` over the answers the player gave, `fallbacks` and `unverified_answers` apart), per
   category, with every headline field from `scored_category` (the basics when asked) and each category with its
   own denominators. `eligibility` is the judge's: `eligible` only when every answer verifies, the provenance is

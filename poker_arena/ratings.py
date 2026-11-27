@@ -2620,6 +2620,60 @@ def _elo(names, comps, games, iters=60):
 
 # The leaderboard.
 
+CYCLE_NOTE = 'decided matchups form a cycle'
+
+
+def _sccs(nodes, edges):
+    """Strongly connected components of the graph `edges` (node -> set of successors), Tarjan's algorithm."""
+    index, low, stack, on, out = {}, {}, [], set(), []
+
+    def visit(v):
+        index[v] = low[v] = len(index)
+        stack.append(v)
+        on.add(v)
+        for w in sorted(edges[v]):
+            if w not in index:
+                visit(w)
+                low[v] = min(low[v], low[w])
+            elif w in on:
+                low[v] = min(low[v], index[w])
+        if low[v] == index[v]:
+            comp = []
+            while True:
+                w = stack.pop()
+                on.discard(w)
+                comp.append(w)
+                if w == v:
+                    break
+            out.append(comp)
+
+    for v in nodes:
+        if v not in index:
+            visit(v)
+    return out
+
+
+def _decided_order(comp, order, result):
+    """{player: (rank, rank_range, undecided_against, cycle)} from the counted decided wins inside one group.
+    Players whose wins form a cycle share a strongly connected component of the win graph and get no strict rank;
+    one component is above another only when every cross pair is a decided win for its side, and a strict rank
+    needs a player alone in its component and ordered against every other player."""
+    wins = {p: {q for q in comp if q != p and result(p, q) == 'win'} for p in comp}
+    sccs = _sccs(comp, wins)
+    of = {p: i for i, c in enumerate(sccs) for p in c}
+    above = lambda i, j: all(b in wins[a] for a in sccs[i] for b in sccs[j])
+    out = {}
+    for p in comp:
+        s = of[p]
+        hi = [q for j, c in enumerate(sccs) if j != s and above(j, s) for q in c]
+        lo = [q for j, c in enumerate(sccs) if j != s and above(s, j) for q in c]
+        rng = [len(hi) + 1, len(comp) - len(lo)]
+        rank = rng[0] if len(comp) > 1 and rng[0] == rng[1] else None
+        cycle = [q for q in order if q != p and of[q] == s]
+        out[p] = (rank, rng, [q for q in order if q != p and q not in hi and q not in lo], cycle)
+    return out
+
+
 def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, plan=None, pooled=False,
          n_pairings=None, notes=(), playing=(), recorded=None, eligibility=None, rejected=(), registration=None) -> dict:
     """The leaderboard from duplicate deals (as `load_deals` gives them). `meta` gives each player's identity,
@@ -2736,18 +2790,7 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
     players, groups, leaders = [], [], []
     for ci, comp in enumerate(comps):
         order = sorted(comp, key=lambda p: -point[idx[p]])
-        decided = {}
-        for p in comp:
-            res = {q: result(p, q) for q in comp if q != p}
-            better = sum(r == 'loss' for r in res.values())
-            worse = sum(r == 'win' for r in res.values())
-            full = len(comp) > 1 and all(r in ('win', 'loss') for r in res.values())
-            decided[p] = (better + 1 if full else None, [better + 1, len(comp) - worse],
-                          [q for q in order if q != p and res[q] not in ('win', 'loss')])
-        ranks = [v[0] for v in decided.values() if v[0]]
-        for p in comp:
-            if decided[p][0] and ranks.count(decided[p][0]) > 1:     # a cycle of verdicts: no strict order
-                decided[p] = (None,) + decided[p][1:]
+        decided = _decided_order(comp, order, result)
         lead = next((p for p in comp if len(comp) > 1 and all(result(p, q) == 'win' for q in comp if q != p)), None)
         mb_lead = next((p for p in comp if len(comp) > 1 and all(model_result(p, q) == 'win' for q in comp if q != p)),
                        None)
@@ -2806,7 +2849,7 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
             q = t_ppf(0.975, df) if sd_boot is not None else 1.96
             elo_basis = 'posterior' if sd_boot is None or sd_boot <= sd else 'bootstrap'
             sd = max(sd, sd_boot or 0.0)
-            rank, rng_, tied = decided[p]
+            rank, rng_, tied, cycle = decided[p]
             direct = [x['edge'] if x['a'] == p else -x['edge'] for x in mine
                       if p in (x['a'], x['b']) and x.get('edge') is not None]
             players.append({
@@ -2818,7 +2861,8 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
                 'strength_ci95': sci, 'df': df,
                 'observed_edge': round(sum(direct) / len(direct), 1) if direct else None,
                 'observed_opponents': len(direct), 'ci_basis': basis, 'ci_kind': CI_FIXED, 'position': pos, 'rank': rank, 'rank_kind': 'decided' if rank else 'descriptive',
-                'rank_range': rng_, 'rank_tied_with': tied, 'in_fit': True,
+                'rank_range': rng_, 'rank_tied_with': tied, 'rank_cycle': cycle,
+                'rank_note': CYCLE_NOTE if cycle else None, 'in_fit': True,
                 'identity_resolved': bool(info(p).get('identity_resolved', identity_resolved(info(p)['identity']))),
                 'net_bb': round(tot[p]['net_bb'], 1), 'hands': 2 * tot[p]['deals'], 'deals': tot[p]['deals'],
                 'session_elo': round(1500 + K * float(elo[i])),
@@ -2852,7 +2896,7 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
             'strength': None, 'strength_kind': STRENGTH_KIND, 'strength_se': None, 'strength_ci95': None, 'df': None,
             'observed_edge': None, 'observed_opponents': 0, 'ci_basis': None,
             'ci_kind': CI_FIXED, 'position': None, 'rank': None, 'rank_kind': 'descriptive', 'rank_range': None, 'rank_tied_with': [],
-            'in_fit': False, 'identity_resolved': bool(info(p).get('identity_resolved', identity_resolved(info(p)['identity']))),
+            'rank_cycle': [], 'rank_note': None, 'in_fit': False, 'identity_resolved': bool(info(p).get('identity_resolved', identity_resolved(info(p)['identity']))),
             'net_bb': round(tot[p]['net_bb'], 1), 'hands': 2 * tot[p]['deals'], 'deals': tot[p]['deals'],
             'session_elo': None, 'session_elo_ci95': None, 'session_elo_basis': None, 'inferential': False,
             'sessions': 0, 'session_w': 0, 'session_t': 0,
@@ -3492,8 +3536,10 @@ def verified_quiz(doc: dict) -> dict:
     """A quiz.json as it should be served: each player's answers re-derived by the judge (`verify_quiz_player`),
     every score recounted from them (the headline fields from `scored_category`, the basics when asked, each
     category with its own denominators), `eligibility` and `attestation` the judge's, never the record's."""
+    from .quiz import prompt_leak
     key, key_problems = _answer_key(doc)
     cats = doc.get('categories') or {}
+    leak = prompt_leak(doc)
     players = {}
     for pid, x in (doc.get('players') or {}).items():
         if not isinstance(x, dict):
@@ -3517,9 +3563,24 @@ def verified_quiz(doc: dict) -> dict:
                                         'identity_match': {'attested': 'match'}.get(v['attestation']['status'],
                                                                                     v['attestation']['status'])},
                         'attestation': v['attestation'], 'identity_match': v['attestation']['status'],
-                        'audit_status': None if not answers else 'verified' if all(a.get('audit') == 'verified' for a in answers) else 'incomplete'}
-    return {**doc, 'players': players, 'verified_by': 'judge',
+                        'audit_status': None if not answers else 'verified' if all(a.get('audit') == 'verified' for a in answers) else 'incomplete',
+                        'prompt_leak': _player_leak(leak, answers)}
+    return {**doc, 'players': players, 'verified_by': 'judge', 'prompt_leak': leak,
             'answer_key': {'status': 'altered' if key_problems else 'intact', 'problems': key_problems}}
+
+
+def _player_leak(leak, answers) -> dict | None:
+    """The spots a player answered whose prompt may have leaked the answer (`quiz.prompt_leak`), by category."""
+    if not leak:
+        return None
+    hit = [a for a in answers if str(a.get('spot')) in leak['spots']]
+    if not hit:
+        return None
+    named = set(leak['named_answer'])
+    return {'version': leak['version'], 'spots': [str(a['spot']) for a in hit],
+            'named_answer': [str(a['spot']) for a in hit if str(a['spot']) in named],
+            'categories': sorted({str(a.get('category')) for a in hit}),
+            'correct_on_named_answer': sum(bool(a.get('correct')) for a in hit if str(a['spot']) in named)}
 
 
 _QUIZ: dict = {}
@@ -3778,6 +3839,10 @@ def table(r, labels=None) -> str:
                          f'{"—" if p.get("observed_edge") is None else format(p["observed_edge"], "+.1f"):>8} '
                          f'{p["net_bb"]:>+8.1f} {p["hands"]:>6}  '
                          f'{elo:>20} {p["session_w"]}-{p["session_t"]}-{p["session_l"]:<3}')
+        cycles = {tuple(sorted([p['player'], *p['rank_cycle']])) for p in r['players']
+                  if p['component'] == g['id'] and p.get('rank_cycle')}
+        for c in sorted(cycles):
+            lines.append(f'{CYCLE_NOTE.capitalize()}: {", ".join(name(p) for p in c)} have no order among them.')
         lines.append(_named(g['headline'], name, g['players']))
     out = [p for p in r['players'] if p['component'] is None]
     if out:

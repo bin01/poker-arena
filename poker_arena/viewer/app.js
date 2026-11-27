@@ -919,13 +919,14 @@ function standings(rt, waiting) {
   shown.forEach((g, k) => {
     const members = g.members.map(p => by[p]).filter(Boolean);
     const blocks = Core.standingBlocks(members);
-    const ranked = blocks.some(b => b.kind === 'decided');
+    const ranked = blocks.some(b => b.kind === 'decided' || b.kind === 'cycle');
     const points = !ranked || state.order === 'points';
     const ax = axisFor(members);
     const range = b => !b.range ? '–' : b.range[0] === b.range[1] ? String(b.range[0]) : `${b.range[0]}–${b.range[1]}`;
     const rows = points
-      ? Core.standingBlocks(members.map(p => ({ ...p, rank_kind: 'descriptive' })))[0].players.map(p => standingRow(rt, g, by[p.player], ax, ranked)).join('')
+      ? Core.standingBlocks(members.map(p => ({ ...p, rank_kind: 'descriptive', rank_cycle: [] })))[0].players.map(p => standingRow(rt, g, by[p.player], ax, ranked)).join('')
       : blocks.map(b => b.kind === 'decided' ? b.players.map(p => standingRow(rt, g, p, ax, true)).join('')
+        : b.kind === 'cycle' ? cycleBlock(rt, g, b, ax)
         : `<div class="unres" role="group" aria-label="Order not decided"><div class="unres-head"><span class="rank prov">${range(b)}</span>
             <span>${b.range ? `Places ${range(b)}: ` : ''}the order of these ${b.players.length === 2 ? 'two' : b.players.length} is <b>not decided</b> · listed by points</span></div>
             ${b.players.map(p => standingRow(rt, g, p, ax, true, true)).join('')}</div>`).join('');
@@ -959,6 +960,15 @@ function standings(rt, waiting) {
       'Left out when its exact model or reasoning level is unknown (its results could mix more than one model), or when it only met players who are left out.');
   }
   return out;
+}
+
+function cycleBlock(rt, g, b, ax) {
+  const names = b.players.map(p => p.player);
+  const results = Core.cycleResults(names, g.pairings || rt.pairings);
+  return `<div class="unres cycle" role="group" aria-label="Decided matchups form a cycle"><div class="unres-head"><span class="rank prov" aria-hidden="true">↻</span>
+      <span><b>Decided matchups form a cycle</b>, so these ${b.players.length === 2 ? 'two' : b.players.length} have no order · listed by points</span></div>
+    ${results.length ? `<div class="cycle-results small soft">${results.map(x => `${plain(x.winner)} beat ${plain(x.loser)}`).join(' · ')}</div>` : ''}
+    ${b.players.map(p => standingRow(rt, g, p, ax, true, true)).join('')}</div>`;
 }
 
 function identityFlag(rt, p) {
@@ -1193,7 +1203,8 @@ const provChip = x => {
   const at = x.attestation && (typeof x.attestation === 'string' ? { status: x.attestation } : x.attestation);
   const att = at && (at.status === 'unattested' || at.status === 'mismatch')
     ? chip(at.status === 'mismatch' ? 'wrong model' : 'unattested', at.status === 'mismatch' ? 'bad' : 'quiet', `${at.meaning || ''}${at.policy ? ` (${at.policy})` : ''}`) : '';
-  return chip(word, tone, tip + (more ? ` (${more})` : '')) + att + linkChip(x);
+  const leak = Core.leakNote(x);
+  return chip(word, tone, tip + (more ? ` (${more})` : '')) + att + (leak ? chip(esc(leak.short), 'warn', leak.long) : '') + linkChip(x);
 };
 // A quiz score of the same model and reasoning level as a tournament player, but not shown to be the same player
 // (settings, code or CLI differ or were not recorded): a separate, model-level assessment, never the player's own.
@@ -1214,7 +1225,9 @@ async function loadQuiz() {
 // on the scored category, and on the harder ones, each with its own denominator.
 const catTitle = (q, c) => (q.category_info[c] && q.category_info[c].title) || catWord(c);
 function scoreText(q, x, quiet = false) {
-  const flag = x.provenance?.status === 'unrecorded' ? '<span class="soft"> (unverified)</span>' : x.provenance?.status === 'ineligible' ? '<span class="neg"> ineligible</span>' : '';
+  const leak = Core.leakNote(x);
+  const flag = (x.provenance?.status === 'unrecorded' ? '<span class="soft"> (unverified)</span>' : x.provenance?.status === 'ineligible' ? '<span class="neg"> ineligible</span>' : '')
+    + (leak ? `<span class="soft" title="${esc(leak.long)}"> (earlier version: answers may have leaked)</span>` : '');
   const head = `${x.correct ?? '–'}/${x.total ?? '–'}${q.scored_category ? ` ${esc(catTitle(q, q.scored_category).toLowerCase())}` : ''}`;
   const more = x.others && x.others.total ? ` · ${x.others.correct}/${x.others.total} harder` : '';
   const sep = modelLevel(x) && !quiet ? `<span class="soft" title="${esc(linkTip(x))}"> (model-level, separate run)</span>` : '';
@@ -1237,7 +1250,8 @@ async function fillQuizTeaser(run) {
 async function renderQuiz(spotId) {
   const q = await loadQuiz();
   const superseded = q.superseded ? `<div class="notice quiz-notice"><span class="suit">♦</span><div><b>Superseded.</b> ${esc(typeof q.superseded === 'string' ? q.superseded : q.superseded.reason || q.superseded.by || 'a newer version of this quiz replaces it')}</div></div>` : '';
-  const fixture = superseded + (q.fixture ? `<div class="notice quiz-notice"><span class="suit">♦</span><div><b>Fixture data.</b> ${esc(q.fixture === true ? 'These answers are made up to show the layout; they are not real model answers.' : q.fixture)}</div></div>` : '');
+  const leaked = q.prompt_leak && (q.prompt_leak.spots || []).length ? `<div class="notice quiz-notice"><span class="suit">♦</span><div><b>Earlier quiz version${q.prompt_leak.version ? ` (${esc(q.prompt_leak.version)})` : ''}.</b> Its prompts named each spot by a descriptive id, and ${plural(q.prompt_leak.spots.length, 'spot')} had an id naming an action${(q.prompt_leak.named_answer || []).length ? ` (${q.prompt_leak.named_answer.length} of them the best answer itself)` : ''}, so those prompts may have leaked the answer: ${q.prompt_leak.spots.map(esc).join(', ')}. Scores on them are flagged; quiz-4 names spots by an opaque id.</div></div>` : '';
+  const fixture = superseded + leaked + (q.fixture ? `<div class="notice quiz-notice"><span class="suit">♦</span><div><b>Fixture data.</b> ${esc(q.fixture === true ? 'These answers are made up to show the layout; they are not real model answers.' : q.fixture)}</div></div>` : '');
   const head = `<div class="page-head"><div><div class="eyebrow">Poker fundamentals</div><h1>${esc(q.suite)}</h1>
       <div class="sub">${plural(q.spots.length, 'spot')} · ${plural(q.players.length, 'player')}${q.version ? ` · version ${esc(q.version)}` : ''}</div></div></div>`;
   const lede = `<p class="lede quiz-lede">Separate from the games: every player answers the same spots, such as calling or folding at a price or

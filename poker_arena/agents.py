@@ -148,7 +148,8 @@ class ModelAgent(Agent):
             calls.append({'prompt': message, 'output': reply.text, 'thinking': reply.thinking, 'usage': reply.usage,
                           'latency': reply.latency, 'attempt': attempt, **reply.meta})
             if reply.meta.get('audit') == 'unverified':
-                error = 'The turn could not be audited (its record of tool use was unreadable); asked again.'
+                why = reply.meta.get('audit_reason') or 'its record of tool use was unreadable'
+                error = f'The turn could not be audited ({why}); asked again.'
                 calls[-1].update(error=error, rejected='unverified')
                 obj = parse_json(reply.text)
                 errors.append({'requested': None if obj is None else
