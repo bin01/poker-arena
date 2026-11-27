@@ -194,6 +194,69 @@ class TestToolUse(OnPath):
         self.assertEqual(cmd.protocol()['tool_policy']['audit']['default'], 'opaque')
 
 
+FAKE_CLAUDE_INIT = r'''#!/usr/bin/env python3
+import json, sys
+sys.stdin.read()
+print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': 'c-1', 'model': 'claude-x-1-20260101'}))
+print(json.dumps({'type': 'assistant', 'message': {'model': 'claude-x-1-20260101', 'content': [{'type': 'text', 'text': 'ok'}]}}))
+print(json.dumps({'type': 'result', 'result': '{"action": "fold"}', 'session_id': 'c-1', 'usage': {}}))
+'''
+
+FAKE_GEMINI = r'''#!/usr/bin/env python3
+import json, os
+mode = os.environ.get('GEMINI_MODE')
+stats = {'models': {'gemini-x': {}}, 'tools': {'totalCalls': 0, 'byName': {}}}
+if mode == 'no-tools':
+    stats = {'models': {'gemini-x': {}}}
+elif mode == 'two-models':
+    stats = {'models': {'gemini-x': {}, 'gemini-y': {}}, 'tools': {'totalCalls': 0, 'byName': {}}}
+print(json.dumps({'response': '{"action": "check"}', 'stats': stats}))
+'''
+
+
+class TestIdentity(OnPath):
+    """Every reply says which model was asked and which (if any) the backend's own output says answered."""
+
+    def test_claude_attests_from_its_init_event(self):
+        self.install('claude', FAKE_CLAUDE_INIT)
+        r = asyncio.run(make_backend('claude', 'SYS', model='claude-x-1', effort='high', retries=0).send('hi'))
+        self.assertEqual({k: r.meta[k] for k in ('requested_model', 'observed_model', 'identity', 'served_model',
+                                                  'requested_effort')},
+                         {'requested_model': 'claude-x-1', 'observed_model': 'claude-x-1-20260101',
+                          'identity': 'attested', 'served_model': 'claude-x-1-20260101', 'requested_effort': 'high'})
+
+    def test_a_claude_reply_that_names_no_model_is_unattested(self):
+        self.install('claude', FAKE_CLAUDE)
+        r = asyncio.run(make_backend('claude', 'SYS', model='claude-x-1', retries=0).send('hi'))
+        self.assertEqual((r.meta['observed_model'], r.meta['identity']), (None, 'unattested'))
+        self.assertNotIn('served_model', r.meta)
+
+    def test_codex_and_command_cannot_attest(self):
+        d = self.install('codex', FAKE_CODEX)
+        os.environ['ARGV_LOG'] = str(d / 'argv.jsonl')
+        self.addCleanup(os.environ.pop, 'ARGV_LOG', None)
+        r = asyncio.run(make_backend('codex', 'SYS', model='gpt-x', retries=0).send('hi'))
+        self.assertEqual((r.meta['requested_model'], r.meta['observed_model'], r.meta['identity']),
+                         ('gpt-x', None, 'unattested'))
+        r = asyncio.run(make_backend('command', 'SYS', command=['cat'], model='m', retries=0).send('hi'))
+        self.assertEqual((r.meta['observed_model'], r.meta['identity'], r.meta['audit']), (None, 'unattested', 'opaque'))
+
+    def test_gemini_tool_stats_and_model(self):
+        self.install('gemini', FAKE_GEMINI)
+        self.addCleanup(os.environ.pop, 'GEMINI_MODE', None)
+        send = lambda: asyncio.run(make_backend('gemini', 'SYS', model='gemini-x', retries=0).send('hi'))
+        r = send()
+        self.assertEqual((r.meta['audit'], r.meta['observed_model'], r.meta['identity']), ('verified', 'gemini-x', 'attested'))
+        os.environ['GEMINI_MODE'] = 'no-tools'
+        r = send()
+        self.assertEqual(r.meta['audit'], 'unverified')                  # no tool counts: nothing is known
+        self.assertNotIn('tool_use', r.meta)
+        os.environ['GEMINI_MODE'] = 'two-models'
+        r = send()
+        self.assertEqual((r.meta['observed_model'], r.meta['observed_models'], r.meta['identity']),
+                         (None, ['gemini-x', 'gemini-y'], 'unattested'))
+
+
 class TestAttempts(unittest.TestCase):
     def test_a_timeout_keeps_what_was_printed(self):
         class Slow(Backend):

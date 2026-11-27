@@ -21,7 +21,11 @@ that may have advanced a CLI's own conversation is followed by a rebuild, so the
 turn the record lacks. `meta['tool_use']` lists any tool the model ran or tried in its turn (the seat rejects
 such a reply). `meta['audit']` says how far the turn could be checked: 'verified' (the backend's own record of
 the turn was read in full), 'unverified' (a record should exist but couldn't be read: the seat rejects the reply
-and asks again, as for tool use) or 'opaque' (this backend never exposes one; its protocol says so). `state()` / `restore()` let a stopped match resume; `rebuild()` starts a CLI conversation over
+and asks again, as for tool use; gemini output without tool counts is one) or 'opaque' (this backend never exposes
+one; its protocol says so, and the judge never counts such turns towards a decided result unless the design
+preregistered it). Every reply also says who answered: `requested_model`, `observed_model` (claude: the init
+event's model; agy: the transcript's; gemini: its stats' only model; openai_compat: the response's; codex and
+command: none) and `identity` ('attested' when the output named a model, else 'unattested'). `state()` / `restore()` let a stopped match resume; `rebuild()` starts a CLI conversation over
 from the turns the match committed, for when the CLI's own conversation may hold turns the record dropped.
 `protocol()` is what a player's results depend on, for its identity across runs.
 """
@@ -211,11 +215,25 @@ class Backend:
                 self.rebuilding = False
             reply.meta = {**meta, **reply.meta}
             reply.meta.setdefault('audit', self.AUDIT)
+            reply.meta.update(self.identity(reply.meta.get('observed_model')))
             self.turns.append([text, reply.text])
             return reply
 
     async def _call(self, text: str) -> Reply:
         raise NotImplementedError
+
+    def identity(self, observed: str | None = None) -> dict:
+        """Who was asked and who answered, for one call: `requested_model` (the configured model, None for the
+        CLI's default), `observed_model` (the model the backend's own output names, None when it names none) and
+        `identity`: 'attested' when the output named a model, else 'unattested' (the configured model is all
+        that is known). Whether the observed model is the requested one is the judge's question."""
+        out = {'requested_model': self.model, 'observed_model': observed or None,
+               'identity': 'attested' if observed else 'unattested'}
+        if getattr(self, 'effort', None) is not None:
+            out['requested_effort'] = self.effort
+        if observed:
+            out['served_model'] = observed
+        return out
 
     # ---- running a CLI -----------------------------------------------------------------------
     def folder(self) -> str:
@@ -329,12 +347,17 @@ class ClaudeCLI(Backend):
             cmd += ['--resume', self.session]
         out = await self.run(cmd + self.extra_args, stdin=text)
         thinking, result, usage, session, is_error, tools = [], None, {}, None, False, []
+        observed, answered = None, []
         for line in out.splitlines():
             try:
                 ev = json.loads(line)
             except ValueError:
                 continue
+            if ev.get('type') == 'system' and ev.get('subtype') == 'init':
+                observed = ev.get('model') or observed
             if ev.get('type') == 'assistant':
+                if (ev.get('message') or {}).get('model'):
+                    answered.append(ev['message']['model'])
                 for block in (ev.get('message') or {}).get('content') or []:
                     if block.get('type') == 'thinking' and block.get('thinking'):
                         thinking.append(block['thinking'])
@@ -350,7 +373,9 @@ class ClaudeCLI(Backend):
         if result is None or is_error:
             raise BackendError(f'claude returned no result: {out.strip()[-1500:]}')
         self.session = session or self.session
-        meta = {'session': self.session, **({'tool_use': tools} if tools else {})}
+        meta = {'session': self.session, 'observed_model': observed or (answered[-1] if answered else None),
+                **({'answered_by': sorted(set(answered))} if answered else {}),
+                **({'tool_use': tools} if tools else {})}
         return Reply(result, '\n'.join(thinking), usage, meta=meta)
 
     def _session_from(self, stdout):
@@ -529,7 +554,7 @@ class AgyCLI(Backend):
             raise BackendError(f'agy {data.get("status")}: {json.dumps(data.get("error") or data)[:1500]}')
         self.session = data.get('conversation_id') or self.session
         thinking, served, tools, audit = self._transcript()
-        meta = {'session': self.session, 'audit': audit, **({'served_model': served} if served else {}),
+        meta = {'session': self.session, 'audit': audit, 'observed_model': served,
                 **({'tool_use': tools} if tools else {})}
         return Reply(data.get('response') or '', thinking, data.get('usage') or {}, meta=meta)
 
@@ -544,7 +569,7 @@ class GeminiCLI(Backend):
     """Gemini CLI in headless mode; the transcript is re-sent every turn (as an argument, so it is capped
     lower than the other stateless backends; the oldest turns go first and the notes carry what matters)."""
     exe = 'gemini'
-    AUDIT_SOURCE = "the tool counts in gemini's JSON stats"
+    AUDIT_SOURCE = "the tool counts in gemini's JSON stats (missing counts: unverified)"
 
     def __init__(self, system, **kw):
         kw.setdefault('max_history_chars', 200_000)
@@ -562,10 +587,17 @@ class GeminiCLI(Backend):
             raise BackendError(f'gemini returned non-JSON output: {out.strip()[-1500:]}')
         if data.get('error'):
             raise BackendError(f'gemini: {json.dumps(data["error"])[:1500]}')
-        by_name = (((data.get('stats') or {}).get('tools') or {}).get('byName')) or {}
+        stats = data.get('stats') if isinstance(data.get('stats'), dict) else {}
+        tool_stats = stats.get('tools')
+        audit = 'verified' if isinstance(tool_stats, dict) and isinstance(tool_stats.get('byName'), dict) else 'unverified'
+        by_name = tool_stats.get('byName') if audit == 'verified' else {}
         tools = [{'type': 'tool_call', 'name': k} for k, v in by_name.items() if (v or {}).get('count', 1)]
-        return Reply(data.get('response') or '', '', data.get('usage') or data.get('stats') or {},
-                     meta={'tool_use': tools} if tools else {})
+        if audit == 'verified' and not tools and (tool_stats.get('totalCalls') or 0) > 0:
+            tools = [{'type': 'tool_call', 'name': 'unnamed tool'}]
+        models = sorted((stats.get('models') or {}) if isinstance(stats.get('models'), dict) else {})
+        meta = {'audit': audit, 'observed_model': models[0] if len(models) == 1 else None,
+                **({'observed_models': models} if len(models) > 1 else {}), **({'tool_use': tools} if tools else {})}
+        return Reply(data.get('response') or '', '', data.get('usage') or stats, meta=meta)
 
 
 class CommandCLI(Backend):
@@ -614,7 +646,7 @@ class OpenAICompat(Backend):
         msg = ((raw.get('choices') or [{}])[0]).get('message') or {}
         tools = [{'type': 'tool_call', 'name': (c.get('function') or {}).get('name')} for c in msg.get('tool_calls') or []]
         return Reply(msg.get('content') or '', msg.get('reasoning') or '', raw.get('usage') or {},
-                     meta={'tool_use': tools} if tools else {})
+                     meta={'observed_model': raw.get('model'), **({'tool_use': tools} if tools else {})})
 
 
 BACKENDS = {'claude': ClaudeCLI, 'codex': CodexCLI, 'agy': AgyCLI, 'gemini': GeminiCLI, 'command': CommandCLI,

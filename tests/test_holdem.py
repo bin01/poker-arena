@@ -154,6 +154,53 @@ class TestEngine(unittest.TestCase):
         self.assertEqual(sum(ep.result['won']), ep.pot)
 
 
+class TestReplayContext(unittest.TestCase):
+    """What the viewer needs to follow a hand live: who acts next, the price, and every seat's made hand."""
+
+    def test_to_act_to_call_pot_odds_and_made_hands(self):
+        G = get_game('holdem')({'hands_per_match': 10})
+        for seed in range(300):
+            n = 2 if seed % 3 else 3
+            rng = random.Random(seed)
+            ep = G.episode(seed % n, seed, [f'P{i}' for i in range(n)])
+            start = ep.events[0]
+            self.assertEqual(start.kind, 'hand_start')
+            self.assertEqual(start.data['to_act'], None if ep.done else ep.to_act)
+            self.assertEqual(start.data['omniscient']['made_hand'],
+                             {i: describe(evaluate(ep.hole[i])) for i in range(n)})
+            while not ep.done:
+                seat, req = ep.to_act, ep.request(ep.to_act)
+                pot, tc = ep.pot, ep.to_call(seat)
+                a = rng.choice(req.legal)
+                act = {'action': a, **({'amount': rng.randint(*req.data['raise_bounds'])} if a == 'raise' else {})}
+                self.assertIsNone(ep.apply(seat, act))
+                last = ep.history[-1]
+                self.assertEqual(last['to_act'], None if ep.done else ep.to_act)
+                self.assertEqual((last['to_call'], last['pot_before']), (tc, pot))
+                self.assertEqual(last['pot_odds'], round(tc / (pot + tc), 4) if tc else None)
+            actions = [e for e in ep.events if e.kind == 'action']
+            self.assertIsNone(actions[-1].data['to_act'] if actions else None)
+            for e in ep.events:
+                if e.kind == 'board':
+                    self.assertEqual(e.data['omniscient']['made_hand'],
+                                     {i: describe(evaluate(ep.hole[i] + e.data['board'])) for i in range(n)})
+                    self.assertNotIn('omniscient', ep.render(e, 0))
+            made = ep.summary()['omniscient']['made_hand']
+            self.assertEqual(list(made), ['preflop', 'flop', 'turn', 'river'][:len(made)])
+
+    def test_a_pair_preflop_and_on_the_flop(self):
+        G = get_game('holdem')({'hands_per_match': 10})
+        ep = G.episode(0, 1, ['A', 'B'])
+        ep.hole = [['As', 'Ad'], ['7c', '2h']]
+        ep.deck_board = ['Ah', '7d', '9s', 'Kc', '3d']
+        ep.made_by_street = {'preflop': ep.made_hands()}
+        ep.apply(0, {'action': 'call'})
+        ep.apply(1, {'action': 'check'})
+        made = ep.summary()['omniscient']['made_hand']
+        self.assertEqual(made['preflop'], {0: 'a pair of aces', 1: 'seven high'})
+        self.assertEqual(made['flop'], {0: 'three aces', 1: 'a pair of sevens'})
+
+
 class TestBotsAndRatings(unittest.TestCase):
     def test_bot_match_and_ratings(self):
         import tempfile

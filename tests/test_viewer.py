@@ -115,7 +115,7 @@ class TestViewerData(unittest.TestCase):
             life = server.lifecycle(self.runs, 'pilot', server.index(self.runs, 'pilot'))
             self.assertEqual(life['status'], 'running')              # from the plan: station-vs-random has not played
             self.assertEqual(life['pairings']['station|random']['status'], 'waiting')
-            self.assertIn(life['pairings']['fake|rule']['status'], ('decided', 'exhausted'))
+            self.assertIn(life['pairings']['fake|rule']['status'], ('decided', 'exhausted', 'ineligible'))
             t.write_text(json.dumps({'status': 'stopped', 'round': 1, 'pairings': {}, 'updated': 1}))
             r = server.runs(self.runs)[0]
             self.assertEqual((r['status'], r['finished']), ('stopped', False))   # the runner's own file wins
@@ -135,6 +135,34 @@ class TestViewerData(unittest.TestCase):
             (root / 'r' / 'decisions.json').write_text(json.dumps({'a__vs__b': [{'verdict': 'b', 'looks_used': 1}]}))
             life = server.lifecycle(root, 'r', ms)
             self.assertEqual((life['status'], life['pairings']['a|b']['status']), ('finished', 'decided'))
+
+    def test_run_audit(self):
+        a = server.audit(self.runs, 'pilot')
+        self.assertEqual(set(a['players']), {'fake'})                  # bots make no calls
+        f = a['players']['fake']
+        self.assertGreater(f['decisions'], 0)
+        self.assertGreaterEqual(f['calls'], f['decisions'])
+        self.assertEqual(sum(f['identity'].values()), f['calls'] - f['backend_failures'])
+        self.assertEqual(f['identity'], {'unattested': f['calls']})    # a command backend never says which model answered
+        self.assertGreater(f['retries'], 0)                            # the stand-in garbles every 7th reply
+        self.assertEqual(a['totals']['decisions'], f['decisions'])
+        self.assertEqual(server.ratings_for(self.runs, 'pilot', boot=20)['run_audit']['totals'], a['totals'])
+
+    def test_identity_of_a_call(self):
+        self.assertEqual(server._identity({'identity': 'unattested', 'served_model': 'x'}, 'x'), 'unattested')
+        self.assertEqual(server._identity({'served_model': 'claude-opus-5-5'}, 'claude-opus-5-5'), 'attested')
+        self.assertEqual(server._identity({'observed_model': 'claude-haiku-5'}, 'claude-opus-5-5'), 'mismatch')
+        self.assertEqual(server._identity({}, 'claude-opus-5-5'), 'unattested')
+
+    def test_lifecycle_ineligible_is_terminal(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d).resolve()
+            (root / 'r').mkdir()
+            (root / 'r' / 'plan.json').write_text(json.dumps({'matchups': [['a', 'b']], 'deals': 10, 'design': {'max_rounds': 3}}))
+            (root / 'r' / 'decisions.json').write_text(json.dumps({'a__vs__b': [{'verdict': 'ineligible', 'looks_used': 1}]}))
+            ms = [{'a': 'a', 'b': 'b', 'started': True, 'finished': True, 'live': False, 'round': 1}]
+            life = server.lifecycle(root, 'r', ms)
+            self.assertEqual((life['status'], life['pairings']['a|b']['status']), ('finished', 'ineligible'))
 
     def test_key_matches_the_app(self):
         self.assertEqual(server.key('pilot/a__vs__b-1/a-first'), 'pilot~2Fa__vs__b-1~2Fa-first')
@@ -194,15 +222,17 @@ class TestHistory(unittest.TestCase):
         self.assertEqual(history.sync(self.runs)['matches'], 0)          # nothing changed: nothing read again
         db = self.runs / history.DB_NAME
         r = history.all_time(db, boot=10, players_file=str(self.players))
-        self.assertEqual({p['player'] for p in r['players']}, {'bot:rule:sims=40', 'bot:station', 'bot:random'})
-        self.assertEqual(sorted(r['ids']['bot:station']), ['station', 'station2'])  # one bot, two ids
+        full = {p['player'].split('@')[0]: p['player'] for p in r['players']}   # an id may carry an implementation suffix
+        self.assertEqual(set(full), {'bot:rule:sims=40', 'bot:station', 'bot:random'})
+        rule, station = full['bot:rule:sims=40'], full['bot:station']
+        self.assertEqual(sorted(r['ids'][station]), ['station', 'station2'])  # one bot, two ids
         self.assertEqual(r['deals'], 30)                                  # the station-vs-station2 deals don't count
         self.assertEqual({x['run']: x['self_play'] for x in r['runs']}, {'one': 0, 'two': 10})
-        pair = next(m for m in r['matchups'] if {m['a'], m['b']} == {'bot:rule:sims=40', 'bot:station'})
+        pair = next(m for m in r['matchups'] if {m['a'], m['b']} == {rule, station})
         self.assertEqual(pair['plays'], 20)                               # pooled across both runs
         self.assertEqual(pair['deals'], 10)                               # the same 10 deals twice: averaged
-        self.assertEqual(r['stats']['bot:station']['hands'], 40)          # as station, then as station2; no self-play
-        self.assertEqual(r['labels']['bot:rule:sims=40'], 'Rule bot')
+        self.assertEqual(r['stats'][station]['hands'], 40)                # as station, then as station2; no self-play
+        self.assertEqual(r['labels'][rule], 'Rule bot')
 
         import shutil
         shutil.rmtree(self.runs / 'two')
@@ -220,7 +250,7 @@ class TestHistory(unittest.TestCase):
         history.sync(self.runs)
         r = history.all_time(self.runs / history.DB_NAME, boot=10)
         self.assertEqual(r['left_out'], [{'run': 'short', 'reason': 'other game settings'}])
-        self.assertNotIn('bot:random', {p['player'] for p in r['players']})
+        self.assertNotIn('bot:random', {p['player'].split('@')[0] for p in r['players']})
         import shutil
         shutil.rmtree(self.runs / 'one')
         self.play('one', [['rule', 'station']], deals=4)                  # the same folder, started over
@@ -248,6 +278,7 @@ class TestNames(unittest.TestCase):
     def test_display_names(self):
         self.assertEqual(server.pretty_model('claude-opus-5-5'), 'Claude Opus 5.5')
         self.assertEqual(server.pretty_model('gpt-6-luna'), 'GPT-6 Luna')
+        self.assertEqual(server.pretty_model('gpt-6.2-sol'), 'GPT-6.2 Sol')
         self.assertEqual(server.pretty_model('gemini-4-neon-high'), 'Gemini 4 Neon High')
         self.assertEqual(server.display_name('x', {'backend': 'codex', 'model': 'gpt-6-luna', 'effort': 'high'}), 'GPT-6 Luna · High')
         self.assertEqual(server.display_name('x', {'backend': 'agy', 'model': 'gemini-4-neon-high', 'effort': 'high'}), 'Gemini 4 Neon · High')
@@ -503,6 +534,99 @@ class TestViewerLogic(unittest.TestCase):
                 {'kind': 'action', 'data': {'seat': 2, 'action': 'fold'}}]
         r = self.run_js(f'const s = PokerTable.steps({json.dumps(hand)}); return [s.n, s.steps[1].seats.map(x => [x.stack, x.folded])];')
         self.assertEqual(r, [3, [[99, False], [118, False], [80, True]]])
+
+
+    def test_assumptions_beside_every_verdict(self):
+        r = self.run_js('const d = {calibration: {conversation_effect_share: 0.5}}; const p = {a: "a", b: "b", edge: 50, verdict: "a", looks_used: 2, looks_planned: 6};'
+                        ' const out = Core.normalize({design: d, pairings: [{...p, conversation_share: 0.62}, {...p, conversation_share: 0.2},'
+                        '   {...p}, {...p, conversation_share: 0.9, assumptions: {status: "supported", checks: {conversation_share: {value: 0.9, limit: 1}}}}]}).pairings;'
+                        ' return out.map(x => [x.assumption.status, Core.verdict(x).long, Core.verdict(x).qualifier, Core.verdict(x).decided]);')
+        self.assertEqual([x[0] for x in r], ['unsupported', 'supported', 'unknown', 'supported'])
+        self.assertIn('not established', r[0][1])
+        self.assertEqual(r[0][2], 'outside calibrated range')
+        self.assertIn('which the data support', r[1][1])
+        self.assertIn('not checked', r[2][1])
+        for x in r:
+            self.assertTrue(x[3])
+            self.assertNotIn('5%', x[1])                            # never an error bound without its assumptions
+
+    def test_unsupported_win_never_makes_a_decided_leader(self):
+        r = self.run_js(f'const c = {json.dumps(CONTRACT)}; c.design = {{calibration: {{conversation_effect_share: 0.5}}}};'
+                        ' c.pairings[0].conversation_share = 0.7; const g = Core.normalize(c).groups[0];'
+                        ' c.pairings[0].conversation_share = 0.1; const h = Core.normalize(c).groups[0];'
+                        ' c.groups = [{id: 0, players: ["a", "b"], leader: null, leader_outside_calibration: "a"}]; const k = Core.normalize(c).groups[0];'
+                        ' return [g.leader, g.qualified_leader, g.leader_assumption, h.leader, h.leader_assumption, k.leader, k.qualified_leader];')
+        self.assertEqual(r, [None, 'a', 'unsupported', 'a', 'supported', None, 'a'])
+
+    def test_ineligible_and_provenance(self):
+        r = self.run_js('const p = {a: "a", b: "b", edge: 30};'
+                        ' return [Core.verdict({...p, verdict: "ineligible", ineligible_reasons: ["identity unattested"]}),'
+                        ' Core.verdict({...p, verdict: "a", eligible: false}).short,'
+                        ' Core.sourceOf({...p, verdict: "a", official: true, judge: "abcdef123456"}),'
+                        ' Core.sourceOf({...p, verdict: "a", retrospective: true}).kind,'
+                        ' Core.sourceOf({...p, verdict: "open", recorded_verdict: "a"}), Core.sourceOf({...p, verdict: "a", recorded_verdict: "a"})];')
+        self.assertEqual((r[0]['short'], r[0]['decided'], r[0]['tone']), ('Ineligible', False, 'bad'))
+        self.assertIn('identity unattested', r[0]['long'])
+        self.assertEqual(r[1], 'Ineligible')
+        self.assertEqual(r[2]['kind'], 'official')
+        self.assertIn('abcdef12', r[2]['text'])
+        self.assertEqual(r[3], 'retrospective')
+        self.assertEqual(r[4]['kind'], 'retrospective')
+        self.assertIn('a wins', r[4]['text'])
+        self.assertIsNone(r[5])
+
+    def test_interval_basis_and_fit(self):
+        r = self.run_js('const by = {a: {strength: 300, component: 0}, b: {strength: -200, component: 0}};'
+                        ' return [Core.basisOf({ci_basis: "blocks"}).short, Core.basisOf({basis: "conversations"}).key, Core.basisOf({}),'
+                        ' Core.fitOf({a: "a", b: "b", edge: 270, ci95: [210, 330]}, by), Core.fitOf({a: "a", b: "b", edge: 480, ci95: [100, 860]}, by),'
+                        ' Core.fitOf({a: "a", b: "b", edge: 480, fitted_edge: 500, residual: -20, additivity: {warning: true}}, by)];')
+        self.assertEqual(r[0], 'within conversations')
+        self.assertEqual(r[1], 'across')
+        self.assertIsNone(r[2])
+        self.assertEqual(r[3], {'fitted': 500, 'residual': -230, 'warn': True, 'estimated': True})
+        self.assertFalse(r[4]['warn'])
+        self.assertEqual(r[5], {'fitted': 500, 'residual': -20, 'warn': True, 'estimated': False})
+
+    def test_identity_and_names(self):
+        r = self.run_js('return [Core.identityOf({attestation: "unattested"}), Core.identityOf(null, {identity: {attested: 3}}),'
+                        ' Core.identityOf(null, {identity: {attested: 3, unattested: 1}}), Core.identityOf(null, {identity: {attested: 3, mismatch: 1}}),'
+                        ' Core.identityOf(null, {}), Core.identityOf(null, {identity: "unattested"}), Core.nameParts("Claude Sonnet · Default effort (protocol not recorded, 5 hands)"), Core.nameParts("Rule bot")];')
+        self.assertEqual(r[:6], ['unattested', 'attested', 'partly attested', 'mismatch', None, 'unattested'])
+        self.assertEqual(r[6], ['Claude Sonnet', 'Default effort', 'protocol not recorded, 5 hands'])
+        self.assertEqual(r[7], ['Rule bot', '', ''])
+
+    def test_table_context(self):
+        r = self.run_js(f'const s = PokerTable.steps({json.dumps(HAND)}); return [s.steps.map(x => [x.toCall, x.potOdds && Math.round(x.potOdds * 100)]),'
+                        ' s.log.filter(e => e.kind === "action").map(e => e.facing && [e.facing.toCall, e.facing.pot]), s.steps[3].seats.map(x => x.made)];')
+        calls, facing, made = r
+        self.assertEqual(calls[0], [1, 25])          # the button owes 1 into a pot of 3: a call needs 1 / (3 + 1)
+        self.assertEqual(calls[1], [4, 33])          # the big blind owes 4 to call the raise to 6, into 8
+        self.assertEqual(calls[3], [0, None])        # the flop opens: a check is free
+        self.assertEqual(facing, [[1, 3], [4, 8], None, None, [8, 20]])
+        self.assertEqual(made, ['a pair of aces', 'ace high'])   # the board's ace
+
+    def test_table_uses_recorded_context(self):
+        hand = [dict(e, data=dict(e['data'])) for e in HAND]
+        hand[0]['data']['to_act'] = 0
+        hand[0]['data']['omniscient'] = {'made_hand': {'0': 'ace high (recorded)', '1': 'seven high'}}
+        hand[4]['data'].update(to_act=1, to_call=1, pot_before=3, pot_odds=0.25)
+        hand[6]['data'].update(to_act=1)                  # after the call: the flop's first actor, before the flop is dealt
+        hand[7]['data']['omniscient'] = {'made_hand': {'0': 'a pair of aces (recorded)', '1': 'seven high'}}
+        hand[11]['data'].update(to_act=None)
+        r = self.run_js(f'const s = PokerTable.steps({json.dumps(hand)}); return [s.steps.map(x => x.toAct), s.log[1].facing,'
+                        ' s.steps[0].seats[0].made, s.steps[3].seats[0].made];')
+        self.assertEqual(r[0], [0, 1, 1, 1, 0, 1, None, None])
+        self.assertEqual(r[1], {'toCall': 1, 'pot': 3, 'odds': 0.25})
+        self.assertEqual(r[2:], ['ace high (recorded)', 'a pair of aces (recorded)'])
+
+    def test_made_hands(self):
+        r = self.run_js('const m = PokerTable.madeHand; return [m(["Ah", "Kh"], ["Qh", "Jh", "Th"]), m(["6s", "6d"], ["6c", "2h", "2d"]),'
+                        ' m(["As", "2d"], ["3c", "4h", "5d"]), m(["9s", "9d"], []), m(["Ks", "Kd"], ["Kc", "Qh", "Qd", "Qs"]),'
+                        ' m(["Ah", "2h"], ["9h", "7h", "Kh", "Qc"]), m(["7c", "7d"], ["2c", "2s", "9h"]),'
+                        ' PokerTable.drawOf(["Ah", "2h"], ["Kh", "7h", "9c"]), PokerTable.drawOf(["8c", "9d"], ["Ts", "Jh", "2c"]), PokerTable.drawOf(["8c", "9d"], ["Ts", "Jh", "2c", "3d", "4s"])];')
+        self.assertEqual(r, ['a royal flush', 'a full house, sixes full of twos', 'a straight, five high', 'a pair of nines',
+                             'a full house, kings full of queens', 'a flush, ace high', 'two pair, sevens and twos',
+                             'flush draw', 'straight draw', ''])
 
 
 class TestEffort(unittest.TestCase):

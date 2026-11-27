@@ -7,16 +7,23 @@ sync) and never removes anything, so a run whose folder is deleted keeps its pla
 The all-time leaderboard rates a player by what it is, not by its id in one run's players.toml: its model,
 reasoning level and protocol (`claude:claude-sonnet-5-5:high#1a2b3c4d`, the protocol being the fingerprint of
 every setting that changes play, as the runner records it, the match horizon and memory resets included), or
-its bot and settings (`bot:rule:sims=200`). Only identical protocols pool: the same model with other
-instructions, isolation, tool policy, retry policy or conversation length is another player, and so is a
-player from before protocols were recorded. A model whose recorded protocol predates the horizon carries it
+its bot and settings (`bot:rule:sims=200`), and the implementation that played it (`@5e6f7a8b`: the code that
+plays, i.e. the engine, agents, backends, runner and prompt template, not the judge, and for a model the
+version of its CLI). Only identical protocols and implementations pool: the same model with other
+instructions, isolation, tool policy, retry policy or conversation length is another player, and so is one
+played by other parsing, correction or tool-detection code or another CLI version, and a player from before
+protocols were recorded. An explicit equivalence list (`equivalences.json` beside the database:
+{"implementations": [["5e6f7a8b", "9a0b1c2d", ...], ...], "reason": "..."}) merges implementations shown to
+play identically; each group pools under its first member, and the all-time output lists what was merged. A model whose recorded protocol predates the horizon carries it
 in its identity instead (`...#1a2b3c4d~h50`: 50 hands per conversation, memory reset at every match), so
 conversations of different lengths never pool. A player whose model was
 not recorded, or only as a bare alias (`sonnet`), and a player for whom a different model answered than the
 one configured (in that run), is quarantined: listed, but left out of the all-time fit. Only deals played
 under the same game settings pool (blinds and stacks change what bb/100 means); runs under other settings
 are listed as left out. The same pair often replays the same deal in several runs: each deal row keeps its
-seed and fingerprint, and the rating averages repeats into one observation.
+seed and fingerprint, and the rating averages repeats into one observation. A duplicate pair is counted only
+if its b-first play is its a-first play with the seats swapped (ratings.check_pair); the rest are kept in the
+`rejected` table and listed.
 
 All-time standings are descriptive only. Runs had different designs and stopped pairings at different
 times, so pooling them is not any run's preregistered test: no all-time verdict, rank or leader is decided.
@@ -28,6 +35,7 @@ Tables:
     deals     every duplicate deal both of whose plays have finished: a's net chips over the two hands, its seed
               and fingerprint (ratings.fingerprint)
     tallies   per match and player, the raw style counts that stats.summarize turns into rates
+    rejected  duplicate pairs (or single deals of them) that failed validation, with the reason
 """
 from __future__ import annotations
 import hashlib
@@ -40,7 +48,7 @@ from pathlib import Path
 
 from .stats import add, summarize, tally
 
-SCHEMA = 4
+SCHEMA = 5
 DB_NAME = 'arena.db'
 ALL = '*'   # the run name the viewer uses for the all-time leaderboard
 
@@ -58,21 +66,54 @@ CREATE TABLE IF NOT EXISTS deals (
     net_a INTEGER, bb INTEGER, game_key TEXT, seed INTEGER, fp TEXT, PRIMARY KEY (run, matchup, deal));
 CREATE TABLE IF NOT EXISTS tallies (
     match_id TEXT, pid TEXT, identity TEXT, counts TEXT, served TEXT, PRIMARY KEY (match_id, pid));
+CREATE TABLE IF NOT EXISTS rejected (
+    run TEXT, matchup TEXT, deal INTEGER, reason TEXT, PRIMARY KEY (run, matchup, deal));
 """
 
 
-def identity(pid: str, spec: dict, protocol: str | None = None, horizon: int | None = None) -> str:
+def identity(pid: str, spec: dict, protocol: str | None = None, horizon: int | None = None,
+             implementation: str | None = None) -> str:
     """What a player is, whatever its id: backend, model, reasoning level and the first 8 characters of its
     protocol fingerprint when one was recorded, plus `~h<hands>` (`horizon`: hands per conversation) when that
-    protocol does not include the match horizon; or bot and settings."""
+    protocol does not include the match horizon; or bot and settings. Then `@<implementation>` when the match
+    recorded the implementation that played (see `implementation_tag`)."""
+    impl = f'@{implementation}' if implementation else ''
     if 'bot' in spec:
         extra = ''.join(f':{k}={spec[k]}' for k in sorted(spec) if k not in ('bot', 'label'))
-        return f'bot:{spec["bot"]}{extra}'
+        return f'bot:{spec["bot"]}{extra}{impl}'
     backend = spec.get('backend', 'unknown')
-    tag = (f'#{protocol[:8]}' if protocol else '') + (f'~h{horizon}' if horizon else '')
+    tag = (f'#{protocol[:8]}' if protocol else '') + (f'~h{horizon}' if horizon else '') + impl
     if spec.get('model'):
         return f'{backend}:{spec["model"]}:{spec.get("effort") or "default"}{tag}'
     return f'{backend}:{pid}{tag}'   # a CLI or command without a model setting: only its id says what it is
+
+
+def implementation_tag(cfg: dict, pid: str) -> str | None:
+    """The first 8 characters of the hash of what played `pid` in a match: the content hashes of the code that
+    plays (every recorded implementation file but the judge, ratings.py), the prompt template, and for a model
+    the version of its CLI. The implementation in force is the last accepted code change, if any. None when the
+    match recorded no implementation."""
+    changes = cfg.get('implementation_changes') or []
+    impl = (changes[-1].get('to') if changes else None) or cfg.get('implementation')
+    if not isinstance(impl, dict) or not impl.get('files'):
+        return None
+    files = {k: v for k, v in impl['files'].items() if not k.endswith('/ratings.py')}
+    spec = (cfg.get('specs') or {}).get(pid) or {}
+    cli = None
+    if 'bot' not in spec:
+        players, eff = cfg.get('players') or [], cfg.get('effective') or []
+        seat = players.index(pid) if pid in players else None
+        exe = (eff[seat] or {}).get('exe') if seat is not None and seat < len(eff) else None
+        cli = (cfg.get('cli_versions') or {}).get(exe) if exe else None
+    key = {'files': files, 'prompt_template': impl.get('prompt_template'), 'cli': cli}
+    return hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:8]
+
+
+def match_identity(cfg: dict, pid: str) -> str:
+    """A player's identity in one match config."""
+    from .ratings import protocol_of
+    return identity(pid, (cfg.get('specs') or {}).get(pid, {}), protocol_of(cfg, pid), legacy_horizon(cfg, pid),
+                    implementation_tag(cfg, pid))
 
 
 def legacy_horizon(cfg: dict, pid: str) -> int | None:
@@ -100,7 +141,7 @@ def connect(db) -> sqlite3.Connection:
             con.execute('ALTER TABLE deals ADD COLUMN fp TEXT')
             con.execute("UPDATE matches SET stamp = ''")
     row = con.execute("SELECT v FROM meta WHERE k = 'schema'").fetchone()
-    if row and int(row[0]) < 4:   # schemas 2-3: identities gain the protocol and horizon: read every folder again
+    if row and int(row[0]) < 5:   # schemas 2-4: identities gain the protocol, horizon and implementation: read again
         with con:
             con.execute("UPDATE matches SET stamp = ''")
     with con:
@@ -143,7 +184,6 @@ def _run_of(root: Path, mdir: Path) -> str:
 
 def sync(root, db=None) -> dict:
     """Bring the database up to date with every match under root. Returns counts of what changed."""
-    from .ratings import protocol_of
     from .server import display_name
     root = Path(root).resolve()
     con = connect(db or root / DB_NAME)
@@ -170,7 +210,7 @@ def sync(root, db=None) -> dict:
                 con.execute('DELETE FROM tallies WHERE match_id = ?', (mid,))
                 con.execute('DELETE FROM deals WHERE run = ? AND matchup = ?', (run, mdir.name))
             pids, specs = cfg.get('players', []), cfg.get('specs', {})
-            ids = [identity(p, specs.get(p, {}), protocol_of(cfg, p), legacy_horizon(cfg, p)) for p in pids]
+            ids = [match_identity(cfg, p) for p in pids]
             hands = _lines(_read(d / 'hands.jsonl'))
             gk = game_key(cfg.get('game', {}))
             con.execute('INSERT OR REPLACE INTO matches VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', (
@@ -195,7 +235,8 @@ def sync(root, db=None) -> dict:
 
 
 def _sync_deals(con, mdir: Path, run: str, gk) -> int:
-    """The duplicate deals of one matchup that both plays have finished (a is seat 0 of a-first)."""
+    """The duplicate deals of one matchup that both plays have finished and that pass ratings.check_pair
+    (a is seat 0 of a-first); what fails is kept in `rejected` (deal -1: the whole conversation)."""
     a_dir, b_dir = mdir / 'a-first', mdir / 'b-first'
     if not (a_dir / 'config.json').exists() or not (b_dir / 'config.json').exists():
         return 0
@@ -203,18 +244,26 @@ def _sync_deals(con, mdir: Path, run: str, gk) -> int:
         cfg = json.loads(_read(a_dir / 'config.json'))
     except ValueError:
         return 0
-    from .ratings import fingerprint, protocol_of
+    try:
+        cb = json.loads(_read(b_dir / 'config.json'))
+    except ValueError:
+        cb = None
+    from .ratings import check_pair, fingerprint
     players = cfg.get('players') or ['?', '?']
     a, b = players[:2]
-    specs = cfg.get('specs', {})
-    ids = [identity(p, specs.get(p, {}), protocol_of(cfg, p), legacy_horizon(cfg, p)) for p in (a, b)]
+    ids = [match_identity(cfg, p) for p in (a, b)]
     game = cfg.get('game', {})
     bb = game.get('big_unit') or game.get('bb') or 1
     seeds = cfg.get('seeds', [])
     ha = {h['hand']: h for h in _lines(_read(a_dir / 'hands.jsonl')) if 'hand' in h}
     hb = {h['hand']: h for h in _lines(_read(b_dir / 'hands.jsonl')) if 'hand' in h}
+    good, rejected = check_pair(cfg, cb, ha, hb)
+    con.execute('DELETE FROM deals WHERE run = ? AND matchup = ?', (run, mdir.name))
+    con.execute('DELETE FROM rejected WHERE run = ? AND matchup = ?', (run, mdir.name))
+    con.executemany('INSERT OR REPLACE INTO rejected VALUES (?,?,?,?)',
+                    [(run, mdir.name, -1 if x['hand'] is None else x['hand'], x['reason']) for x in rejected])
     rows = []
-    for k in sorted(set(ha) & set(hb)):
+    for k in good:
         seed = seeds[k] if k < len(seeds) else None
         rows.append((run, mdir.name, k, a, b, ids[0], ids[1], ha[k]['net'][0] + hb[k]['net'][1], bb, gk, seed,
                      fingerprint(game, seed, k % len(players))))
@@ -233,13 +282,34 @@ def current_labels(players_file='players.toml') -> dict:
 
 
 def _base(ident: str) -> str:
-    return re.split(r'[#~!]', ident, maxsplit=1)[0]
+    return re.split(r'[#~!@]', ident, maxsplit=1)[0]
 
 
-def all_time(db, boot=200, players_file='players.toml', seed=0) -> dict:
-    """The leaderboard over every run in the database, one player per model, reasoning level and protocol.
-    Descriptive only: no verdict, rank or leader here is a test result."""
+def load_equivalences(path) -> dict:
+    """{implementation tag: the tag it pools under} from an equivalences.json ({"implementations": [[tag, ...],
+    ...]}); empty when there is none."""
+    try:
+        doc = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for group in doc.get('implementations') or []:
+        tags = [str(t)[:8] for t in group if t]
+        for t in tags[1:]:
+            out[t] = tags[0]
+    return out
+
+
+def _canon(ident: str, eq: dict) -> str:
+    return re.sub(r'@([0-9a-f]{8})', lambda m: '@' + eq.get(m.group(1), m.group(1)), ident)
+
+
+def all_time(db, boot=200, players_file='players.toml', seed=0, equivalences=None) -> dict:
+    """The leaderboard over every run in the database, one player per model, reasoning level, protocol and
+    implementation (`equivalences`: {tag: tag it pools under}, by default from equivalences.json beside the
+    database). Descriptive only: no verdict, rank or leader here is a test result."""
     from .ratings import quarantine_reason, identity_resolved, rate, served_mismatch
+    eq = load_equivalences(Path(db).parent / 'equivalences.json') if equivalences is None else dict(equivalences)
     con = connect(db)
     rows = con.execute('SELECT run, matchup, deal, a_identity, b_identity, net_a, bb, game_key, fp, seed FROM deals').fetchall()
     matches = con.execute('SELECT run, game_key, code_version, started, hands_done, finished, identities '
@@ -247,7 +317,14 @@ def all_time(db, boot=200, players_file='players.toml', seed=0) -> dict:
     people = con.execute('SELECT run, pid, identity, label, kind, spec FROM players').fetchall()
     tallies = con.execute('SELECT m.run, t.identity, t.counts, t.served, m.game_key, m.identities, m.players FROM tallies t '
                           'JOIN matches m ON m.id = t.match_id').fetchall()
+    rejected = [{'run': run, 'matchup': mu, 'hand': None if k < 0 else k, 'reason': why}
+                for run, mu, k, why in con.execute('SELECT run, matchup, deal, reason FROM rejected ORDER BY run, matchup, deal')]
     con.close()
+    rows = [(run, mu, k, _canon(a, eq), _canon(b, eq), *rest) for run, mu, k, a, b, *rest in rows]
+    matches = [(*m[:6], json.dumps([_canon(i, eq) for i in json.loads(m[6] or '[]')])) for m in matches]
+    people = [(run, pid, _canon(ident, eq), *rest) for run, pid, ident, *rest in people]
+    tallies = [(run, _canon(ident, eq), c, sv, gk, json.dumps([_canon(i, eq) for i in json.loads(idents or '[]')]), pl)
+               for run, ident, c, sv, gk, idents, pl in tallies]
 
     # a model that answered for a player in a run, other than the one configured: that run's deals of it are
     # quarantined under their own identity
@@ -317,7 +394,17 @@ def all_time(db, boot=200, players_file='players.toml', seed=0) -> dict:
     if any('#' not in i for i, m in meta.items() if m['kind'] == 'model'):
         notes.append('Players from runs before protocols were recorded are kept apart from later runs of the same '
                      'model and level (their settings cannot be compared).')
-    r = rate(deals, boot=boot, seed=seed, meta=meta, pooled=True, notes=notes, playing=playing)
+    if len({re.sub(r'@[0-9a-f]{8}', '', i) for i in meta}) < len(meta):
+        notes.append('Some models appear more than once because they were played by different implementations '
+                     '(code that plays, or CLI versions); they pool only where an equivalence list says those '
+                     'implementations play identically.')
+    if eq:
+        notes.append('Pooled as equivalent implementations (equivalences.json): '
+                     + '; '.join(f'{k} as {v}' for k, v in sorted(eq.items())) + '.')
+    if rejected:
+        notes.append(f'{len(rejected)} duplicate pair{"s" if len(rejected) != 1 else ""} failed validation (b-first is '
+                     f'not a-first with the seats swapped on the same deals) and were left out.')
+    r = rate(deals, boot=boot, seed=seed, meta=meta, pooled=True, notes=notes, playing=playing, rejected=rejected)
 
     stats, servedp = defaultdict(dict), defaultdict(set)
     for run, ident, counts, sv, gk, seats, pl in tallies:
@@ -342,6 +429,7 @@ def all_time(db, boot=200, players_file='players.toml', seed=0) -> dict:
     from .stats import LABELS, POSITIONS
     r.update({
         'all_time': True, 'labels': labels, 'kinds': kinds, 'stat_labels': LABELS, 'position_labels': POSITIONS,
+        'equivalences': eq,
         'ids': {i: sorted(p) for i, p in pids.items()},
         'game': json.loads(main) if main else None,
         'runs': sorted(({'run': run, 'deals': x['deals'], 'self_play': x['self_play'], 'started': x['started'],
@@ -380,12 +468,16 @@ def _disambiguate(labels: dict):
         h = re.search(r'~h(\d+)', ident)
         h = f', {h.group(1)} hands per conversation' if h else ''
         return (f'protocol {ident.split("#", 1)[1][:8]}' if '#' in ident else 'protocol not recorded') + h
+
+    def implementation(ident):
+        m = re.search(r'@([0-9a-f]{8})', ident)
+        return f'implementation {m.group(1)}' if m else 'implementation not recorded'
     by = defaultdict(list)
     for ident, lab in labels.items():
         by[lab].append(ident)
     for lab, idents in by.items():
         if len(idents) > 1:
-            for tell in (backend, protocol, lambda i: i):
+            for tell in (backend, protocol, implementation, lambda i: i):
                 if len({tell(i) for i in idents}) == len(idents):
                     break
             for ident in idents:

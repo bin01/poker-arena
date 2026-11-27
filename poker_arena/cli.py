@@ -48,8 +48,11 @@ def cmd_plan(args):
         n = len(plan['matchups'])
         per_round = 2 * n * args.deals * d['replicates']
         print(f'wrote {args.write}: {n} pairings, {per_round:,} hands per round, at most {d["max_rounds"]} rounds '
-              f'({per_round * d["max_rounds"]:,} hands); a pairing stops once decided (at most {d["alpha"]:.0%} chance '
-              f'of any false verdict over all pairings; see docs/methodology.md for the assumptions)')
+              f'({per_round * d["max_rounds"]:,} hands); a pairing stops once decided or ineligible. If the test\'s '
+              f'assumptions hold, at most {d["alpha"]:.0%} chance of any false verdict over all pairings '
+              f'(docs/methodology.md says which assumptions, and each verdict says whether its data fit them).')
+        print(f'The design is registered in {plan["out"]}/plan.json when the tournament starts, before its first '
+              f'hand; only then are its verdicts official. Change the plan after that and nothing in the run is a test.')
         print(design_line(d))
         print(_power_table(d))
         if d['underpowered']:
@@ -107,11 +110,19 @@ def cmd_ratings(args):
         print('No finished duplicate deals yet.')
         return
     print(summary(r))
-    test = ('the preregistered sequential test on ' + r['objective']) if (r.get('design') or {}).get('registered') \
-        else 'none (no preregistered design: everything is descriptive)'
+    reg = r.get('registration') or {}
+    if (r.get('design') or {}).get('registered'):
+        test = (f'the official decisions of the preregistered sequential test on {r["objective"]}, recorded when '
+                f'play stopped by the registered judge {reg.get("judge_fingerprint")} (this judge: '
+                f'{r.get("judge_fingerprint")}; anything it recomputes differently is retrospective)')
+    else:
+        why = '; '.join(reg.get('reasons') or []) or 'no preregistered design'
+        test = f'none (not preregistered: {why}; everything is descriptive)'
     print(f'\n{r["deals"]} duplicate deals ({r["hands"]} hands), {r["observations"]} distinct. Verdicts: {test}; '
           f'strengths: descriptive; session Elo: share of {r["session_deals"]}-deal sessions won (secondary, '
           f'descriptive).')
+    if r.get('rejected'):
+        print(f'{len(r["rejected"])} duplicate pairs failed validation and were left out (see the notes).')
 
 
 def cmd_view(args):
@@ -134,8 +145,9 @@ def cmd_history(args):
         return
     print(history.table(r))
     print(f'\n{r["deals"]:,} duplicate deals from {len(r["runs"])} runs ({r["observations"]:,} distinct), '
-          f'one player per model, reasoning level and protocol. Descriptive only: pooled runs are no one\'s '
-          f'preregistered test.')
+          f'one player per model, reasoning level, protocol and implementation (code that plays and CLI version; '
+          f'equivalences.json beside the database can merge implementations). Descriptive only: pooled runs are '
+          f'no one\'s preregistered test.')
     if len(r['code_versions']) > 1:
         print(f'Code versions: {", ".join(r["code_versions"])}')
 

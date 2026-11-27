@@ -39,23 +39,28 @@ once (only possible across runs), those plays are averaged into one observation.
 
 ## What is a test and what is a description
 
-Exactly one thing is a test: the **preregistered sequential procedure on each pairing**. Its verdicts *a is
-better*, *b is better* and *even*, reached at a completed planned look, are the only inferential results, and
-only when
+Exactly one thing is a test: the **preregistered sequential procedure on each pairing**, applied by one
+function, `ratings.adjudicate`. The runner stops a pairing and records its decision only through it, and the
+ratings, the command line and the viewer report what it recorded. Its verdicts *a is better*, *b is better* and
+*even*, reached at a completed planned look, are the only inferential results, and only when
 
-- the run has a **preregistered design** (`design.registered: true`): a plan whose design was fixed before play.
-  A run played as one fixed round (older plans, `play`), or under an older stopping rule, has
-  `design: {registered: false, ...}`: every pairing there is `verdict: 'descriptive'`, nothing is ranked or led,
-  and the only sample-size figure, under `design.retrospective`, is labelled *retrospective* (what a default
-  design would have needed), never "planned";
-- both players' **identities are verified** in that run (see *Who is a player*): a pairing with a player whose
-  model is unknown, whose settings changed between matches, or for whom another model answered, is
-  `verdict: 'descriptive'` with the reason; the test's own verdict is kept as `test_verdict` for the record.
+- the run is **preregistered** (`registration_status`, below): a `registration` written into plan.json before
+  the first hand. A run without one (one fixed round, `play`, an older stopping rule, a plan that says
+  `registered: false`, a registration written late, a design changed after it, or a code change accepted during
+  the run) has `design: {registered: false, ...}`: every pairing there is `verdict: 'descriptive'`, nothing is
+  ranked or led, and the only sample-size figure, under `design.retrospective`, is labelled *retrospective*;
+- the pairing is **eligible** (see *The adjudicator*): every rule of the design holds for both players and for
+  the data, or the verdict is `ineligible`, a terminal verdict that stops the pairing;
+- the verdict is **official**: recorded by the runner at that look, by the registered judge with the registered
+  calibration. What today's code computes from the same data is a recomputation, labelled `retrospective`.
 
 A **decided rank** and a **decided leader** are built from those verdicts alone, so they inherit their
-guarantee: a false leader needs at least one false verdict. A leader is a player with a decided win over every
-other player of its group; a rank is decided when a player has a decided win or loss against every other player
-of its group (and the verdicts form no cycle).
+guarantee: a false leader needs at least one false verdict. A verdict outside the calibrated range (its
+`assumptions` are `unsupported`, below) does not count unless the design preregistered that it should
+(`outside_calibration: 'count'`). A leader is a player with a counting decided win over every other player of
+its group; a rank is decided when a player has a counting decided win or loss against every other player of its
+group (and the verdicts form no cycle). A group whose only would-be leader relies on a verdict outside the
+calibrated range has `leader: null` and names it in `leader_outside_calibration`.
 
 Everything else is **descriptive**: strengths and their intervals, the order by points, the group's front
 runner and its margin, session Elo, style statistics, every all-time number. These are recomputed on every
@@ -91,6 +96,55 @@ With no edge between two players, the procedure calls a winner for that pairing 
 The minimum number of conversations and the zero-spread rule exist so that degenerate data never decide: two
 conversations, or any number of conversations with identical results, give no verdict.
 
+**Every verdict says whether its data fit these assumptions** (`assumptions: {status, checks}`, recorded with
+the decision): `conversation_share` (the estimated share of the conversations' spread that their cards don't
+explain) against the calibrated limit of 0.5, `independent_deals` (no deal repeated across the pairing's
+conversations) and `conversations` (enough of them to judge). `status` is `supported` (all checks pass),
+`unsupported` (one fails: the bound holds only if the results are symmetric, which no data can show) or
+`unknown` (a check could not be made). A decided verdict carries `calibrated` (true, false or null) and a
+`standing`: `decided`, `decided (outside calibrated range)` or `decided (assumptions unchecked)`. Nothing here
+states the error bound without these conditions.
+
+## The adjudicator: registration, eligibility and official decisions
+
+**Registration.** `ratings.registration(design)` is the artifact the runner writes into plan.json before the
+first hand: `{status: 'registered', design, judge_fingerprint, calibration_id, created}`. The judge fingerprint
+is the hash of `ratings.py` (the one the runner records for it); the calibration id hashes the calibrated levels
+and every constant of the test. `ratings.registration_status(plan, evidence)` never recomputes it from the
+design: a run is registered only when the artifact exists, its status is `registered`, its design inputs (alpha,
+round deals, block, replicates, max rounds, target, planning assumptions, budget and the eligibility rules) match
+the plan's, it was created no later than the first match started, its judge is the one the run started with, and
+no code change was accepted during the run. A plan that says `registered: false` is `declined` even beside an
+artifact; an `allow_code_change` that changes anything that plays or judges makes it `void`, with the files.
+
+**Eligibility.** `ratings.adjudicate(pairing_data, design, n_pairings, look, eligibility)` runs `decide` and then
+every rule; any failure gives `verdict: 'ineligible'` with `ineligible_reasons` (the test's own verdict stays in
+`test_verdict`). The facts come from the runner (`runner.eligibility`, from the pairing's match folders): per
+player its kind, backend, requested model, protocols, the models its replies named and its audit. The rules:
+
+| rule | ineligible when |
+|---|---|
+| registration | no valid registration (as above), or a code change during the run |
+| identity resolved | no model recorded, or a bare alias (`sonnet`) |
+| identity attested | a reply named another model (`mismatch`); no reply at all; or the backend did not report the model (`unattested`) and the design's `allow_unattested` (default `codex`, which cannot report it) does not name the backend. An allowed unattested player is shown as unattested everywhere. |
+| audit complete | a used reply whose turn could not be checked for tool use: `opaque` (the `command` backend) unless `allow_opaque` names the backend (default none), or unverified or unrecorded |
+| protocol consistent | the player's settings differ between the pairing's matches |
+| data integrity | a duplicate pair failed validation (below), or the pairs were not validated at all |
+
+**Duplicate pairs are validated** before they count (`ratings.check_pair`, used by `load_deals`, `pairing_data`
+and the history): b-first must seat a-first's players in the other order, with the same game settings, seeds,
+deal fingerprints, specs and protocols; each hand's recorded seed and fingerprint must match the configs and its
+chips must add up. A failing conversation (or hand) is left out and reported (`rejected`), and the pairing is
+ineligible.
+
+**Official and retrospective.** Each look the runner records is adjudicate's output with the judge fingerprint
+and calibration id. The ratings show a pairing's verdict from that record when it was made by the registered
+judge with the registered calibration (`official: true`, `judge`); they also adjudicate the same deals with
+today's code and show it as `recomputed: {verdict, judge, agrees}`, which never replaces the record. Without
+such a record (a missing look, or one written by another judge) the row is `retrospective: true`, and a decided
+result there becomes `verdict: 'retrospective'`, which counts for nothing. If a run's folders no longer pass
+validation, its recorded verdicts stay visible but stop counting (`integrity_now: false`).
+
 ## The preregistered design
 
 `ratings.normalize_design(plan)` turns a plan into the one design that the runner plays by, the ratings judge by
@@ -115,7 +169,10 @@ and the viewer shows (nothing else builds one):
 | `power_at_max` | | the moderate scenario's power |
 | `deals_needed`, `conversations_needed` | | per pairing, for 80% power under the moderate scenario |
 | `deals_planned`, `max_deals` | | the deals per pairing the design allows |
-| `registered` | | false for a design not fixed before play |
+| `allow_unattested` | `['codex']` | backends whose players may be eligible without attesting the model that answered |
+| `allow_opaque` | `[]` | backends whose players may be eligible although their turns cannot be audited for tool use |
+| `outside_calibration` | `'exclude'` | whether a decided verdict outside the calibrated range counts towards a decided rank or leader (`'count'`) |
+| `registered` | | only `false`, for a plan that declines registration or an older stopping rule; whether a run is registered comes from `registration_status`, never from the design |
 | `calibration` | | the null shapes the t arm is calibrated for, and each one's level |
 
 `python -m poker_arena plan` writes `max_rounds` (and its basis) into the plan, so a stored plan reads back the
@@ -160,8 +217,8 @@ the 18% computed here.
 
 ## The test
 
-After each round a pairing's verdict comes from `ratings.decide`, called by the runner with every deal so far
-and the conversation of each deal. A look can decide only when it has at least `min_conversations`
+After each round a pairing's verdict comes from `ratings.decide`, inside `ratings.adjudicate`, called by the
+runner with every validated deal so far and the conversation of each deal. A look can decide only when it has at least `min_conversations`
 conversations and they differ at all (a look whose conversations all have the same mean gives no verdict,
 `reason` says so).
 
@@ -198,14 +255,16 @@ power at the target (84.4% with both arms, 84.4% with the t arm alone, 1,000 seq
 | `exhausted` | The last planned look came without a decision. **Not evidence that the two are equally good.** |
 | `open` | Undecided and looks remain, or a round is under way. |
 | `early` | A completed look with fewer than `min_conversations` conversations (whatever the numbers say), or too few deals for any spread. |
-| `descriptive` | No test applies: pooled across runs, a run without a design, or a player whose identity is in doubt. |
+| `ineligible` | An eligibility rule failed (see *The adjudicator*). Terminal: the pairing stops. `test_verdict` keeps what the test said. |
+| `retrospective` | A decided result that no official record backs (today's recomputation only). Decides nothing. |
+| `descriptive` | No test applies: pooled across runs, or a run that is not preregistered. |
 
 `ci95` is the ordinary 95% interval at the look; `ci_decision` is the edge ± the bar × the standard error, the
 interval that matches the t arm; `signflip` says whether the sign-flip arm has rejected. `conversation_share` is
 an estimate of how much of the conversations' spread their card noise does not explain (between-conversation
-variance beyond the within-conversation one, ignoring memory, so it errs high); above one half the notes say the
-pairing is outside the calibrated range unless its results are symmetric. When a run's `decisions.json` recorded
-a different verdict (an earlier version of the test), the pairing shows `recorded_verdict` and the notes say so.
+variance beyond the within-conversation one, ignoring memory, so it errs high); above one half the verdict's
+`assumptions` are `unsupported` and the pairing is outside the calibrated range unless its results are
+symmetric.
 
 ### Calibration
 
@@ -267,7 +326,18 @@ Each player gets a strength in bb/100 from a least-squares fit over all observat
 with the strengths summing to zero within each group of connected players: the edge against the average
 opponent of the group. The fit assumes edges add up across players, which poker's rock-paper-scissors effects can
 break; when every pairing is the only link between its players the assumption cannot be checked, and the notes
-say so. The per-pairing edges never depend on it.
+say so. The per-pairing edges never depend on it, and they stay the primary evidence.
+
+**Weighting.** Each distinct deal counts once, so a pairing weighs as much as it has deals, and a strength is an
+average over the opponents a player actually met, as often as it met them (`fit.method` in the output). Unequal
+exposure therefore moves strengths: in the bots' demo run Station sits above Random although Random's direct
+edge over Station is positive, because Station met the strong Rule bot in fewer deals.
+
+**Fit diagnostics.** Every pairing carries `observed_edge` (over the deals in the fit), `fitted_edge` (what the
+strengths imply, s_a − s_b), `residual` and `residual_se` (the bootstrap spread of the residual, with the same
+joint weights as the strengths), and `additivity: {status: 'ok' | 'warning' | 'untestable', z}`: a warning when
+the residual is beyond two standard errors, untestable in a group that fits its pairings exactly. A warning goes
+into the notes with both numbers: one number per player does not describe those results, so read the pairings.
 
 **Groups.** Players are connected when a chain of played pairings links them; different groups are on separate
 scales and every summary is per group, from that group's own data. A group without a reference bot has no fixed
@@ -306,7 +376,8 @@ anything.
 
 ## Who is a player
 
-A model player is `backend:model:effort#protocol`, for example `claude:claude-sonnet-5-5:high#1a2b3c4d`. The
+A model player is `backend:model:effort#protocol@implementation`, for example
+`claude:claude-sonnet-5-5:high#1a2b3c4d@5e6f7a8b` (a bot: `bot:rule:sims=200@5e6f7a8b`). The
 protocol is the first 8 characters of the fingerprint the runner records for each seat: a hash of every
 setting that changes play (backend, model, effort, isolation, instructions or system prompt, tool policy, extra
 arguments, retries and fixes, thinking display) and of the match horizon and memory schedule (hands per
@@ -314,8 +385,19 @@ conversation, which the model is told; a fresh conversation at every match). A p
 horizon was part of it gets the horizon in the identity instead (`...#1a2b3c4d~h50`), so conversations of
 different lengths never pool. A player from before protocols were recorded is kept apart from later runs.
 
-**Which model answered.** Where the CLI reports the model that answered (`served_models`), it must be the
-configured one: the same canonical id (lower case, no provider prefix, punctuation and spaces as hyphens, so
+The implementation is the first 8 characters of a hash of what played the seat (`history.implementation_tag`):
+the content hashes of the code that plays (engine, games, agents, backends, runner: everything the runner
+records but the judge, `ratings.py`), the prompt template, and for a model the version of its CLI. A change to
+parsing, corrections, tool detection or bot behaviour, or a new CLI version, makes another player. When such a
+change is shown not to matter for play, an `equivalences.json` beside the database
+(`{"implementations": [["5e6f7a8b", "9a0b1c2d"]], "reason": "..."}`) pools each group under its first tag, and
+the all-time output lists what it merged.
+
+**Which model answered.** Each call records `requested_model`, `observed_model` (what the CLI reported:
+Claude's init event, Antigravity's transcript; Codex and plain commands report nothing) and `identity`
+(`attested` or `unattested`). A player is `attested` when every reply named its model, `unattested` when some
+named none, `mismatch` when some named another; the players' `identity_status` and the run's `audit` summary
+carry it. Where a model is reported it must be the configured one: the same canonical id (lower case, no provider prefix, punctuation and spaces as hyphens, so
 "Gemini 4 Neon (High)" is `gemini-4-neon-high`), a dated snapshot of it (`<id>-YYYYMMDD` or `<id>-YYYY-MM-DD`),
 or an id listed for it in `ratings.SERVED_ALIASES` (empty by default). Nothing else matches: `claude-sonnet-5`
 is not `claude-sonnet-5-5`, and `gemini-4-neon-high-0912` is not `gemini-4-neon`.
@@ -323,7 +405,8 @@ is not `claude-sonnet-5-5`, and `gemini-4-neon-high-0912` is not `gemini-4-neon`
 A player is **quarantined** when its identity is unresolved (no model recorded, or a bare alias such as `sonnet`
 whose version changes over time), when its settings differ between the matches of one run, or when another model
 answered. Within a run a quarantined player stays in the fit with a flag (`in_fit: true`, `quarantined: true`,
-`inferential: false`), and every pairing it plays is descriptive. In the all-time standings it is left out of
+`inferential: false`), its pairings are ineligible when the reason holds inside them, and it never takes a
+decided rank or the lead. In the all-time standings it is left out of
 the fit (`in_fit: false`), listed with its hands and net result; a served-model mismatch quarantines only that
 run's deals, under their own identity (`...!served=<model>`).
 
@@ -333,6 +416,7 @@ run's deals, under their own identity (`...!served=<model>`).
 different designs and stopped pairings at different times, so pooling them is no one's preregistered test:
 every pairing there has `verdict: 'descriptive'`, there is no leader and no rank, and the notes say so. Repeated
 deals are averaged; slates are matched by seed across runs, so runs on the same cards are resampled together.
+Duplicate pairs that fail validation are kept in the `rejected` table and listed, never pooled.
 Independent confirmation needs a new run with its own design.
 
 ## Style statistics (tendencies, not quality)
@@ -358,6 +442,10 @@ itself.
 - **Independence of conversations** is by design (fresh memories, no shared state); a model provider that
   carried state across conversations would break it.
 - **Additivity** of strengths is an assumption (see Strength).
-- **Identity is as good as the CLI's report.** A CLI that doesn't report which model answered can't be checked.
+- **Identity is as good as the CLI's report.** A CLI that doesn't report which model answered (Codex) can't be
+  checked; it is eligible only because the default design allows it, and it is shown as unattested.
+- **The registration is a record, not a signature.** It proves the design was fixed before the first match
+  started only as far as the files are honest: someone editing plan.json and every match config by hand could
+  forge it.
 - **One game format.** Heads-up, 100 big blinds deep, stacks reset every hand. Strengths do not carry over to
   other formats.

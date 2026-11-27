@@ -14,10 +14,14 @@
   const trim = v => Number.isInteger(v) ? String(v) : v.toFixed(1).replace(/\.0$/, '');
   const approx = n => n < 100 ? String(n) : Number(n.toPrecision(2)).toLocaleString('en-US');
 
-  // "GPT-6 Luna · High" -> ['GPT-6 Luna', 'High']
+  // "GPT-6 Luna · High" -> ['GPT-6 Luna', 'High', '']; a level's parenthetical is the third part:
+  // "Claude Sonnet · Default effort (protocol not recorded)" -> ['Claude Sonnet', 'Default effort', 'protocol not recorded']
   function nameParts(text) {
-    const i = String(text).lastIndexOf(' · ');
-    return i < 0 ? [String(text), ''] : [text.slice(0, i), text.slice(i + 3)];
+    text = String(text);
+    const i = text.lastIndexOf(' · ');
+    if (i < 0) return [text, '', ''];
+    const level = text.slice(i + 3), m = level.match(/^(.*?)\s*\((.*)\)\s*$/);
+    return m ? [text.slice(0, i), m[1], m[2]] : [text.slice(0, i), level, ''];
   }
 
   function family(text, kind) {
@@ -51,6 +55,8 @@
     const out = isContract(r) ? fromContract(r) : fromLegacy(r);
     const minConv = r.min_conversations ?? (r.design && r.design.min_conversations);
     if (minConv != null) out.pairings = out.pairings.map(p => ({ min_conversations: minConv, ...p }));
+    const byId = Object.fromEntries(out.players.map(p => [p.player, p]));
+    out.pairings = out.pairings.map(p => ({ ...p, assumption: assumptionsOf(p, r.design), fit: fitOf(p, byId) }));
     const unregistered = !pooled && isUnregistered(r.design);
     const descriptive = pooled || unregistered;
     if (descriptive) {
@@ -132,8 +138,19 @@
       const leader = pooled ? null : own ? playerId(g.leader) : decidedLeader(members, pairings);
       const front = playerId(g.front_runner) || (ranked[0] && ranked[0].player) || null;
       const margin = g.front_runner_margin ?? (ranked.length > 1 ? ranked[0].strength - ranked[1].strength : null);
+      const wins = leader ? pairings.filter(x => { const s = verdictSides(x); return s && s.winner === leader; }) : [];
+      const given = g.assumptions && (g.assumptions.status || g.assumptions);
+      const statuses = wins.map(x => x.assumption ? x.assumption.status : 'unknown');
+      let leaderAssumption = !leader ? null : typeof given === 'string' ? given
+        : statuses.includes('unsupported') ? 'unsupported' : statuses.length && statuses.every(x => x === 'supported') ? 'supported' : 'unknown';
+      // a leader whose wins include one outside the calibrated range is not a decided leader
+      let qualified = pooled ? null : playerId(g.leader_outside_calibration);
+      let decided = leader && members.includes(leader) ? leader : null;
+      if (decided && leaderAssumption === 'unsupported') { qualified = decided; decided = null; }
+      if (qualified) leaderAssumption = 'unsupported';
       return { ...g, index: i, members, ranked: ranked.map(p => p.player), pairings,
-        leader: leader && members.includes(leader) ? leader : null, front_runner: front, front_runner_margin: margin };
+        leader: decided, qualified_leader: qualified && members.includes(qualified) ? qualified : null, front_runner: front, front_runner_margin: margin,
+        leader_assumption: leaderAssumption, misfits: g.misfit_pairings ?? pairings.filter(x => x.fit && x.fit.warn).length };
     });
   }
 
@@ -144,8 +161,92 @@
     return null;
   }
 
-  // A verdict in words: {tone, short, long, decided}. `name` turns a player id into display text.
-  // Only a/b/even come from the sequential procedure; everything else is described, not decided.
+  // ---- what a verdict rests on: its assumptions, its eligibility, where it was recorded ---------------
+  const ASSUME = { supported: 'within calibrated range', unsupported: 'outside calibrated range', unknown: 'assumptions unchecked' };
+  const words = k => String(k).replace(/_/g, ' ');
+  // The adjudicator's `assumptions` when given; else the conversation share against the share the test was
+  // calibrated for. {status: 'supported'|'unsupported'|'unknown', label, detail}
+  function assumptionsOf(p, design) {
+    const a = p && p.assumptions;
+    let status = a ? (typeof a === 'string' ? a : a.status) : null;
+    let detail = '';
+    if (a && typeof a === 'object' && a.checks) {
+      detail = Object.entries(a.checks).map(([k, v]) => v && typeof v === 'object'
+        ? `${words(k)}: ${v.status || ''}${v.value != null ? ` ${v.value}` : ''}${v.limit != null ? ` (calibrated up to ${v.limit})` : ''}`.trim()
+        : `${words(k)}: ${v}`).join('; ');
+    }
+    if (!status) {
+      const share = p && p.conversation_share;
+      const cal = design && design.calibration && design.calibration.conversation_effect_share;
+      if (share != null && cal != null) {
+        status = share > cal ? 'unsupported' : 'supported';
+        detail = `conversations differ by ${Math.round(share * 100)}% of the spread; the test is calibrated up to ${Math.round(cal * 100)}%`;
+      } else status = 'unknown';
+    }
+    if (!ASSUME[status]) status = 'unknown';
+    return { status, label: ASSUME[status], detail };
+  }
+
+  // {reasons} when a pairing may not be decided (identity, audit, protocol, registration...), else null.
+  function ineligible(p) {
+    if (!p || (p.verdict !== 'ineligible' && p.eligible !== false)) return null;
+    return { reasons: (p.ineligible_reasons || []).map(String) };
+  }
+
+  // Where a verdict comes from: {kind: 'official'|'retrospective'|'recorded', text} or null.
+  function sourceOf(p, name = x => x) {
+    if (!p) return null;
+    if (p.retrospective) return { kind: 'retrospective', short: 'retrospective', text: 'retrospective: recomputed by today\'s judge, not the one the run registered' };
+    if (p.official) return { kind: 'official', short: 'official', text: `official: recorded when play stopped${p.judge ? ` by judge ${String(p.judge).slice(0, 8)}` : ''}` };
+    if (p.recorded_verdict != null && p.recorded_verdict !== p.verdict && DECIDED.concat(['exhausted', 'ineligible']).includes(p.recorded_verdict)) {
+      const was = p.recorded_verdict === 'a' ? `${name(p.a)} wins` : p.recorded_verdict === 'b' ? `${name(p.b)} wins`
+        : { even: 'even', exhausted: 'no winner', ineligible: 'ineligible' }[p.recorded_verdict];
+      return { kind: 'retrospective', short: `at the time: ${was}`, text: `The runner recorded "${was}" during play; that record is not a test result here, and what is shown is today's recomputation.` };
+    }
+    return null;
+  }
+
+  // The interval's basis, said at the number: blocks of deals inside conversations, or whole conversations.
+  const BASIS = {
+    blocks: { key: 'within', short: 'within conversations', long: 'This range resamples blocks of deals inside single conversations. It leaves out how much fresh conversations (new match pairs) differ, which this data cannot measure, so the real uncertainty is larger.' },
+    conversations: { key: 'across', short: 'across conversations', long: 'This range resamples whole conversations (match pairs), so it includes how much fresh conversations differ.' },
+    mixed: { key: 'mixed', short: 'partly within conversations', long: 'Part of this range rests on blocks of deals inside single conversations, which leave out how much fresh conversations differ.' },
+  };
+  const basisOf = x => (x && BASIS[x.ci_basis || x.basis]) || null;
+
+  // How a pairing's direct result compares with what the strengths predict: {fitted, residual, warn, estimated}.
+  function fitOf(p, byId) {
+    const sa = byId[p.a], sb = byId[p.b];
+    let fitted = p.fitted_edge;
+    const estimated = fitted == null;
+    if (fitted == null && sa && sb && sa.strength != null && sb.strength != null && sa.component === sb.component) fitted = sa.strength - sb.strength;
+    if (fitted == null || p.edge == null) return null;
+    const residual = p.residual ?? p.edge - fitted;
+    const a = p.additivity;
+    let warn;
+    if (a != null) warn = typeof a === 'boolean' ? a : typeof a === 'string' ? !['ok', 'consistent', 'none'].includes(a)
+      : !!(a.warning ?? a.warn ?? (a.status && !['ok', 'consistent'].includes(a.status)));
+    else warn = !!p.ci95 && Math.abs(residual) > (p.ci95[1] - p.ci95[0]) / 2;
+    return { fitted, residual, warn, estimated };
+  }
+
+  // A player's model identity: 'attested' (the backend reported the model it ran), 'unattested', 'mismatch'
+  // or 'partly attested', from the ratings' own field or the run audit's call counts; null when unknown.
+  function identityOf(p, audit) {
+    const own = p && (p.attestation || p.identity_status
+      || (p.identity_attested === true ? 'attested' : p.identity_attested === false ? 'unattested' : null));
+    if (own) return own;
+    const a = audit && audit.identity;
+    if (!a) return null;
+    if (typeof a === 'string') return a === 'none' ? null : a;
+    if (a.mismatch) return 'mismatch';
+    if (a.attested && a.unattested) return 'partly attested';
+    return a.attested ? 'attested' : a.unattested ? 'unattested' : null;
+  }
+
+  // A verdict in words: {tone, short, long, decided, qualifier}. `name` turns a player id into display text.
+  // Only a/b/even come from the sequential procedure; everything else is described, not decided. A decided
+  // verdict never states its error bound without the assumptions it rests on.
   function verdict(p, name = x => x) {
     const sides = verdictSides(p);
     const looks = p.looks_planned && p.looks_used ? ` after ${p.looks_used} of ${p.looks_planned} planned checks` : '';
@@ -153,11 +254,21 @@
     const ahead = (p.edge ?? 0) >= 0 ? p.a : p.b;
     const behind = ahead === p.a ? p.b : p.a;
     const level = !p.edge;
+    const no = ineligible(p);
+    if (no) {
+      return { tone: 'bad', decided: false, short: 'Ineligible', long: `Not eligible for a decision${no.reasons.length ? `: ${no.reasons.join('; ')}` : ''}.${level ? '' : ` ${name(ahead)} is ahead on points only.`}` };
+    }
+    const as = p.assumption || { status: 'unknown' };
+    const out = as.status === 'unsupported'
+      ? ' The test\'s assumptions do not hold here (outside its calibrated range), so its error rate is not established.'
+      : as.status === 'supported' ? ' Its error rate holds under the test\'s assumptions, which the data support.'
+      : ' Its error rate holds only under the test\'s assumptions, which are not checked here.';
+    const qualifier = as.status === 'unsupported' ? ASSUME.unsupported : '';
     switch (p.verdict) {
       case 'a': case 'b':
-        return { tone: 'won', decided: true, short: `${name(sides.winner)} wins`, long: `Decided${looks}: ${name(sides.winner)} beats ${name(sides.loser)}; the edge cleared the sequential test's bar.` };
+        return { tone: 'won', decided: true, qualifier, short: `${name(sides.winner)} wins`, long: `Decided${looks}: ${name(sides.winner)} beats ${name(sides.loser)}; the edge cleared the sequential test's bar.${out}` };
       case 'even':
-        return { tone: 'even', decided: true, short: 'Even', long: `Decided${looks}: within ±${band} bb/100 of each other.` };
+        return { tone: 'even', decided: true, qualifier, short: 'Even', long: `Decided${looks}: within ±${band} bb/100 of each other.${out}` };
       case 'exhausted':
         return { tone: 'open', decided: false, short: 'No winner', long: `Every planned check is used and the difference is unresolved.${level ? '' : ` ${name(ahead)} is ahead on points only.`}` };
       case 'early': {
@@ -207,7 +318,7 @@
     const amt = a.amount != null && a.action !== 'fold' && a.action !== 'check' ? ' ' + bbFmt(a.amount) : '';
     return (ACT[a.action] || a.action) + amt;
   }
-  const KIND = { sizing: 'resized', retry: 'asked again', fallback: 'auto-played', note: 'changed' };
+  const KIND = { sizing: 'resized', retry: 'asked again', fallback: 'auto-played', note: 'changed', tool_use: 'tool rejected', unverified: 'unaudited, asked again' };
   // From a thought event (and its action): null, or {kind, label, requested, executed, reason}.
   function correction(thought, action, bbFmt = String) {
     const t = thought || {};
@@ -257,5 +368,6 @@
   }
 
   return { esc, MINUS, signed, plural, trim, approx, nameParts, family, isContract, normalize, verdict, verdictSides, powerLine, correction, actText,
-    isDecided, decidedLeader, playerId, rateOf, targetEdge, isUnregistered, scenarios, conversationsShort };
+    isDecided, decidedLeader, playerId, rateOf, targetEdge, isUnregistered, scenarios, conversationsShort,
+    assumptionsOf, ineligible, sourceOf, basisOf, fitOf, identityOf, ASSUME };
 });

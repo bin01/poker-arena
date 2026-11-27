@@ -68,9 +68,11 @@ class HoldemHand(Episode):
         self.done = False
         self.payoffs = [0] * n
         self.result = {}
+        self.made_by_street = {'preflop': self.made_hands()}
 
         self._emit('hand_start', {'hand': index, 'button': self.button, 'names': names, 'stack': self.start,
-                                  'sb': self.sb, 'bb': self.bb, 'hole': self.hole, 'seed': seed},
+                                  'sb': self.sb, 'bb': self.bb, 'hole': self.hole, 'seed': seed,
+                                  'omniscient': {'made_hand': self.made_by_street['preflop']}},
                    visible=[])  # the full deal is logged for the viewer only
         for i in range(n):
             self._emit('hole', {'seat': i, 'cards': self.hole[i]}, visible=[i])
@@ -83,6 +85,7 @@ class HoldemHand(Episode):
         self._post(bb_seat, self.bb, 'big blind')
         self.to_act = sb_seat if n == 2 else self._next_active(bb_seat)
         self._check_round()
+        self.events[0].data['to_act'] = None if self.done else self.to_act
 
     # ---- helpers -------------------------------------------------------------------------------
     def _emit(self, kind, data, visible=None):
@@ -110,6 +113,11 @@ class HoldemHand(Episode):
             if self._can_act(j):
                 return j
         return None
+
+    def made_hands(self) -> dict:
+        """Every seat's best hand from its cards and the board so far, folded seats included. Omniscient: it
+        reads every seat's hole cards, so it is for the viewer, never shown to a seat."""
+        return {i: describe(evaluate(self.hole[i] + self.board)) for i in range(self.n)}
 
     @property
     def pot(self):
@@ -231,7 +239,9 @@ class HoldemHand(Episode):
                 to, note = lo, f'{asked} is below the minimum: raised to {lo}'
 
         say = str(action.get('say') or '').strip()
-        entry = {'seat': seat, 'street': STREETS[self.street], 'action': kind, 'say': say}
+        pot_before = self.pot
+        entry = {'seat': seat, 'street': STREETS[self.street], 'action': kind, 'say': say, 'to_call': tc,
+                 'pot_before': pot_before, 'pot_odds': round(tc / (pot_before + tc), 4) if tc else None}
         if kind == 'fold':
             self.folded[seat] = True
         elif kind == 'check':
@@ -268,6 +278,7 @@ class HoldemHand(Episode):
         self.history.append(entry)
         self._emit('action', entry)
         self._advance(seat)
+        entry['to_act'] = None if self.done else self.to_act
         return None
 
     # ---- flow --------------------------------------------------------------------------------
@@ -306,7 +317,9 @@ class HoldemHand(Episode):
         count = {1: 3, 2: 4, 3: 5}[self.street]
         new = self.deck_board[len(self.board):count]
         self.board = self.deck_board[:count]
-        self._emit('board', {'street': STREETS[self.street], 'cards': new, 'board': list(self.board)})
+        self.made_by_street[STREETS[self.street]] = self.made_hands()
+        self._emit('board', {'street': STREETS[self.street], 'cards': new, 'board': list(self.board),
+                             'omniscient': {'made_hand': self.made_by_street[STREETS[self.street]]}})
 
     def _runout(self):
         if len(self._in_hand()) > 1:
@@ -403,7 +416,7 @@ class HoldemHand(Episode):
 
     def summary(self):
         return {'hand': self.index, 'button': self.button, 'hole': self.hole, 'board': list(self.board),
-                'actions': self.history, **self.result}
+                'actions': self.history, **self.result, 'omniscient': {'made_hand': self.made_by_street}}
 
 
 @register

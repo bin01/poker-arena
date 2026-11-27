@@ -92,8 +92,8 @@ class TestResume(Base):
         players.write_text('[players.rule]\nbot = "rule"\nsims = 30\n[players.station]\nbot = "station"\n')
         plan = make_plan(['rule', 'station'], deals=4, out=str(self.d / 'run'), players_file=str(players),
                          design={'max_rounds': 1})
-        with mock.patch('poker_arena.ratings.decide', create=True,
-                        side_effect=lambda xs, d, n, k, groups=None: {'verdict': 'exhausted', 'looks_used': k, 'deals': len(xs)}):
+        with mock.patch('poker_arena.ratings.adjudicate', create=True,
+                        side_effect=lambda pd, d, n, k, e: {'verdict': 'exhausted', 'looks_used': k, 'deals': len(pd['xs'])}):
             asyncio.run(run_plan(plan, **QUIET))
             for change in ({'deals': 5, 'design': {**plan['design'], 'round_deals': 5}}, {'seed': 7},
                            {'design': {**plan['design'], 'alpha': 0.1}}, {'replicates': 2}):
@@ -112,6 +112,52 @@ class TestResume(Base):
             cfg_path.write_text(json.dumps(cfg))
             with self.assertRaisesRegex(ResumeMismatch, 'b-first'):
                 asyncio.run(run_plan(plan, **QUIET))
+
+
+class Attesting(FakeCLI):
+    """Names the model that answered: the configured one, or `ANSWER` when set."""
+    ANSWER = None
+
+    async def _call(self, text):
+        r = await super()._call(text)
+        r.meta['observed_model'] = Attesting.ANSWER or self.model + '-20260101'
+        return r
+
+
+class TestEligibilityFacts(Base):
+    def facts(self, backend, answer=None):
+        from poker_arena.runner import eligibility
+        backends.BACKENDS['attesting'] = Attesting
+        self.addCleanup(backends.BACKENDS.pop, 'attesting', None)
+        Attesting.ANSWER = answer
+        a, b = ('m', {'backend': backend, 'model': 'fake-1'}), ('station', {'bot': 'station'})
+        out = self.d / backend / str(answer)
+        asyncio.run(run_duplicate(self.G, a, b, [1, 2], out, **QUIET))
+        return eligibility(out, ['m__vs__station'], ('m', 'station'), {'status': 'registered'})
+
+    def test_identity_audit_and_protocol_per_player(self):
+        f = self.facts('fakecli')
+        m, st = f['players']['m'], f['players']['station']
+        self.assertEqual((m['kind'], m['backend'], m['requested_model'], m['identity']),
+                         ('model', 'fakecli', 'fake-1', 'unattested'))
+        self.assertEqual((m['audit'], m['audit_counts']), ('complete', {'verified': m['decisions']}))
+        self.assertEqual(len(m['protocols']), 1)
+        self.assertTrue(m['protocol_consistent'])
+        self.assertEqual(st['identity'], 'bot')
+        self.assertEqual((f['registration'], f['conversations'], f['implementation_changes']),
+                         ({'status': 'registered'}, 1, []))
+        att = self.facts('attesting')['players']['m']
+        self.assertEqual((att['identity'], att['observed_models']), ('attested', ['fake-1-20260101']))
+        self.assertEqual(self.facts('attesting', 'other-9')['players']['m']['identity'], 'mismatch')
+
+    def test_thought_events_carry_identity(self):
+        self.facts('attesting')
+        out = self.d / 'attesting' / 'None' / 'm__vs__station' / 'a-first'
+        t = next(e['data'] for e in self.rows(out / 'events.jsonl') if e['kind'] == 'thought' and e['data']['player'] == 'm')
+        self.assertEqual((t['requested_model'], t['observed_model'], t['identity'], t['served_model']),
+                         ('fake-1', 'fake-1-20260101', 'attested', 'fake-1-20260101'))
+        c = self.rows(out / 'calls.jsonl')[0]
+        self.assertEqual((c['requested_model'], c['identity']), ('fake-1', 'attested'))
 
 
 class TestInterruptedHand(Base):

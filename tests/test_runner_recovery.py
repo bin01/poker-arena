@@ -306,11 +306,12 @@ class TestImplementation(Base):
         players.write_text('[players.a]\nbot = "station"\n[players.b]\nbot = "station"\n')
         plan = make_plan(['a', 'b'], deals=4, out=str(self.d / 'run'), players_file=str(players),
                          design={'max_rounds': 2})
-        decide = lambda xs, d, n, k, groups=None: {'verdict': 'exhausted' if k >= 2 else 'open', 'looks_used': k}
-        with mock.patch('poker_arena.ratings.decide', side_effect=decide):
+        decide = lambda pd, d, n, k, e: {'verdict': 'exhausted' if k >= 2 else 'open', 'looks_used': k}
+        with mock.patch('poker_arena.ratings.adjudicate', side_effect=decide, create=True):
             asyncio.run(run_plan(plan, **QUIET))
             out = self.d / 'run'
             stored = json.loads((out / 'plan.json').read_text())
+            self.assertEqual(stored['registration']['status'], 'registered')
             self.assertEqual(stored['sources'], [f'source/{stored["implementation"]["fingerprint"]}.tar.gz'])
             with tarfile.open(out / stored['sources'][0]) as tar:
                 names = tar.getnames()
@@ -326,6 +327,10 @@ class TestImplementation(Base):
                 first = f'source/{stored["implementation"]["fingerprint"]}.tar.gz'
                 self.assertEqual(stored['implementation_changes'][0]['source'], next(x for x in stored['sources']
                                                                                      if x != first))
+                self.assertEqual(stored['registration']['status'], 'void')          # the judge changed after it
+                self.assertIn('ratings.py', stored['registration']['void_reason'])
+                asyncio.run(run_plan(plan, allow_code_change=True, **QUIET))
+                self.assertEqual(json.loads((out / 'plan.json').read_text())['registration']['status'], 'void')
 
     def test_a_viewer_change_is_not_an_implementation_change(self):
         src = dict(runner.sources())

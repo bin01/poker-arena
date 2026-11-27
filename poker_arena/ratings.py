@@ -13,12 +13,17 @@ same pairing can differ for reasons that have nothing to do with the cards. A sl
 round and replicate deal to every pairing (the same seeds), so conversations on one slate share their cards.
 
 Inference and description. Exactly one thing here is a test: the preregistered sequential procedure of each
-pairing (`normalize_design`, `decide`). Its verdicts 'a', 'b' and 'even', at a completed planned look, are the
-only inferential results, and only in a run with a preregistered design and players whose identity is
-verified. A decided rank and a leader are built from those verdicts alone: a leader has a decided win over
-every other player of its group. Everything else (strengths, their intervals, the order by points, the front
-runner, session Elo, every all-time number, every number of a run without a design) is descriptive,
-recomputed on every refresh, and labelled so.
+pairing (`normalize_design`, `decide`), applied with every eligibility rule by one function, `adjudicate`,
+which the runner stops and records on. Its verdicts 'a', 'b' and 'even', at a completed planned look, are the
+only inferential results, and only when the run is preregistered (`registration_status`: a registration
+written into plan.json before the first hand, never recomputed), the pairing is eligible (identities resolved
+and attested, turns audited, protocols consistent, duplicate pairs valid; else the terminal verdict
+'ineligible'), and the verdict is official (recorded at that look by the registered judge; what today's code
+recomputes is retrospective). Every verdict carries its assumption status (`assumptions`). A decided rank and
+a leader are built from official verdicts within the calibrated range alone: a leader has such a win over
+every other player of its group. Everything else (strengths, their intervals and fit diagnostics, the order by
+points, the front runner, session Elo, every all-time number, every number of a run that is not
+preregistered) is descriptive, recomputed on every refresh, and labelled so.
 
 The test. The unit is the conversation; a look can decide only with at least MIN_CONVERSATIONS of them and
 some spread between them. A winner needs two arms to agree at a look: the conversation-level t (the
@@ -29,8 +34,8 @@ true edge (any tails, any discreteness, any dependence inside a conversation: e.
 players). The t arm's bar is calibrated for a stated family of skewed results: conversation effects of
 exponential, lognormal or rare-large-loss shape holding up to half a conversation mean's variance. Together:
 with no edge, a pairing is called with chance at most alpha / n_pairings in either case (Bonferroni over the
-pairings, Pocock-type repeated looks). Beyond the family (large, rare, one-sided swings) no test of this
-size can keep that promise; docs/methodology.md gives the measured worst cases. `even` is an equivalence
+pairings, Pocock-type repeated looks), if those assumptions hold. Beyond the family (large, rare, one-sided
+swings) no test of this size can keep that promise; docs/methodology.md gives the measured worst cases. `even` is an equivalence
 verdict (TOST at +-EQUIV_BB100, both arms).
 
 Planning. The deals a design needs come from the spread of a conversation's mean, which counts the
@@ -84,10 +89,16 @@ ELO_PRIOR = 1.5             # prior sd of a session-Elo rating, in logits
 K = 400 / math.log(10)
 ALIASES = ('sonnet', 'opus', 'haiku')   # bare CLI aliases: the model version behind them is unknown
 DECIDED = ('a', 'b', 'even')
-GUARANTEE = ('exactly whenever every conversation\'s result is symmetric about the pairing\'s true edge (for '
-             'instance when the two players are interchangeable), and in simulation for '
-             'skewed results whose conversation effects are no larger than their card noise (docs/methodology.md); '
-             'rarer, larger swings can exceed it, and no test of this size can rule them out.')
+TERMINAL = ('a', 'b', 'even', 'ineligible')   # verdicts that stop a pairing before its last look
+ALLOW_UNATTESTED = ('codex',)   # backends that cannot report the model that answered, allowed unless a design says otherwise
+ASSUMPTIONS = ('Its error bound is conditional: if the test\'s assumptions hold, a pairing with no real edge is '
+               'called for either player with chance at most alpha / n_pairings (so at most alpha over all of '
+               'them). It holds exactly when every conversation\'s result is symmetric about the true edge (for '
+               'instance two interchangeable players), which no data can confirm, and, by simulation, when results '
+               'are skewed but the conversation effect holds at most half the spread of a conversation mean '
+               '(docs/methodology.md). Beyond that range the bound is not shown to hold; each verdict says whether '
+               'its data look within it.')
+GUARANTEE = ASSUMPTIONS
 _Z = NormalDist()
 
 
@@ -148,7 +159,7 @@ def t_ppf(p, df):
 
 def _parts(identity: str):
     served = identity.split('!served=', 1)[1] if '!served=' in identity else None
-    return identity.split('!served=', 1)[0].split('#', 1)[0].split(':'), served
+    return re.split(r'[#@]', identity.split('!served=', 1)[0], maxsplit=1)[0].split(':'), served
 
 
 def identity_resolved(identity: str) -> bool:
@@ -239,9 +250,56 @@ def _round_of(name: str, cfg: dict) -> tuple[int, int]:
     return int(cfg.get('round') or (r.group(1) if r else 1)), int(cfg.get('replicate') or (x.group(1) if x else 1))
 
 
-def load_deals(root) -> list[dict]:
+def check_pair(ca: dict, cb: dict | None, ha: dict, hb: dict) -> tuple[list[int], list[dict]]:
+    """Whether b-first is a-first with the seats swapped, hand by hand: (the hands both plays finished that pass,
+    [{'hand' (None: the whole conversation), 'reason'}] for what was rejected). The conversation is rejected
+    when b-first is missing its config, seats other players or the same order, plays other game settings, other
+    seeds or other deal fingerprints, or gives a player other specs or another protocol. A hand is rejected
+    when either play's recorded seed or deal fingerprint differs from the configs', or its chips don't add up."""
+    if not cb:
+        return [], [{'hand': None, 'reason': 'b-first has no readable config'}]
+    pa, pb = list(ca.get('players') or []), list(cb.get('players') or [])
+    bad = []
+    if len(pa) != 2 or pb != pa[::-1]:
+        bad.append(f'b-first seats {pb}, not {pa[::-1]}')
+    from .history import game_key
+    if game_key(ca.get('game') or {}) != game_key(cb.get('game') or {}):
+        bad.append('the two plays have different game settings')
+    if (ca.get('seeds') or []) != (cb.get('seeds') or []):
+        bad.append('the two plays were dealt different seeds')
+    fa, fb = ca.get('deal_fingerprints'), cb.get('deal_fingerprints')
+    if fa is not None and fb is not None and fa != fb:
+        bad.append('the two plays have different deal fingerprints')
+    for p in pa:
+        if (ca.get('specs') or {}).get(p) != (cb.get('specs') or {}).get(p):
+            bad.append(f'{p} has different specs in the two plays')
+        if protocol_of(ca, p) != protocol_of(cb, p):
+            bad.append(f'{p} has a different protocol in the two plays')
+    if bad:
+        return [], [{'hand': None, 'reason': '; '.join(bad)}]
+    seeds = ca.get('seeds') or []
+    good, out = [], []
+    for k in sorted(set(ha) & set(hb)):
+        why = []
+        for side, h in (('a-first', ha[k]), ('b-first', hb[k])):
+            if h.get('seed') is not None and k < len(seeds) and h['seed'] != seeds[k]:
+                why.append(f'{side} recorded seed {h["seed"]}, not {seeds[k]}')
+            if h.get('fingerprint') is not None and fa is not None and k < len(fa) and h['fingerprint'] != fa[k]:
+                why.append(f'{side} recorded another deal fingerprint')
+            net = h.get('net')
+            if not isinstance(net, list) or len(net) != 2 or sum(net) != 0:
+                why.append(f'{side} chips do not add up ({net})')
+        if why:
+            out.append({'hand': k, 'reason': '; '.join(why)})
+        else:
+            good.append(k)
+    return good, out
+
+
+def load_deals(root, report: list | None = None) -> list[dict]:
     """[{'a', 'b', 'matchup' (the conversation), 'deal', 'net_a' (chips, both hands), 'bb', 'seed', 'fp',
-    'planned', 'slate', 'round', 'replicate'}] for every duplicate deal under root both of whose plays finished."""
+    'planned', 'slate', 'round', 'replicate'}] for every duplicate deal under root both of whose plays finished
+    and that passes `check_pair`; what it rejects is appended to `report` as {'matchup', 'hand', 'reason'}."""
     root = Path(root)
     deals = []
     for cfg_path in sorted(root.rglob('a-first/config.json')):
@@ -258,13 +316,33 @@ def load_deals(root) -> list[dict]:
         a, b = ca['players'][0], ca['players'][1]
         name = str(mdir.relative_to(root)) if mdir != root else mdir.name
         rnd, rep = _round_of(mdir.name, ca)
-        for k in sorted(set(ha) & set(hb)):
+        good, rejected = check_pair(ca, _json(b_dir / 'config.json'), ha, hb)
+        if report is not None:
+            report += [{'matchup': name, 'a': a, 'b': b, **x} for x in rejected]
+        for k in good:
             seed = seeds[k] if k < len(seeds) else None
             deals.append({'a': a, 'b': b, 'matchup': name, 'deal': k, 'bb': bb, 'seed': seed,
                           'fp': fingerprint(game, seed, k % n), 'planned': len(seeds),
                           'slate': seeds[0] if seeds else name, 'round': rnd, 'replicate': rep,
                           'net_a': ha[k]['net'][0] + hb[k]['net'][1]})
     return deals
+
+
+def pairing_data(root, folders, a) -> dict:
+    """What `adjudicate` judges for one pairing, from its match folders (relative to root) in play order:
+    {'xs' (a's bb/100 per validated duplicate deal), 'groups' (each deal's conversation), 'fps' (deal
+    fingerprints), 'conversations', 'rejected' ([{'matchup', 'hand', 'reason'}] from `check_pair`)}."""
+    root = Path(root)
+    xs, groups, fps, rejected = [], [], [], []
+    for f in folders:
+        report = []
+        for d in load_deals(root / f, report):
+            sign = 1 if d['a'] == a else -1
+            xs.append(sign * d['net_a'] / d['bb'] / 2 * 100)
+            groups.append(f)
+            fps.append(d['fp'])
+        rejected += [{**x, 'matchup': f} for x in report]
+    return {'a': a, 'xs': xs, 'groups': groups, 'fps': fps, 'conversations': list(folders), 'rejected': rejected}
 
 
 def protocol_of(cfg: dict, pid: str) -> str | None:
@@ -282,7 +360,7 @@ def protocol_of(cfg: dict, pid: str) -> str | None:
 def load_meta(root, served=None) -> dict:
     """{player id: {'identity', 'kind', 'quarantine_reason', 'identity_resolved', 'protocol'}} from the match
     configs under root. `served` ({player id: [models that answered]}) quarantines a served-model mismatch."""
-    from .history import identity
+    from .history import match_identity
     meta, protos, models = {}, defaultdict(set), {}
     for cfg_path in sorted(Path(root).rglob('config.json')):
         cfg = _json(cfg_path) or {}
@@ -291,7 +369,7 @@ def load_meta(root, served=None) -> dict:
             protos[pid].add(proto)
             models[pid] = spec.get('model')
             if pid not in meta:
-                ident = identity(pid, spec, proto)
+                ident = match_identity(cfg, pid)
                 meta[pid] = {'identity': ident, 'kind': 'bot' if 'bot' in spec else 'model',
                              'identity_resolved': identity_resolved(ident), 'protocol': proto,
                              'quarantine_reason': quarantine_reason(ident)}
@@ -304,12 +382,127 @@ def load_meta(root, served=None) -> dict:
     return meta
 
 
+# The judge and its registration.
+
+_SOURCE = Path(__file__).read_bytes()
+
+
+def judge_fingerprint() -> str:
+    """This judge's implementation: the hash of ratings.py as loaded (the hash the runner records for it)."""
+    return hashlib.sha256(_SOURCE).hexdigest()[:16]
+
+
+def calibration_id(design: dict | None) -> str | None:
+    """Names the calibration a design's bars come from: its calibrated levels and every constant of the test
+    that sets its operating characteristics."""
+    if not design or not design.get('calibration'):
+        return None
+    key = {'calibration': design['calibration'], 'nominal_alpha': design.get('nominal_alpha'), 'flips': FLIPS,
+           'seed': SIM_SEED, 'min_conversations': MIN_CONVERSATIONS, 'equiv_bb100': EQUIV_BB100}
+    return hashlib.sha1(json.dumps(key, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+DESIGN_INPUTS = ('alpha', 'round_deals', 'block', 'replicates', 'max_rounds', 'target_edge_bb100', 'prior_sd_bb100',
+                 'assumed_icc', 'assumed_ar1', 'budget_deals', 'n_pairings', 'allow_unattested', 'allow_opaque',
+                 'outside_calibration')
+
+
+def _inputs(d: dict) -> dict:
+    """What a design was chosen to be (not what this code computes from it), for comparing with a registration."""
+    d = d or {}
+    defaults = {'block': BLOCK, 'replicates': 1, 'target_edge_bb100': TARGET_EDGE, 'prior_sd_bb100': PRIOR_SD,
+                'assumed_icc': ASSUMED_ICC, 'assumed_ar1': ASSUMED_AR1, 'budget_deals': None,
+                'allow_unattested': list(ALLOW_UNATTESTED), 'allow_opaque': [], 'outside_calibration': 'exclude'}
+    out = {}
+    for k in DESIGN_INPUTS:
+        v = d.get(k, defaults.get(k))
+        out[k] = sorted(v) if isinstance(v, (list, tuple, set)) else float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v
+    return out
+
+
+def registration(design: dict, created: float | None = None) -> dict:
+    """The preregistration of a design, to write into plan.json before the first hand: the design, the judge
+    that will decide the run and the calibration of its bars."""
+    import time
+    return {'status': 'registered', 'design': design, 'judge_fingerprint': judge_fingerprint(),
+            'calibration_id': calibration_id(design), 'created': round(created if created is not None else time.time())}
+
+
+def registration_problems(reg: dict | None, design: dict | None, first_started=None, implementation=None,
+                          changes=()) -> list[str]:
+    """Why a registration doesn't preregister this design (empty: it does). `first_started` is when the run's
+    first match began, `implementation` the one it began with ({'files': {path: hash}}), `changes` the code
+    changes accepted during it (allow_code_change)."""
+    if not reg:
+        return ['no registration was written before play']
+    if reg.get('status') == 'void':
+        return [f'the registration is void: {reg.get("void_reason") or "the code changed after it"}']
+    if reg.get('status') != 'registered':
+        return [f'the registration has status {reg.get("status")!r}']
+    out = []
+    if not reg.get('judge_fingerprint') or reg.get('created') is None:
+        out.append('the registration names no judge or no time')
+    if design is not None:
+        diff = [k for k, v in _inputs(design).items() if _inputs(reg.get('design') or {}).get(k) != v]
+        if diff:
+            out.append(f'the design differs from the registered one ({", ".join(diff)})')
+    if first_started is not None and reg.get('created') is not None and float(reg['created']) > float(first_started):
+        out.append('it was written after play began')
+    judge = ((implementation or {}).get('files') or {}).get(f'{Path(__file__).parent.name}/ratings.py')
+    if judge and reg.get('judge_fingerprint') and judge != reg['judge_fingerprint']:
+        out.append('the registered judge is not the one the run started with')
+    if changes:
+        files = sorted({f for c in changes for f in (c.get('files') or ['(unrecorded files)'])})
+        out.append(f'the code changed during the run (allow_code_change: {", ".join(files)})')
+    return out
+
+
+def run_evidence(root) -> dict:
+    """What the match folders under root say about when play began and which code changes were accepted."""
+    first, changes = None, []
+    for cfg_path in Path(root).rglob('config.json'):
+        if cfg_path.parent.name not in ('a-first', 'b-first'):
+            continue
+        cfg = _json(cfg_path) or {}
+        if cfg.get('started') is not None:
+            first = cfg['started'] if first is None else min(first, cfg['started'])
+        changes += cfg.get('implementation_changes') or []
+    return {'first_started': first, 'implementation_changes': changes}
+
+
+def registration_status(plan: dict | None, evidence: dict | None = None) -> dict:
+    """Whether a run is preregistered: {'registered', 'status' ('valid' | 'missing' | 'declined' | 'legacy' |
+    'void' | 'invalid'), 'reasons', 'judge_fingerprint', 'calibration_id', 'created', 'design'}. Never recomputed
+    from the design: only a registration written into plan.json before the first hand counts, an explicit
+    `registered: false` stays false, and any code change accepted during the run voids it."""
+    plan = plan or {}
+    reg = plan.get('registration')
+    out = {'registered': False, 'status': 'missing', 'reasons': [], 'judge_fingerprint': (reg or {}).get('judge_fingerprint'),
+           'calibration_id': (reg or {}).get('calibration_id'), 'created': (reg or {}).get('created'),
+           'design': (reg or {}).get('design')}
+    design = normalize_design(plan) if plan else None
+    if plan.get('registered') is False or (plan.get('design') or {}).get('registered') is False:
+        return {**out, 'status': 'declined', 'reasons': ['the plan says registered: false']}
+    if design and design.get('legacy'):
+        return {**out, 'status': 'legacy', 'reasons': ['played under an older stopping rule, not a registered design']}
+    if not design:
+        return {**out, 'reasons': ['the run has no sequential design']}
+    ev = evidence or {}
+    problems = registration_problems(reg, design, ev.get('first_started'), plan.get('implementation'),
+                                     [*(plan.get('implementation_changes') or []), *(ev.get('implementation_changes') or [])])
+    if not problems:
+        return {**out, 'registered': True, 'status': 'valid'}
+    status = 'missing' if not reg else 'void' if reg.get('status') == 'void' or any('code changed' in p for p in problems) else 'invalid'
+    return {**out, 'status': status, 'reasons': problems}
+
+
 # The preregistered design.
 
 _COMPUTED = ('replicates', 'n_pairings', 'alpha_pairing', 'nominal_alpha', 'deals_needed', 'deals_planned',
              'max_deals', 'power_at_max', 'min_conversations', 'conversations_needed', 'power_scenarios',
              'underpowered', 'registered', 'sd_conversation_bb100', 'calibration')
-_PLAN_KEYS = ('design', 'deals', 'until_decided', 'replicates', 'matchups', 'target_edge_bb100', 'prior_sd_bb100')
+_PLAN_KEYS = ('design', 'deals', 'until_decided', 'replicates', 'matchups', 'target_edge_bb100', 'prior_sd_bb100',
+              'registered')
 
 
 def _n_pairings(plan: dict) -> int:
@@ -326,9 +519,13 @@ def normalize_design(plan: dict | None) -> dict | None:
     80% power at the target under those assumptions (max_rounds_basis 'power'); `budget_deals` caps the deals per
     pairing (basis 'budget'), and then `underpowered` says whether that leaves less than 80%. power_scenarios
     gives the power at the target under optimistic, the assumed (moderate) and pessimistic dependence;
-    power_at_max is the moderate one. registered: False for a plan whose design was not fixed before play (an
-    older stopping rule). The runner, the ratings and the viewer all use this one. None for a plan with no
-    sequential design."""
+    power_at_max is the moderate one. The eligibility rules are part of the design: allow_unattested (backends
+    whose model identity may go unattested, default codex), allow_opaque (backends whose turns may go unaudited,
+    default none) and outside_calibration ('exclude', the default: a decided verdict outside the calibrated range
+    never counts towards a decided leader; 'count'). `registered` is not computed here: it is False for a plan
+    that declines registration or played an older stopping rule (`legacy`), and absent otherwise; only
+    `registration_status` says whether a run is preregistered. The runner, the ratings and the viewer all use
+    this one. None for a plan with no sequential design."""
     if not plan or not plan.get('deals') and not (plan.get('design') or {}).get('round_deals'):
         return None
     if plan.get('design') is None and not plan.get('until_decided'):
@@ -342,6 +539,8 @@ def normalize_design(plan: dict | None) -> dict | None:
 def _normalized(key: str) -> str:
     plan = json.loads(key)
     given = {k: v for k, v in (plan.get('design') or {}).items() if k not in _COMPUTED}
+    if plan.get('registered') is False or (plan.get('design') or {}).get('registered') is False:
+        given['registered'] = False
     if plan.get('design') is not None:
         d = {**DEFAULT_DESIGN, 'round_deals': plan.get('deals') or DEFAULT_DESIGN['round_deals'], **given}
     else:
@@ -403,6 +602,7 @@ def _complete(d, reps, n_pairings, target, prior) -> dict:
         if rounds > cap:
             rounds, basis = cap, 'budget'
     a1, _, levels, _ = _calibrate(ap, rounds, reps)
+    declined = d.get('registered') is False or d.get('legacy')
     power = [{'scenario': name, 'assumed_icc': i, 'assumed_ar1': a,
               'sd_conversation_bb100': round(sd_conversation(prior, R, i, a), 1),
               'power': power_of(target / sd_conversation(prior, R, i, a), ap, rounds, reps)}
@@ -412,7 +612,10 @@ def _complete(d, reps, n_pairings, target, prior) -> dict:
     return {**d, 'round_deals': R, 'max_rounds': rounds, 'max_rounds_basis': basis, 'block': B, 'replicates': reps,
             'n_pairings': n_pairings, 'alpha_pairing': ap, 'nominal_alpha': a1,
             'min_conversations': first_verdict(ap, rounds, reps) or MIN_CONVERSATIONS,
-            'registered': not d.get('legacy'), 'target_edge_bb100': target, 'prior_sd_bb100': prior,
+            **({'registered': False} if declined else {}), 'target_edge_bb100': target, 'prior_sd_bb100': prior,
+            'allow_unattested': sorted(d.get('allow_unattested', ALLOW_UNATTESTED)),
+            'allow_opaque': sorted(d.get('allow_opaque', ())),
+            'outside_calibration': d.get('outside_calibration', 'exclude'),
             'assumed_icc': icc, 'assumed_ar1': ar1, 'sd_conversation_bb100': round(plan_sd, 1),
             'conversations_needed': need * reps if need else None, 'deals_needed': need * reps * R if need else None,
             'deals_planned': cap, 'max_deals': cap, 'power_at_max': moderate, 'power_scenarios': power,
@@ -781,6 +984,138 @@ def decide(xs, design=None, n_pairings=1, looks_used=None, groups=None) -> dict:
     return out
 
 
+# The adjudicator: the only function whose verdicts stop, record or decide anything.
+
+def assumptions(v: dict, fps=None, groups=None) -> dict:
+    """What a verdict's error bound rests on, checked against the data: {'status': 'supported' | 'unsupported' |
+    'unknown', 'checks': {name: {'status', 'value', 'limit', 'meaning'}}}. The bound holds exactly when
+    conversation results are symmetric about the true edge (which no data can confirm) and, by calibration, for
+    skewed results whose conversation effect holds at most FAMILY_SHARE of a conversation mean's variance:
+    `conversation_share` estimates that share. `independent_deals`: no deal is repeated across the pairing's
+    conversations. `conversations`: enough of them to judge at all."""
+    checks = {}
+    C, need = v.get('conversations') or 0, v.get('min_conversations') or MIN_CONVERSATIONS
+    checks['conversations'] = {'status': 'supported' if C >= need else 'unknown', 'value': C, 'limit': need,
+                               'meaning': 'independent conversations, at least the number a verdict needs'}
+    share = v.get('conversation_share')
+    checks['conversation_share'] = {
+        'status': 'unknown' if share is None else 'supported' if share <= FAMILY_SHARE else 'unsupported',
+        'value': share, 'limit': FAMILY_SHARE,
+        'meaning': 'estimated share of the spread of conversation means that is a conversation effect; the test '
+                   'is calibrated up to the limit (beyond it the bound holds only if results are symmetric)'}
+    if fps is not None and groups is not None:
+        seen, repeats = {}, 0
+        for fp, g in zip(fps, groups):
+            if fp is None:
+                continue
+            if fp in seen and seen[fp] != g:
+                repeats += 1
+            seen.setdefault(fp, g)
+        checks['independent_deals'] = {'status': 'supported' if not repeats else 'unsupported', 'value': repeats,
+                                       'limit': 0, 'meaning': 'deals repeated across conversations of the pairing'}
+    states = {c['status'] for c in checks.values()}
+    status = 'unsupported' if 'unsupported' in states else 'unknown' if 'unknown' in states else 'supported'
+    return {'status': status, 'checks': checks}
+
+
+def _player_problems(p: str, x: dict | None, design: dict) -> list[str]:
+    if not x:
+        return [f'{p}: no eligibility facts']
+    if x.get('kind') == 'bot':
+        return []
+    out, backend = [], x.get('backend')
+    model = x.get('requested_model')
+    if not model:
+        out.append(f'{p}: no model recorded, so which model played is unknown')
+    elif str(model) in ALIASES:
+        out.append(f'{p}: bare alias "{model}", so the model version behind it is unknown')
+    ident = x.get('identity')
+    if ident == 'mismatch':
+        out.append(f'{p}: answered by {", ".join(x.get("observed_models") or ["another model"])}, not the requested {model}')
+    elif ident in (None, 'none'):
+        out.append(f'{p}: no replies recorded')
+    elif ident == 'unattested' and backend not in (design.get('allow_unattested') or ()):
+        out.append(f'{p}: its backend ({backend}) did not attest which model answered, and the design does not '
+                   f'allow unattested {backend}')
+    audit = x.get('audit')
+    if audit == 'opaque' and backend not in (design.get('allow_opaque') or ()):
+        out.append(f'{p}: its turns could not be audited for tool use (opaque {backend} backend), and the design '
+                   f'does not allow that')
+    elif audit not in ('complete', 'opaque'):
+        out.append(f'{p}: some of its decisions have no complete audit of tool use')
+    if x.get('protocol_consistent') is False:
+        out.append(f'{p}: its settings (protocol) differ between matches of the pairing')
+    return out
+
+
+def adjudicate(pairing_data: dict, design: dict, n_pairings: int, look: int, eligibility: dict | None) -> dict:
+    """The verdict on one pairing at look `look`, with every eligibility rule applied: what the runner stops and
+    records on, and what the ratings, the CLI and the viewer report as official when the runner recorded it.
+
+    pairing_data: {'a', 'b', 'xs' (a's bb/100 per duplicate deal), 'groups' (each deal's conversation),
+    'fps' (deal fingerprints, optional), 'rejected' (check_pair's rejections)}; or {'root', 'conversations', 'a',
+    'b'} to load and validate them with `pairing_data`. eligibility: the runner's facts ({'registration',
+    'implementation_changes', 'first_started' (optional), 'players': {pid: {'kind', 'backend', 'requested_model',
+    'identity', 'audit', 'protocol_consistent', 'observed_models', ...}}}).
+
+    Returns `decide`'s keys plus: eligible, ineligible_reasons, assumptions ({status, checks}), calibrated
+    (True / False / None: assumptions supported / unsupported / unknown), counts_toward_leader, standing,
+    test_verdict (decide's verdict), identity_status and audit_status per player, judge_fingerprint (= judge),
+    calibration_id, registered_judge and official (made by the registered judge under a valid registration).
+    verdict is 'ineligible', a terminal verdict, whenever any rule fails: no valid registration, code changed
+    during the run, a player's identity unresolved, mismatched or unattested where the design doesn't allow it,
+    its turns not fully audited, its protocol inconsistent, or a duplicate pair that failed validation."""
+    data = dict(pairing_data)
+    if 'xs' not in data and data.get('root') is not None:
+        data = {**pairing_data_of(data), **{k: v for k, v in data.items() if k in ('a', 'b')}}
+    xs, groups = list(data.get('xs') or []), data.get('groups')
+    v = decide(xs, design, n_pairings, look, groups=groups)
+    elig = eligibility or {}
+    reasons = []
+    if eligibility is None:
+        reasons.append('no eligibility facts were given')
+    reg = elig.get('registration')
+    reasons += registration_problems(reg, design, elig.get('first_started'), None, elig.get('implementation_changes') or ())
+    if (design or {}).get('registered') is False:
+        reasons.append('the plan declined registration')
+    players = elig.get('players') or {}
+    named = [p for p in (data.get('a'), data.get('b')) if p] or list(players)
+    for p in named:
+        reasons += _player_problems(p, players.get(p), design or {})
+    rejected = data.get('rejected')
+    if rejected is None:
+        reasons.append('the duplicate pairs were not validated')
+    elif rejected:
+        reasons.append(f'{len(rejected)} duplicate pair{"s" if len(rejected) != 1 else ""} failed validation '
+                       f'({rejected[0].get("reason")}{"; ..." if len(rejected) > 1 else ""})')
+    reasons = list(dict.fromkeys(reasons))
+    a = assumptions(v, data.get('fps'), groups)
+    calibrated = {'supported': True, 'unsupported': False}.get(a['status'])
+    eligible = not reasons
+    test = v['verdict']
+    count_outside = (design or {}).get('outside_calibration') == 'count'
+    counts = eligible and test in DECIDED and (calibrated is True or (calibrated is False and count_outside))
+    standing = None
+    if eligible and test in DECIDED:
+        standing = 'decided' if calibrated else ('decided (outside calibrated range)' if calibrated is False
+                                                 else 'decided (assumptions unchecked)')
+    judge = judge_fingerprint()
+    cal = calibration_id(design)
+    official = bool(reg) and not registration_problems(reg, design) and reg.get('judge_fingerprint') == judge \
+        and reg.get('calibration_id') == cal
+    return {**v, 'verdict': test if eligible else 'ineligible', 'test_verdict': test, 'eligible': eligible,
+            'ineligible_reasons': reasons, 'assumptions': a, 'calibrated': calibrated, 'counts_toward_leader': counts,
+            'standing': standing,
+            'identity_status': {p: (players.get(p) or {}).get('identity') for p in named},
+            'audit_status': {p: (players.get(p) or {}).get('audit') for p in named},
+            'judge_fingerprint': judge, 'judge': judge, 'calibration_id': cal,
+            'registered_judge': (reg or {}).get('judge_fingerprint'), 'official': official}
+
+
+def pairing_data_of(spec: dict) -> dict:
+    return pairing_data(spec['root'], spec.get('conversations') or [], spec['a'])
+
+
 # Strength, and its uncertainty.
 
 def observations(deals, block=BLOCK) -> tuple[list[dict], int]:
@@ -799,7 +1134,7 @@ def observations(deals, block=BLOCK) -> tuple[list[dict], int]:
             if slate is None:
                 slate = d['seed'] - d['deal'] if d.get('seed') is not None else d['matchup']
             g = groups[key] = {'a': d['a'], 'b': d['b'], 'xs': [], 'matchup': d['matchup'], 'deal': d['deal'],
-                               'slate': slate, 'pos': d['deal'] // block, 'round': d.get('round') or 1,
+                               'slate': slate, 'pos': d['deal'] // block, 'round': d.get('round') or 1, 'fp': d.get('fp'),
                                'replicate': d.get('replicate') or 1, 'planned': d.get('planned') or 0}
         g['xs'].append(x if d['a'] == g['a'] else -x)
     obs = [{**{k: v for k, v in g.items() if k != 'xs'}, 'x': sum(g['xs']) / len(g['xs']), 'plays': len(g['xs'])}
@@ -1002,11 +1337,14 @@ def _elo(names, comps, games, iters=60):
 # The leaderboard.
 
 def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, plan=None, pooled=False,
-         n_pairings=None, notes=(), playing=(), recorded=None) -> dict:
+         n_pairings=None, notes=(), playing=(), recorded=None, eligibility=None, rejected=(), registration=None) -> dict:
     """The leaderboard from duplicate deals (as `load_deals` gives them). `meta` gives each player's identity,
     kind and quarantine reason; with `pooled` (all-time standings) everything is descriptive and quarantined
     players are listed but left out of the fit. `plan` (a tournament's plan.json) gives the design, the roster
-    and the pairings planned; `playing` players with a match under way; `recorded` the run's decisions.json."""
+    and the pairings planned; `playing` players with a match under way; `recorded` the run's decisions.json
+    (the official decisions); `eligibility` ({frozenset((a, b)): the runner's facts}) what today's adjudication
+    of each pairing is checked with; `rejected` the duplicate pairs that failed validation; `registration`
+    the run's `registration_status` (from the plan alone when not given)."""
     meta = meta or {}
     raw = [d for d in deals if d['a'] != d['b']]
     planned_pairs = []
@@ -1015,17 +1353,22 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
             planned_pairs.append((a, b))
     seen = {frozenset((d['a'], d['b'])) for d in raw}
     n_pairings = n_pairings or len(planned_pairs) or max(1, len(seen))
+    reg = None
     if pooled:
         design = None
-    elif design is None:
-        design = normalize_design(plan) if plan else None
+    else:
+        if design is None:
+            design = normalize_design(plan) if plan else None
+        reg = registration if registration is not None else registration_status(plan)
         if design is None:
             design = unregistered((plan or {}).get('deals') or max((d.get('planned') or 0 for d in raw), default=1),
                                   n_pairings, (plan or {}).get('replicates') or 1)
-        elif not design.get('registered', True):
+        elif not reg['registered']:
             design = {**unregistered(design['round_deals'], n_pairings, design['replicates']), 'legacy': design.get('legacy')}
+        else:
+            design = {**design, 'registered': True}
     block = int((design or {}).get('block') or BLOCK)
-    registered = not pooled and bool(design and design.get('registered', True))
+    registered = not pooled and bool(design and design.get('registered'))
     info = lambda p: meta.get(p) or {'identity': p, 'kind': 'bot' if p.startswith('bot:') else 'model',
                                      'quarantine_reason': None, 'identity_resolved': True}
     excluded = {p for d in raw for p in (d['a'], d['b']) if pooled and info(p)['quarantine_reason']}
@@ -1060,13 +1403,20 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
             v[idx[p]] += s
         return v
 
-    pairings = _pairings(used, obs, design, n_pairings, pooled, recorded or {}, lambda p: info(p)['quarantine_reason'])
+    pairings = _pairings(used, obs, design, n_pairings, pooled, recorded or {}, eligibility or {}, list(rejected),
+                         reg, lambda p: info(p)['quarantine_reason'])
     vmap = {frozenset((x['a'], x['b'])): x for x in pairings}
+    _fit_diagnostics(pairings, names, idx, comps, cells, strata, point, draws, W)
 
-    def result(p, q):
-        """'win', 'loss', 'even' or None: the decided verdict of p against q."""
+    def result(p, q, outside=False):
+        """'win', 'loss', 'even' or None: the decided verdict of p against q that counts towards a decided rank
+        or leader (official, eligible, within the calibrated range unless the design counts the rest; with
+        `outside`, also one outside that range), between players not quarantined in the run."""
         x = vmap.get(frozenset((p, q)))
-        if pooled or not x or x['verdict'] not in DECIDED:
+        if pooled or not x or x['verdict'] not in DECIDED or info(p)['quarantine_reason'] or info(q)['quarantine_reason']:
+            return None
+        if not (x.get('counts_toward_leader') or (outside and x.get('official') and x.get('eligible')
+                                                   and x.get('calibrated') is False)):
             return None
         if x['verdict'] == 'even':
             return 'even'
@@ -1100,6 +1450,8 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
             if decided[p][0] and ranks.count(decided[p][0]) > 1:     # a cycle of verdicts: no strict order
                 decided[p] = (None,) + decided[p][1:]
         lead = next((p for p in comp if len(comp) > 1 and all(result(p, q) == 'win' for q in comp if q != p)), None)
+        outside = None if lead else next((p for p in comp if len(comp) > 1 and all(
+            result(p, q, True) == 'win' for q in comp if q != p)), None)
         front = order[0] if len(order) > 1 else None
         margin = ci95 = None
         if front:
@@ -1123,11 +1475,13 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
         leaders.append(leader)
         groups.append({
             'id': ci, 'players': comp, 'leader': lead, 'leader_detail': leader, 'front_runner': front,
+            'leader_outside_calibration': outside,
+            'misfit_pairings': sum((x.get('additivity') or {}).get('status') == 'warning' for x in mine),
             'over': order[1] if front else None, 'front_runner_margin': margin, 'ci95': ci95, 'power': power,
             'pairings': len(mine), 'decided': sum(x['verdict'] in DECIDED for x in mine),
             'has_bot': any(info(p)['kind'] == 'bot' for p in comp),
             'kind': 'descriptive' if pooled else 'decided' if lead else 'descriptive',
-            'headline': _headline(lead, front, margin, ci95, mine, pooled)})
+            'headline': _headline(lead, front, margin, ci95, mine, pooled, outside)})
         for pos, p in enumerate(order, 1):
             i = idx[p]
             se, sci, df, basis = interval([p], unit((p, 1)))
@@ -1142,6 +1496,8 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
             rank, rng_, tied = decided[p]
             players.append({
                 'player': p, 'identity': info(p)['identity'], 'kind': info(p)['kind'], 'component': ci,
+                'identity_status': _status_of(p, pairings, 'identity_status'),
+                'audit_status': _status_of(p, pairings, 'audit_status'),
                 'strength': round(float(point[i]), 1), 'strength_se': se, 'strength_ci95': sci, 'df': df,
                 'ci_basis': basis, 'position': pos, 'rank': rank, 'rank_kind': 'decided' if rank else 'descriptive',
                 'rank_range': rng_, 'rank_tied_with': tied, 'in_fit': True,
@@ -1158,6 +1514,8 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
     for p in unrated:
         players.append({
             'player': p, 'identity': info(p)['identity'], 'kind': info(p)['kind'], 'component': None,
+            'identity_status': _status_of(p, pairings, 'identity_status'),
+            'audit_status': _status_of(p, pairings, 'audit_status'),
             'strength': None, 'strength_se': None, 'strength_ci95': None, 'df': None, 'ci_basis': None,
             'position': None, 'rank': None, 'rank_kind': 'descriptive', 'rank_range': None, 'rank_tied_with': [],
             'in_fit': False, 'identity_resolved': bool(info(p).get('identity_resolved', identity_resolved(info(p)['identity']))),
@@ -1168,7 +1526,7 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
             'quarantine_reason': info(p)['quarantine_reason'] if p in excluded else None,
             'unrated_reason': info(p)['quarantine_reason'] if p in excluded else 'played only unrated opponents'})
 
-    final = {'a', 'b', 'even', 'exhausted'}
+    final = {'a', 'b', 'even', 'exhausted', 'ineligible'}
     verdict_of = {frozenset((x['a'], x['b'])): x['verdict'] for x in pairings}
     roster_ids = list((plan or {}).get('players') or [])
     for p in [q for m in (plan or {}).get('matchups', []) for q in m] + [x['player'] for x in players]:
@@ -1187,65 +1545,102 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
             status = 'done'
         roster.append({'player': p, 'status': status})
 
-    notes = list(notes) + _notes(pooled, design, pairings, comps, groups, obs, repeats, excluded, unrated, players, block)
-    return {'objective': OBJECTIVE, 'design': design, 'pooled': pooled, 'deals': len(raw), 'hands': 2 * len(raw),
+    notes = list(notes) + _notes(pooled, design, pairings, comps, groups, obs, repeats, excluded, unrated, players, block,
+                                 reg, list(rejected))
+    return {'objective': OBJECTIVE, 'design': design, 'registration': reg, 'pooled': pooled, 'deals': len(raw),
+            'hands': 2 * len(raw), 'rejected': list(rejected), 'judge_fingerprint': judge_fingerprint(),
+            'fit': {'method': 'least squares on distinct duplicate deals: each distinct deal counts once, so a '
+                              'pairing weighs as much as it has deals, and a player\'s strength is against the '
+                              'opponents it actually met, as often as it met them',
+                    'residual': 'per pairing: the observed edge minus the edge the strengths imply, with a '
+                                'bootstrap standard error; additivity "warning" when it is beyond 2 of them',
+                    'primary': 'the direct pairwise results; strengths summarise them'},
             'observations': len(obs), 'repeats': repeats, 'block': block, 'boot': boot,
             'equiv_bb100': EQUIV_BB100, 'session_deals': session,
             'min_conversations': (design or {}).get('min_conversations') or MIN_CONVERSATIONS,
             'inference': ('descriptive only: pooled across runs, so no result here is a test' if pooled else
-                          'descriptive only: this run had no preregistered design, so no result here is a test'
+                          'descriptive only: this run is not preregistered (no valid registration before play), '
+                          'so no result here is a test'
                           if not registered else
-                          'decided results come only from the preregistered sequential test of each pairing; '
-                          'strengths, intervals and the order by points are descriptive'),
+                          'decided results come only from the official decisions of the preregistered '
+                          'sequential test of each pairing, recorded by the registered judge; strengths, intervals '
+                          'and the order by points are descriptive'),
             'guarantee': None if not registered else GUARANTEE,
+            'assumptions': None if not registered else ASSUMPTIONS,
             'components': comps, 'groups': groups, 'leader': leaders[0] if leaders else None, 'leaders': leaders,
             'players': players, 'pairings': pairings, 'matchups': pairings, 'roster': roster, 'notes': notes}
 
 
-def _headline(lead, front, margin, ci95, pairings, pooled) -> str:
+def _headline(lead, front, margin, ci95, pairings, pooled, outside=None) -> str:
     """One line per group, from that group's own data only."""
     if lead:
-        return f'{lead} is the decided leader: it won its pairing against every other player in this group.'
+        return (f'{lead} is the decided leader: it won its pairing against every other player in this group, each '
+                f'within the range the test is calibrated for.')
     if not front:
         return 'Only one player in this group.'
-    open_ = sum(x['verdict'] not in DECIDED for x in pairings)
+    open_ = sum(not x.get('counts_toward_leader') for x in pairings)
     what = 'pooled across runs, so nothing here is decided' if pooled else (
-        f'no decided leader ({open_} of {len(pairings)} pairings undecided)')
+        f'no decided leader ({open_} of {len(pairings)} pairings without decided results that count)')
+    if outside:
+        what += (f'; {outside} won every pairing, but at least one of those verdicts is outside the calibrated range, '
+                 f'where its error rate is unknown')
     iv = f', 95% {_iv(ci95)}' if ci95 else ''
     return f'{front} is ahead on points by {margin:+.0f} bb/100 over the next player{iv}; {what}.'
 
 
-def _notes(pooled, design, pairings, comps, groups, obs, repeats, excluded, unrated, players, block) -> list:
+def _notes(pooled, design, pairings, comps, groups, obs, repeats, excluded, unrated, players, block, reg=None,
+           rejected=()) -> list:
     notes = []
     if pooled:
         notes.append('All-time standings pool runs with different designs and stopping times, so they are '
                      'descriptive only: no verdict, rank or leader here is a test result. Only identical '
-                     'protocols pool (model, reasoning level and the settings that change play).')
-    elif not design.get('registered', True):
-        notes.append('This run had no preregistered design (it was played as one fixed round, or under an older '
-                     'stopping rule), so nothing in it is a test: every verdict is descriptive, and any sample size '
-                     'shown for it is retrospective.')
+                     'protocols and implementations pool (model, reasoning level, the settings that change play, '
+                     'and the code and CLI version that played).')
+    elif not design.get('registered'):
+        why = '; '.join((reg or {}).get('reasons') or []) or 'no registration was written before play'
+        notes.append(f'This run is not preregistered ({why}), so nothing in it is a test: every verdict is '
+                     f'descriptive, and any sample size shown for it is retrospective.')
     else:
-        notes.append(f'Decided results come only from the preregistered sequential test of each pairing: at most '
-                     f'{design["alpha"]:.0%} chance of any false verdict over its {design["n_pairings"]} '
-                     f'pairing{"s" if design["n_pairings"] != 1 else ""}, {GUARANTEE} Strengths, intervals and the '
-                     f'order by points are descriptive.')
+        notes.append(f'Decided results come only from the preregistered sequential test of each pairing, as the '
+                     f'runner recorded it when play stopped (the official decision, by judge '
+                     f'{(reg or {}).get("judge_fingerprint")}). {ASSUMPTIONS} Strengths, intervals and the order by '
+                     f'points are descriptive.')
         if any(x['verdict'] == 'early' for x in pairings):
             notes.append(f'A verdict needs at least {design.get("min_conversations", MIN_CONVERSATIONS)} conversations (fresh match pairs) of a '
                          f'pairing; pairings with fewer are "too early", whatever their numbers say.')
         if any(x['basis'] == 'blocks' for x in pairings):
             notes.append(f'Some pairings have one conversation: their intervals describe that conversation only '
                          f'(blocks of {block} deals), not how a new match would go.')
-        wide = [x for x in pairings if (x.get('conversation_share') or 0) > FAMILY_SHARE
-                and x['conversations'] >= design.get('min_conversations', MIN_CONVERSATIONS)]
+        wide = [x for x in pairings if x.get('calibrated') is False]
         if wide:
-            notes.append('In ' + ', '.join(f'{x["a"]} vs {x["b"]}' for x in wide) + ' the conversations differ by more '
-                         'than their card noise explains (estimated), beyond the range the test is calibrated for '
-                         'unless their results are symmetric; its verdict there is less certain than stated.')
-        doubt = [x for x in pairings if x.get('test_verdict')]
-        if doubt:
-            notes.append('Pairings with a player whose identity is in doubt (no exact model version, mixed settings, or '
-                         'another model answered) are descriptive only: ' + ', '.join(f'{x["a"]} vs {x["b"]}' for x in doubt) + '.')
+            notes.append('Outside the calibrated range: ' + ', '.join(f'{x["a"]} vs {x["b"]}' for x in wide) + '. Their '
+                         'conversations differ by more than the test was calibrated for (or repeat deals), so their '
+                         'error rate is unknown unless their results are symmetric, which no data can show; '
+                         + ('the design counts such verdicts anyway.' if design.get('outside_calibration') == 'count'
+                            else 'such a verdict never counts towards a decided rank or leader.'))
+        bad = [x for x in pairings if x['verdict'] == 'ineligible']
+        if bad:
+            notes.append('Ineligible for a decided result: ' + '; '.join(
+                f'{x["a"]} vs {x["b"]} ({"; ".join(x.get("ineligible_reasons") or [])})' for x in bad) + '.')
+        retro = [x for x in pairings if x.get('retrospective') and x.get('test_verdict') in DECIDED + ('ineligible',)]
+        if retro:
+            notes.append('No decision by the registered judge was recorded at the last look of ' + ', '.join(
+                f'{x["a"]} vs {x["b"]}' for x in retro) + '; what is shown there is today\'s recomputation '
+                '(retrospective), which decides nothing.')
+        changed = [x for x in pairings if x.get('official') and x.get('recomputed') and not x['recomputed']['agrees']]
+        if changed:
+            notes.append('Today\'s judge would judge some looks differently (' + ', '.join(
+                f'{x["a"]} vs {x["b"]}: {x["recomputed"]["verdict"]}' for x in changed) + '); that recomputation is '
+                'retrospective: the official verdict is the one recorded by the registered judge.')
+        stale = [x for x in pairings if x.get('official') and x.get('integrity_now') is False]
+        if stale:
+            notes.append('The match folders of ' + ', '.join(f'{x["a"]} vs {x["b"]}' for x in stale) + ' no longer '
+                         'pass validation, so their recorded verdicts no longer count towards a decided leader.')
+    if rejected:
+        notes.append(f'{len(rejected)} duplicate pair{"s" if len(rejected) != 1 else ""} failed validation (the b-first '
+                     f'play is not a-first with the seats swapped on the same deals) and were left out: '
+                     + '; '.join(f'{x.get("matchup")}{"" if x.get("hand") is None else " hand " + str(x["hand"])}: '
+                                 f'{x["reason"]}' for x in list(rejected)[:3]) + ('; ...' if len(rejected) > 3 else '.'))
     if any(p['ci_basis'] in ('blocks', 'mixed') for p in players if p['in_fit']):
         notes.append('Strength intervals marked "blocks" rest on blocks of deals within single conversations, so '
                      'they leave out how much fresh matches differ.')
@@ -1264,16 +1659,17 @@ def _notes(pooled, design, pairings, comps, groups, obs, repeats, excluded, unra
         notes.append(f'Not rated (every opponent was unrated): {", ".join(sorted(set(unrated) - excluded))}.')
     elif not pooled and any(x['quarantined'] for x in players):
         notes.append('Some players are quarantined (no exact model version, mixed settings, or another model '
-                     'answered): their strengths are shown, but no verdict involving them is decided and they are '
+                     'answered): their strengths are shown, but no decided rank or leader involves them and they are '
                      'not pooled into the all-time standings.')
     if any(len(c) > 2 and _is_tree(c, obs) for c in comps):
         notes.append('Every pairing in a group is its only link between those players, so the strengths fit the '
                      'pairings exactly and nothing checks that edges add up across players.')
-    changed = [x for x in pairings if x.get('recorded_verdict') and x['recorded_verdict'] != x.get('test_verdict', x['verdict'])]
-    if changed:
-        notes.append('The run recorded different verdicts with an earlier version of the test ('
-                     + ', '.join(f'{x["a"]} vs {x["b"]}: {x["recorded_verdict"]}' for x in changed)
-                     + '); shown here is the current test on the same looks, and a pairing it stopped is not resumed.')
+    misfit = [x for x in pairings if (x.get('additivity') or {}).get('status') == 'warning']
+    if misfit:
+        notes.append('The strengths do not add up for ' + ', '.join(
+            f'{x["a"]} vs {x["b"]} (observed {x["observed_edge"]:+.0f}, the strengths imply {x["fitted_edge"]:+.0f})'
+            for x in misfit) + ': one number per player cannot describe these results, so read the pairings '
+            'directly; a strength is an average over the opponents a player happened to meet.')
     notes.append('Session Elo is the share of 10-deal sessions won: a different, secondary statistic that never '
                  'decides anything. Its interval is the wider of a posterior one and a bootstrap that resamples '
                  'sessions with their slates and conversations.')
@@ -1285,11 +1681,73 @@ def _is_tree(comp, obs):
     return len(edges) == len(comp) - 1
 
 
-def _pairings(raw, obs, design, n_pairings, pooled, recorded, blocked=lambda p: None) -> list:
+def _status_of(p, pairings, key):
+    """A player's identity or audit status over its pairings: the worst one any of them recorded."""
+    order = ['mismatch', 'none', 'incomplete', 'unattested', 'opaque', 'attested', 'complete', 'bot']
+    seen = [x[key][p] for x in pairings if isinstance(x.get(key), dict) and x[key].get(p)]
+    return min(seen, key=lambda s: order.index(s) if s in order else -1) if seen else None
+
+
+def _fit_diagnostics(pairings, names, idx, comps, cells, strata, point, draws, W):
+    """Per pairing: the edge observed over the deals in the fit, the edge the strengths imply (fitted_edge), the
+    residual and its bootstrap standard error, and `additivity` ({'status': 'ok' | 'warning' | 'untestable',
+    'z'}): a warning when the residual is beyond 2 standard errors. A group whose pairings form a tree (or two
+    players) fits them exactly: untestable."""
+    if not names:
+        return
+    comp_of = {p: i for i, c in enumerate(comps) for p in c}
+    tree = {i: len({frozenset((c['a'], c['b'])) for c in cells if comp_of[c['a']] == i}) <= len(comps[i]) - 1
+            for i in range(len(comps))}
+    n = np.array([c['n'] for c in cells], float)
+    for x in pairings:
+        if x['a'] not in idx or x['b'] not in idx:
+            continue
+        ix = [i for i, c in enumerate(cells) if {c['a'], c['b']} == {x['a'], x['b']}]
+        sign = np.array([1.0 if cells[i]['a'] == x['a'] else -1.0 for i in ix])
+        sx = np.array([cells[i]['sx'] for i in ix]) * sign
+        observed = float(sx.sum() / n[ix].sum())
+        i, j = idx[x['a']], idx[x['b']]
+        fitted = float(point[i] - point[j])
+        res = observed - fitted
+        se, z, status = None, None, 'untestable' if tree[comp_of[x['a']]] else None
+        if status is None and len(W) >= 2 and _df_basis([x['a'], x['b']], strata)[0] >= 1:
+            obs_w = (W[:, ix] * sx).sum(1) / (W[:, ix] * n[ix]).sum(1)
+            r = obs_w - (draws[:, i] - draws[:, j])
+            se = float(np.std(r, ddof=1))
+            if se > 1e-9:
+                z = res / se
+                status = 'warning' if abs(z) > 2 else 'ok'
+        x.update({'observed_edge': round(observed, 1), 'fitted_edge': round(fitted, 1), 'residual': round(res, 1),
+                  'residual_se': None if se is None else round(se, 1),
+                  'additivity': {'status': status or 'untestable', 'z': None if z is None else round(z, 2)}})
+
+
+_DECISION_KEYS = ('verdict', 'test_verdict', 't', 'boundary', 'signflip', 'decided_at_look', 'ci_decision', 'equiv_ci',
+                  'eligible', 'ineligible_reasons', 'assumptions', 'calibrated', 'counts_toward_leader', 'standing',
+                  'conversation_share', 'min_conversations', 'identity_status', 'audit_status', 'calibration_id',
+                  'looks_used', 'looks_planned', 'edge', 'ci95', 'se', 'df', 'basis', 'deals', 'conversations',
+                  'blocks', 'reason', 'sd_per_deal', 'power', 'alpha_pairing')
+
+
+def _official(rec: dict | None, reg: dict | None) -> bool:
+    """Whether a recorded look is an official decision: written by the adjudicator, by the registered judge,
+    with the registered calibration."""
+    if not rec or not reg or not reg.get('registered') or 'eligible' not in rec or rec.get('official') is False:
+        return False
+    judge = rec.get('judge_fingerprint') or rec.get('judge')
+    return judge == reg.get('judge_fingerprint') and rec.get('calibration_id') == reg.get('calibration_id')
+
+
+def _pairings(raw, obs, design, n_pairings, pooled, recorded, eligibility=None, rejected=(), reg=None,
+              blocked=lambda p: None) -> list:
     """One row per pair of players, pooling every conversation between them, with its verdict at the last
-    completed planned look. Descriptive only (verdict 'descriptive', `inferential` False) when pooled, when the
-    run had no preregistered design, or when either player's identity is in doubt (`blocked` gives the reason:
-    unresolved model, mixed settings, another model answered)."""
+    completed planned look. Descriptive only (verdict 'descriptive', `inferential` False) when pooled or when the
+    run is not preregistered. In a preregistered run every row is adjudicated today (`adjudicate`, with the
+    pairing's eligibility facts and duplicate-pair validation), and the verdict shown is the official one: the
+    decision the runner recorded at that look with the registered judge (`official` True, `judge` its
+    fingerprint; `recomputed` says what today's judge makes of it). Without such a record the row is
+    `retrospective` (today's recomputation): a decided result there becomes verdict 'retrospective' and counts
+    for nothing."""
     by = {}
     for o in obs:
         x = by.setdefault(frozenset((o['a'], o['b'])), {'a': o['a'], 'b': o['b'], 'obs': [], 'matchups': [],
@@ -1307,18 +1765,21 @@ def _pairings(raw, obs, design, n_pairings, pooled, recorded, blocked=lambda p: 
         o = outcome(g) if g['a'] == by[key]['a'] else 1 - outcome(g)
         wins[key][0] += o == 1.0
         wins[key][1] += o == 0.0
-    registered = bool(design and design.get('registered', True))
+    registered = bool(design and design.get('registered'))
     out = []
     for key, x in by.items():
         os_ = sorted(x['obs'], key=lambda o: (o['round'], o['replicate'], o['matchup'], o['deal']))
         sign = lambda o: o['x'] if o['a'] == x['a'] else -o['x']
-        doubt = [f'{p}: {blocked(p)}' for p in (x['a'], x['b']) if blocked(p)]
+        rec = recorded.get(f'{x["a"]}__vs__{x["b"]}') or recorded.get(f'{x["b"]}__vs__{x["a"]}') or []
         if pooled or not registered:
             v = decide([sign(o) for o in os_], {'max_rounds': 1, 'round_deals': len(os_), 'block': BLOCK},
                        n_pairings, 0, groups=[o['matchup'] for o in os_])
             v.update(verdict='descriptive', boundary=None, ci_decision=None, equiv_ci=None, signflip=None,
-                     reason=None if pooled else 'this run had no preregistered design, so nothing in it is a test')
-            looks, beyond = 0, 0
+                     reason=None if pooled else 'this run is not preregistered, so nothing in it is a test',
+                     assumptions=assumptions(v, [o['fp'] for o in os_], [o['matchup'] for o in os_]),
+                     official=False, retrospective=False, eligible=None, ineligible_reasons=[], calibrated=None,
+                     counts_toward_leader=False)
+            beyond = 0
         else:
             rounds, reps = int(design['max_rounds']), int(design.get('replicates') or 1)
             conv = defaultdict(lambda: [0, 0])
@@ -1333,24 +1794,50 @@ def _pairings(raw, obs, design, n_pairings, pooled, recorded, blocked=lambda p: 
                 else:
                     break
             at = [o for o in os_ if o['round'] <= looks] if looks else os_
-            v = decide([sign(o) for o in at], design, n_pairings, looks, groups=[o['matchup'] for o in at])
+            mine = [y for y in rejected if {y.get('a'), y.get('b')} == set(key)]
+            data = {'a': x['a'], 'b': x['b'], 'xs': [sign(o) for o in at], 'groups': [o['matchup'] for o in at],
+                    'fps': [o['fp'] for o in at], 'rejected': mine}
+            today = adjudicate(data, design, n_pairings, looks, eligibility.get(key))
             beyond = len(os_) - len(at) if looks else 0
-            if doubt:
-                v.update(test_verdict=v['verdict'], verdict='descriptive',
-                         reason='; '.join(doubt) + ': results that involve it are descriptive only')
-        v['inferential'] = v['verdict'] != 'descriptive'
-        rec = recorded.get(f'{x["a"]}__vs__{x["b"]}') or recorded.get(f'{x["b"]}__vs__{x["a"]}') or []
-        last = rec[-1] if rec else {}
+            last = rec[looks - 1] if looks and len(rec) >= looks and rec[looks - 1].get('looks_used') == looks else None
+            if _official(last, reg):
+                v = {**today, **{k: last[k] for k in _DECISION_KEYS if k in last}, 'official': True,
+                     'retrospective': False, 'judge': last.get('judge_fingerprint') or last.get('judge'),
+                     'recomputed': {'verdict': today['verdict'], 'judge': today['judge'],
+                                    'agrees': today['verdict'] == last.get('verdict')}}
+                if mine:
+                    v.update(integrity_now=False, counts_toward_leader=False)
+            else:
+                v = {**today, 'official': False, 'retrospective': looks >= 1, 'counts_toward_leader': False,
+                     'recomputed': None}
+                if today['verdict'] in DECIDED:
+                    v.update(verdict='retrospective',
+                             reason='no decision by the registered judge was recorded at this look; this is today\'s '
+                                    'recomputation, which decides nothing')
+        v['inferential'] = bool(v.get('official')) and v['verdict'] in DECIDED
+        last_rec = rec[-1] if rec else {}
         out.append({'a': x['a'], 'b': x['b'], 'matchups': x['matchups'], 'matchup': x['matchups'][-1],
                     'plays': x['plays'], 'hands': 2 * x['plays'], 'net_a_chips': x['chips'],
                     'deals_total': len(os_), 'deals_since_look': beyond, 'in_progress': bool(beyond),
                     'a_session_wins': wins[key][0], 'b_session_wins': wins[key][1], **v,
-                    'recorded_verdict': last.get('verdict'), 'recorded_looks': last.get('looks_used')})
+                    'quarantine': [f'{p}: {blocked(p)}' for p in (x['a'], x['b']) if blocked(p)],
+                    'recorded_verdict': last_rec.get('verdict'), 'recorded_looks': last_rec.get('looks_used')})
     return sorted(out, key=lambda m: (m['a'], m['b']))
 
 
+def run_eligibility(root, folders: list[str], a: str, b: str, reg: dict | None, evidence: dict | None = None) -> dict | None:
+    """The eligibility facts of one pairing, gathered by the runner's own `eligibility` from its match folders
+    (the same facts its adjudication used), with when play began."""
+    try:
+        from .runner import eligibility
+    except ImportError:
+        return None
+    facts = eligibility(Path(root), folders, (a, b), reg)
+    return {**facts, 'first_started': (evidence or {}).get('first_started')}
+
+
 def ratings(root, boot=BOOT, seed=0, session=SESSION) -> dict:
-    """The leaderboard of every match under root, with each player's style stats."""
+    """The leaderboard of every match under root, with each player's style stats and audit summary."""
     from .stats import collect
     root = Path(root)
     plan = _json(root / 'plan.json')
@@ -1360,10 +1847,26 @@ def ratings(root, boot=BOOT, seed=0, session=SESSION) -> dict:
             playing |= set((_json(cfg_path) or {}).get('players', []))
     stats = collect(root)
     meta = load_meta(root, {p: s.get('served_models') for p, s in stats.items()})
-    r = rate(load_deals(root), boot, seed, session, meta=meta, plan=plan, playing=playing,
-             recorded=_json(root / 'decisions.json') or {})
+    rejected = []
+    deals = load_deals(root, rejected)
+    evidence = run_evidence(root)
+    reg = registration_status(plan, evidence) if plan else None
+    eligibility = {}
+    if reg and reg['registered']:
+        folders = defaultdict(list)
+        for d in deals:
+            k = frozenset((d['a'], d['b']))
+            if d['matchup'] not in folders[k]:
+                folders[k].append(d['matchup'])
+        for k, fs in folders.items():
+            a, b = sorted(k)
+            eligibility[k] = run_eligibility(root, fs, a, b, plan.get('registration'), evidence)
+    r = rate(deals, boot, seed, session, meta=meta, plan=plan, playing=playing,
+             recorded=_json(root / 'decisions.json') or {}, eligibility=eligibility, rejected=rejected, registration=reg)
     from .stats import LABELS, POSITIONS
-    return {**r, 'stats': stats, 'stat_labels': LABELS, 'position_labels': POSITIONS}
+    audit = {p: {**(s.get('audit') or {}), 'identity': s.get('identity'), 'fallbacks': s.get('fallbacks'),
+                 'retries': s.get('retries'), 'served_models': s.get('served_models')} for p, s in stats.items()}
+    return {**r, 'stats': stats, 'stat_labels': LABELS, 'position_labels': POSITIONS, 'audit': audit}
 
 
 VERDICT_TEXT = {
@@ -1373,6 +1876,8 @@ VERDICT_TEXT = {
     'exhausted': 'undecided after every planned look (not evidence that they are equal)',
     'early': 'too early to judge: too few conversations',
     'descriptive': 'descriptive only (not a test)',
+    'ineligible': 'ineligible for a decided result',
+    'retrospective': 'retrospective only: no decision by the registered judge was recorded here',
 }
 
 
@@ -1457,15 +1962,20 @@ def verdicts(r, labels=None) -> str:
     """Each pairing: the edge, its interval, the test against the stopping bar, and the verdict."""
     labels = labels or {}
     name = lambda p: labels.get(p, p)
-    order = {'a': 0, 'b': 0, 'even': 1, 'exhausted': 2, 'open': 3, 'early': 4, 'descriptive': 5}
+    order = {'a': 0, 'b': 0, 'even': 1, 'exhausted': 2, 'open': 3, 'early': 4, 'ineligible': 5, 'retrospective': 6,
+             'descriptive': 7}
     d = r.get('design')
+    reg = r.get('registration') or {}
     if r.get('pooled'):
         lines = ['Pairings (descriptive: pooled across runs, nothing here is a test):']
     elif d and not d.get('registered', True):
-        lines = ['Pairings (descriptive: this run had no preregistered design, nothing here is a test):']
+        why = '; '.join(reg.get('reasons') or []) or 'no preregistered design'
+        lines = [f'Pairings (descriptive: this run is not preregistered ({why}); nothing here is a test):']
     else:
-        lines = [f'Pairings (decided only by the preregistered sequential test: at most {d["alpha"]:.0%} chance of '
-                 f'any false verdict over {d["n_pairings"]} pairing{"s" if d["n_pairings"] != 1 else ""}; a verdict needs '
+        lines = [f'Pairings (decided only by the preregistered sequential test, as recorded when play stopped by the '
+                 f'registered judge {reg.get("judge_fingerprint") or "?"}; if its assumptions hold, at most '
+                 f'{d["alpha"]:.0%} chance of any false verdict over {d["n_pairings"]} '
+                 f'pairing{"s" if d["n_pairings"] != 1 else ""}; a verdict needs '
                  f'{d.get("min_conversations", MIN_CONVERSATIONS)}+ conversations):']
     for m in sorted(r['pairings'], key=lambda m: (order[m['verdict']], m['a'], m['b'])):
         a, b = name(m['a']), name(m['b'])
@@ -1486,9 +1996,28 @@ def verdicts(r, labels=None) -> str:
                          + (f', decided at look {m["decided_at_look"]}' if m.get('decided_at_look')
                             and m['decided_at_look'] != m['looks_used'] else ''))
         state = VERDICT_TEXT[m['verdict']].format(a=a, b=b, e=r.get('equiv_bb100', EQUIV_BB100))
+        if m['verdict'] in DECIDED and m.get('standing') and m['standing'] != 'decided':
+            state += m['standing'][len('decided'):]
+        if m.get('official'):
+            state += f'; official (recorded by judge {m.get("judge")})'
+        elif m.get('retrospective'):
+            state += '; retrospective (today\'s recomputation)'
         lines.append(f'{head}: {state}.')
-        if m.get('reason') and (m['verdict'] != 'descriptive' or m.get('test_verdict')):
+        if m['verdict'] == 'ineligible':
+            lines.append('      ' + _named('; '.join(m.get('ineligible_reasons') or []), name, [m['a'], m['b']]) + '.')
+        elif m.get('reason') and m['verdict'] != 'descriptive':
             lines.append(f'      {m["reason"]}.')
+        st = (m.get('assumptions') or {}).get('status')
+        if m['verdict'] not in ('descriptive',) and st:
+            share = ((m['assumptions'].get('checks') or {}).get('conversation_share') or {}).get('value')
+            lines.append(f'      assumptions: {st}' + (f' (conversation share {share} vs calibrated up to {FAMILY_SHARE})'
+                                                      if share is not None else ''))
+        if m.get('recomputed') and not m['recomputed']['agrees']:
+            lines.append(f'      today\'s judge would say {m["recomputed"]["verdict"]} (retrospective; the recorded '
+                         f'verdict stands).')
+        if (m.get('additivity') or {}).get('status') == 'warning':
+            lines.append(f'      the strengths imply {m["fitted_edge"]:+.0f} bb/100 here, not the observed '
+                         f'{m["observed_edge"]:+.0f}: they do not add up across pairings.')
         if m.get('deals_since_look'):
             lines.append(f'      {m["deals_since_look"]} more deals are in a round under way, not yet looked at.')
         need = m['power']['deals_for_80pct']
@@ -1499,7 +2028,12 @@ def verdicts(r, labels=None) -> str:
     lead = [x for x in r.get('leaders') or [] if x]
     if not r.get('pooled') and (d or {}).get('registered', True):
         lines.append('Decided leader: ' + ('; '.join(f'{name(x["player"])} (won its pairing against every other '
-                                                    f'player of its group)' for x in lead) if lead else 'none.'))
+                                                    f'player of its group, within the calibrated range)'
+                                                    for x in lead) if lead else 'none.'))
+        for g in r.get('groups') or []:
+            if g.get('leader_outside_calibration'):
+                lines.append(f'  {name(g["leader_outside_calibration"])} won every pairing of its group, but not all '
+                             f'within the calibrated range, so it is not a decided leader.')
     if d and not r.get('pooled'):
         lines.append(design_line(d))
     return '\n'.join(lines)

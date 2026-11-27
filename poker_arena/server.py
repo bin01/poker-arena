@@ -6,7 +6,8 @@ mixing a smoke test with a tournament makes neither readable.
     /api/runs                       every run: players, progress, pace and ETA, live or not
     /api/index?run=RUN              the run's matchups (both duplicate matches, and planned ones not started)
     /api/match?id=RUN/MATCHUP/a-first   one match: config, finished hands, and every event by hand
-    /api/ratings?run=RUN            the run's leaderboard and per-player stats (recomputed when a hand finishes)
+    /api/ratings?run=RUN            the run's leaderboard, per-player stats and its audit summary (recomputed when a
+                                    hand finishes)
 The run `*` is every run together: its leaderboard comes from the history database (history.py), one player
 per model and reasoning level, and keeps runs whose folders have since been deleted.
 Running matches are followed live: the app polls while a match is unfinished.
@@ -44,7 +45,7 @@ def pretty_model(model: str) -> str:
     for tok in model.replace('_', '-').split('-'):
         if tok.isdigit() and out and out[-1][-1].isdigit():
             out[-1] += '.' + tok
-        elif tok.isdigit() and out and out[-1] == 'GPT':
+        elif out and out[-1] == 'GPT' and tok.replace('.', '').isdigit():
             out[-1] += '-' + tok
         else:
             out.append('GPT' if tok.lower() == 'gpt' else tok if any(c.isdigit() for c in tok) else tok.title())
@@ -216,7 +217,7 @@ def roster(root: Path, run: str) -> list:
     return out
 
 
-TERMINAL = ('a', 'b', 'even', 'exhausted')
+TERMINAL = ('a', 'b', 'even', 'exhausted', 'ineligible')
 
 
 def _design(plan: dict):
@@ -254,7 +255,7 @@ def lifecycle(root: Path, run: str, ms: list) -> dict:
         verdict = last.get('verdict')
         played = max((m['round'] for m in mine if m['finished']), default=0)
         if verdict in TERMINAL:
-            status = 'decided' if verdict != 'exhausted' else 'exhausted'
+            status = verdict if verdict in ('exhausted', 'ineligible') else 'decided'
         elif played >= rounds and all(m['finished'] for m in mine):
             status = 'exhausted' if design else 'done'
         elif any(m['live'] for m in mine):
@@ -263,7 +264,7 @@ def lifecycle(root: Path, run: str, ms: list) -> dict:
             status = 'waiting'
         pairings[f'{a}|{b}'] = {'status': status, 'verdict': verdict, 'looks_used': last.get('looks_used', 0),
                                 'rounds_played': played, 'rounds_planned': rounds}
-    over = all(p['status'] in ('decided', 'exhausted', 'done') for p in pairings.values())
+    over = all(p['status'] in ('decided', 'exhausted', 'ineligible', 'done') for p in pairings.values())
     return {'source': 'plan', 'status': 'finished' if over else 'running',
             'round': max((m['round'] for m in ms if m['started']), default=None), 'pairings': pairings}
 
@@ -353,12 +354,98 @@ def match(root: Path, mid: str):
             'hands': _lines(d / 'hands.jsonl'), 'events': events, 'result': _json(d / 'result.json')}
 
 
+AUDIT_KEYS = ('decisions', 'calls', 'tool_rejected', 'unverified', 'verified', 'opaque', 'audit_missing', 'fallbacks',
+              'retries', 'resized', 'failed_tries', 'rate_limited', 'backend_failures', 'rebuilt')
+
+
+def _identity(call: dict, model) -> str:
+    """'attested' when the backend reported the model it ran and it is the one asked for, 'mismatch' when it
+    reported another, else 'unattested'. The runner's own `identity` wins."""
+    if call.get('identity'):
+        return call['identity']
+    seen = call.get('observed_model') or call.get('served_model')
+    if not seen:
+        return 'unattested'
+    want = call.get('requested_model') or model
+    return 'attested' if not want or str(want) == str(seen) or str(want) in str(seen) else 'mismatch'
+
+
+def audit(root: Path, run: str) -> dict:
+    """What the records say about how each model's decisions were made, from calls.jsonl and the decisions in
+    events.jsonl: tool-use rejections, turns that could not be audited, fallbacks, retries, failed tries and
+    rate-limit waits, and how many calls attest the model that answered. Bots make no calls and are left out."""
+    from .history import ALL
+    folders = [cfg.parent for cfg in sorted(root.rglob('config.json')) if cfg.parent.name in ('a-first', 'b-first')
+               and (run in (None, ALL) or run_of(root, cfg.parent.parent) == run)]
+    players: dict = {}
+    for d in folders:
+        cfg = _json(d / 'config.json') or {}
+        specs = cfg.get('specs', {})
+        models = {pid: s for pid, s in specs.items() if 'bot' not in s}
+        if not models:
+            continue
+        for pid in models:
+            players.setdefault(pid, {**{k: 0 for k in AUDIT_KEYS}, 'identity': {}, 'observed': set(), 'requested': set()})
+        for e in _lines(d / 'events.jsonl'):
+            x = e.get('data') or {}
+            if e.get('kind') != 'thought' or x.get('player') not in models:
+                continue
+            a = players[x['player']]
+            a['decisions'] += 1
+            kind = (x.get('correction') or {}).get('kind')
+            if x.get('fallback') or kind == 'fallback':
+                a['fallbacks'] += 1
+            elif kind in ('retry', 'tool_use', 'unverified'):
+                a['retries'] += 1
+            elif kind == 'sizing':
+                a['resized'] += 1
+        for c in _lines(d / 'calls.jsonl'):
+            pid = c.get('player')
+            if pid not in models:
+                continue
+            a = players[pid]
+            a['calls'] += 1
+            fails = c.get('failed_attempts') or []
+            a['failed_tries'] += len(fails)
+            a['rate_limited'] += sum(1 for f in fails if f.get('rate_limited'))
+            a['rebuilt'] += 1 if c.get('rebuilt_from_turns') else 0
+            if c.get('backend_failed'):
+                a['backend_failures'] += 1
+                continue
+            if c.get('rejected') == 'tool_use':
+                a['tool_rejected'] += 1
+            elif c.get('rejected') == 'unverified' or c.get('audit') == 'unverified':
+                a['unverified'] += 1
+            elif c.get('audit') in ('verified', 'opaque'):
+                a[c['audit']] += 1
+            else:
+                a['audit_missing'] += 1
+            model = models[pid].get('model')
+            ident = _identity(c, model)
+            a['identity'][ident] = a['identity'].get(ident, 0) + 1
+            seen = c.get('observed_model') or c.get('served_model')
+            if seen:
+                a['observed'].add(str(seen))
+            if c.get('requested_model') or model:
+                a['requested'].add(str(c.get('requested_model') or model))
+    out = {pid: {**a, 'observed': sorted(a['observed']), 'requested': sorted(a['requested'])} for pid, a in players.items()}
+    totals = {k: sum(a[k] for a in out.values()) for k in AUDIT_KEYS}
+    totals['identity'] = {}
+    for a in out.values():
+        for k, n in a['identity'].items():
+            totals['identity'][k] = totals['identity'].get(k, 0) + n
+    return {'players': out, 'totals': totals, 'recorded': any(a['verified'] or a['opaque'] or a['unverified'] or a['tool_rejected']
+                                                              for a in out.values())}
+
+
 def ratings_for(root: Path, run, boot=200):
     from .ratings import ratings
     from . import history
     if run == history.ALL:
         history.sync(root)
-        return history.all_time(root / history.DB_NAME, boot=boot, players_file=PLAYERS_FILE[0])
+        r = history.all_time(root / history.DB_NAME, boot=boot, players_file=PLAYERS_FILE[0])
+        r['run_audit'] = audit(root, history.ALL)
+        return r
     base = root if run in (None, '', '.') else (root / run).resolve()
     if root != base and root not in base.parents:
         return None
@@ -371,6 +458,7 @@ def ratings_for(root: Path, run, boot=200):
         kinds.update(m['kinds'])
     r['labels'] = {**labels, **(r.get('labels') or {})}
     r['kinds'] = {**kinds, **(r.get('kinds') or {})}
+    r['run_audit'] = audit(root, key)
     return r
 
 

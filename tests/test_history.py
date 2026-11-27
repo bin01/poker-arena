@@ -1,6 +1,7 @@
 """The history database: deal seeds and fingerprints stored, older databases upgraded in place, repeated deals
-across runs averaged, only identical protocols pooled (conversation length included), unresolved identities
-and served-model mismatches quarantined, and the all-time standings descriptive only."""
+across runs averaged, only identical protocols and implementations pooled (conversation length, code that
+plays and CLI version included, unless an equivalence list merges them), duplicate pairs validated,
+unresolved identities and served-model mismatches quarantined, and the all-time standings descriptive only."""
 import json
 import sqlite3
 import tempfile
@@ -13,17 +14,23 @@ from poker_arena.ratings import fingerprint, ratings
 GAME = {'name': 'holdem', 'unit': 'chips', 'big_unit': 2, 'sb': 1, 'bb': 2, 'stack': 200, 'hands_per_match': 20}
 
 
-def write_matchup(root: Path, run, a, b, specs, nets, seed0=1000, protocols=None, served=None, legacy=False):
+def write_matchup(root: Path, run, a, b, specs, nets, seed0=1000, protocols=None, served=None, legacy=False,
+                  impl=None, cli=None, b_players=None):
     """A finished duplicate pair whose deal k gives a `nets[k]` chips over its two hands. `protocols`
     ({pid: fingerprint}) as the runner records them (with the match horizon, or without it when `legacy`);
-    `served` ({pid: model}) a model that answered."""
+    `served` ({pid: model}) a model that answered; `impl` ({file: hash}) the implementation recorded and `cli`
+    the version of every model's CLI; `b_players` the b-first seats (default: a-first's swapped)."""
     m = root / run / f'{a}__vs__{b}'
-    for side, players in (('a-first', [a, b]), ('b-first', [b, a])):
+    for side, players in (('a-first', [a, b]), ('b-first', b_players or [b, a])):
         d = m / side
         d.mkdir(parents=True)
         seeds = [seed0 + k for k in range(len(nets))]
         cfg = {'game': {**GAME, 'hands_per_match': len(nets)}, 'players': players, 'seeds': seeds,
                'specs': {a: specs[a], b: specs[b]}}
+        if impl:
+            cfg['implementation'] = {'files': impl, 'prompt_template': 'p0', 'fingerprint': 'f'}
+            cfg['effective'] = [{'exe': specs[p].get('backend')} for p in players]
+            cfg['cli_versions'] = {specs[p]['backend']: cli for p in players if cli and 'backend' in specs[p]}
         if protocols:
             settings = {} if legacy else {'horizon': {'hands_per_conversation': len(nets)}}
             cfg['protocol'] = {p: {'fingerprint': f, 'settings': settings} for p, f in protocols.items()}
@@ -97,6 +104,46 @@ class TestHistory(unittest.TestCase):
         labels = {r['labels'][i] for i in ids if i.startswith('claude')}
         self.assertEqual(len(labels), 2)                                  # told apart by protocol
         self.assertTrue(all('protocol' in lab for lab in labels))
+
+    def test_implementations_never_pool_unless_declared_equivalent(self):
+        """The code that plays and the CLI version are part of what a player is (R4-#7); the judge is not, and
+        an explicit equivalence list can merge implementations shown to play identically."""
+        v1 = {'poker_arena/agents.py': 'a1', 'poker_arena/ratings.py': 'j1'}
+        v2 = {'poker_arena/agents.py': 'a2', 'poker_arena/ratings.py': 'j1'}
+        judge_only = {'poker_arena/agents.py': 'a1', 'poker_arena/ratings.py': 'j2'}
+        nets = [4, -2] * 10
+        write_matchup(self.root, 'one', 'm1', 'm2', SPECS, nets, impl=v1, cli='1.0')
+        write_matchup(self.root, 'two', 'm1', 'm2', SPECS, nets, seed0=3000, impl=judge_only, cli='1.0')
+        write_matchup(self.root, 'three', 'm1', 'm2', SPECS, nets, seed0=5000, impl=v2, cli='1.0')
+        write_matchup(self.root, 'four', 'm1', 'm2', SPECS, nets, seed0=7000, impl=v1, cli='2.0')
+        history.sync(self.root)
+        r = history.all_time(self.root / history.DB_NAME, boot=30, players_file='/none')
+        m1 = sorted(p['player'] for p in r['players'] if p['player'].startswith('claude'))
+        self.assertEqual(len(m1), 3)                                       # v1 (and judge-only), v2, v1 with CLI 2.0
+        tags = sorted({i.split('@')[1] for i in m1})
+        self.assertTrue(any('different implementations' in n for n in r['notes']))
+        self.assertTrue(all('implementation' in r['labels'][i] for i in m1), [r['labels'][i] for i in m1])
+        (self.root / 'equivalences.json').write_text(json.dumps({'implementations': [tags], 'reason': 'test'}))
+        merged = history.all_time(self.root / history.DB_NAME, boot=30, players_file='/none')
+        self.assertEqual(len([p for p in merged['players'] if p['player'].startswith('claude')]), 1)
+        self.assertTrue(any('equivalent implementations' in n for n in merged['notes']))
+
+    def test_duplicate_pairs_are_validated(self):
+        """A b-first play that is not a-first with the seats swapped never counts (R4-#8)."""
+        write_matchup(self.root, 'one', 'm1', 'm2', SPECS, [4, -2] * 10)
+        write_matchup(self.root, 'one', 'm1', 'alias', SPECS, [4, -2] * 10, seed0=3000, b_players=['m1', 'alias'])
+        history.sync(self.root)
+        con = sqlite3.connect(self.root / history.DB_NAME)
+        self.assertEqual(con.execute("SELECT count(*) FROM deals WHERE matchup = 'm1__vs__alias'").fetchone(), (0,))
+        [(deal, why)] = con.execute("SELECT deal, reason FROM rejected").fetchall()
+        con.close()
+        self.assertEqual(deal, -1)
+        self.assertIn('b-first seats', why)
+        r = history.all_time(self.root / history.DB_NAME, boot=30, players_file='/none')
+        self.assertEqual(len(r['rejected']), 1)
+        self.assertTrue(any('failed validation' in n for n in r['notes']))
+        run = ratings(self.root / 'one', boot=30)
+        self.assertEqual([x['matchup'] for x in run['rejected']], ['m1__vs__alias'])
 
     def test_conversation_length_never_pools(self):
         """The horizon is part of what a model player is (R3-#9): the runner's protocol now records it; for an

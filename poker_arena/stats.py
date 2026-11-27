@@ -19,7 +19,13 @@ seats can hide what a player does against whom.
 Operations (model players):
     decisions, calls (including retries), retries, fallbacks (a seat that never gave a playable answer and
     was checked or folded for), mean and slowest call time, tokens in and out where the CLI reports them,
-    and which models actually answered (agy reports this).
+    and which models actually answered.
+
+Audit (model players), from calls.jsonl: `audit` counts the replies that were used by how far their turn
+could be checked for tool use (verified, opaque: the backend exposes no record, unverified, unrecorded), and
+the replies rejected and asked again (tool_use_rejected, unverified_rejected) or that never came (no_reply);
+`identity` counts replies by whether the backend reported the model that answered (attested), did not
+(unattested), or reported another model than the one requested (mismatch).
 """
 from __future__ import annotations
 import json
@@ -93,7 +99,34 @@ def tally(d: Path) -> tuple[dict, dict]:
         s['tokens_out'] += u.get('output_tokens') or 0
         if call.get('served_model'):
             served[call['player']].add(call['served_model'])
+        if call.get('observed_model'):
+            served[call['player']].add(call['observed_model'])
+        for k, v in audit_counts(call, (cfg.get('specs') or {}).get(call['player'], {}).get('model')).items():
+            s[k] += v
     return {p: dict(v) for p, v in c.items()}, {p: set(v) for p, v in served.items()}
+
+
+AUDIT = ('verified', 'opaque', 'unverified', 'unrecorded', 'tool_use_rejected', 'unverified_rejected', 'no_reply')
+IDENTITY = ('attested', 'unattested', 'mismatch')
+
+
+def audit_counts(call: dict, model=None) -> dict:
+    """One call's contribution to the audit and identity counts (keys `audit:<status>`, `identity:<status>`)."""
+    if call.get('backend_failed'):
+        return {'audit:no_reply': 1}
+    if call.get('rejected') in ('tool_use', 'unverified'):
+        out = {f'audit:{call["rejected"]}_rejected': 1}
+    else:
+        a = call.get('audit')
+        out = {f'audit:{a if a in ("verified", "opaque", "unverified") else "unrecorded"}': 1}
+    observed = call.get('observed_model') or call.get('served_model')
+    requested = call.get('requested_model') or model
+    if observed and requested:
+        from .ratings import same_model
+        if not same_model(requested, observed):
+            return {**out, 'identity:mismatch': 1}
+    ident = call.get('identity') or ('attested' if observed else 'unattested')
+    return {**out, f'identity:{ident if ident in IDENTITY else "unattested"}': 1}
 
 
 def add(into: dict, counts: dict):
@@ -142,6 +175,8 @@ def summarize(s: dict, served=()) -> dict:
         'latency_mean': _ratio(g('latency'), g('calls')), 'latency_max': g('slowest') or None,
         'tokens_in': int(g('tokens_in')) or None, 'tokens_out': int(g('tokens_out')) or None,
         'served_models': sorted(served),
+        'audit': {k: int(g(f'audit:{k}')) for k in AUDIT},
+        'identity': {k: int(g(f'identity:{k}')) for k in IDENTITY},
     }
     for key, prefix in (('by_opponent', 'vs:'), ('by_position', 'pos:')):
         names = sorted({k[len(prefix):].rsplit(':', 1)[0] for k in s if k.startswith(prefix)})

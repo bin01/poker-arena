@@ -1,8 +1,8 @@
-"""The leaderboard: decided results only from the sequential test of a preregistered design and players of
-verified identity, descriptive strengths with intervals from the joint bootstrap, groups with their own
-leader or front runner, repeated deals averaged, session Elo intervals that keep conversations together and
-never collapse, quarantine apart from fit membership, exact model matching, the one normalized design with
-its power scenarios, and the output keys the viewer reads."""
+"""The leaderboard: decided results only from the official decisions of a preregistered run (the runner's
+look-by-look adjudication, simulated here by `run`), descriptive strengths with intervals from the joint
+bootstrap, groups with their own leader or front runner, repeated deals averaged, session Elo intervals that
+keep conversations together and never collapse, quarantine apart from fit membership, exact model matching,
+the one normalized design with its power scenarios, and the output keys the viewer reads."""
 import json
 import unittest
 
@@ -21,7 +21,11 @@ GROUP_KEYS = {'id', 'players', 'leader', 'front_runner', 'front_runner_margin', 
 DESIGN_KEYS = {'alpha', 'round_deals', 'max_rounds', 'max_rounds_basis', 'block', 'replicates', 'n_pairings',
                'alpha_pairing', 'nominal_alpha', 'target_edge_bb100', 'prior_sd_bb100', 'deals_needed', 'deals_planned',
                'max_deals', 'power_at_max', 'min_conversations', 'conversations_needed', 'power_scenarios',
-               'assumed_icc', 'assumed_ar1', 'underpowered', 'registered', 'sd_conversation_bb100'}
+               'assumed_icc', 'assumed_ar1', 'underpowered', 'sd_conversation_bb100', 'allow_unattested',
+               'allow_opaque', 'outside_calibration'}
+ADJUDICATE_KEYS = DECIDE_KEYS | {'eligible', 'ineligible_reasons', 'assumptions', 'calibrated', 'counts_toward_leader',
+                                 'standing', 'test_verdict', 'identity_status', 'audit_status', 'judge_fingerprint',
+                                 'judge', 'calibration_id', 'registered_judge', 'official'}
 
 
 def deals_between(a, b, edge, n, rng, sd=300.0, rounds=1, seed0=1000, run='', planned=None, reps=1, effects=None):
@@ -45,8 +49,53 @@ def deals_between(a, b, edge, n, rng, sd=300.0, rounds=1, seed0=1000, run='', pl
 
 def plan(players, n, rounds, reps=1, **kw):
     pairs = [[a, b] for i, a in enumerate(players) for b in players[i + 1:]]
-    return {'players': players, 'matchups': kw.pop('matchups', pairs), 'deals': n, 'design': {'max_rounds': rounds},
-            'replicates': reps, **kw}
+    return {'players': players, 'matchups': kw.pop('matchups', pairs), 'deals': n,
+            'design': {'max_rounds': rounds, **kw.pop('design', {})}, 'replicates': reps, **kw}
+
+
+BOT = {'kind': 'bot', 'backend': None, 'requested_model': None, 'identity': 'bot', 'audit': 'complete',
+       'protocol_consistent': True}
+MODEL = {'kind': 'model', 'backend': 'claude', 'requested_model': 'claude-x-1', 'identity': 'attested',
+         'audit': 'complete', 'protocol_consistent': True, 'observed_models': ['claude-x-1']}
+
+
+def facts(reg, players, who=None):
+    """The runner's eligibility facts for a pairing: every player a bot unless `who` says otherwise."""
+    return {'registration': reg, 'implementation_changes': [], 'conversations': 0,
+            'players': {p: {**BOT, **(who or {}).get(p, {})} for p in players}}
+
+
+def run(deals, p, boot=50, who=None, registered=True, **kw):
+    """What a run's folders would give the ratings: the plan registered before play, each pairing adjudicated
+    after every round as the runner does (decisions.json), and no deal of a pairing after its terminal
+    verdict. Returns rate()'s output."""
+    if registered:
+        p = {**p, 'registration': R.registration(R.normalize_design(p), created=0)}
+    d = R.normalize_design(p)
+    reg = p.get('registration')
+    by = {}
+    for x in deals:
+        by.setdefault(frozenset((x['a'], x['b'])), []).append(x)
+    recorded, kept, elig = {}, [], {}
+    for key, ds in by.items():
+        ds.sort(key=lambda x: (x['round'], x['replicate'], x['matchup'], x['deal']))
+        a, b = ds[0]['a'], ds[0]['b']
+        elig[key] = facts(reg, (a, b), who)
+        stop = max(x['round'] for x in ds)
+        for r in range(1, d['max_rounds'] + 1):
+            at = [x for x in ds if x['round'] <= r]
+            done = {(x['round'], x['replicate']) for x in at if x['round'] == r}
+            if len(done) < d['replicates'] or sum(x['round'] == r for x in at) < d['replicates'] * (ds[0]['planned']):
+                break
+            sign = lambda x: (1 if x['a'] == a else -1) * x['net_a'] / x['bb'] / 2 * 100
+            v = R.adjudicate({'a': a, 'b': b, 'xs': [sign(x) for x in at], 'groups': [x['matchup'] for x in at],
+                              'fps': [x['fp'] for x in at], 'rejected': []}, d, len(p['matchups']), r, elig[key])
+            recorded.setdefault(f'{a}__vs__{b}', []).append(v)
+            if v['verdict'] in R.TERMINAL:
+                stop = r
+                break
+        kept += [x for x in ds if x['round'] <= stop]
+    return R.rate(kept, boot=boot, plan=p, recorded=recorded, eligibility=elig, **kw)
 
 
 class TestInference(unittest.TestCase):
@@ -56,7 +105,7 @@ class TestInference(unittest.TestCase):
         deals = []
         for a, b in (('x', 'y'), ('x', 'z'), ('y', 'z')):
             deals += deals_between(a, b, true[a] - true[b], 50, rng, sd=100, rounds=4, reps=2)
-        r = R.rate(deals, boot=100, plan=plan(['x', 'y', 'z'], 50, 4, reps=2))
+        r = run(deals, plan(['x', 'y', 'z'], 50, 4, reps=2))
         self.assertTrue(all(m['verdict'] == 'a' for m in r['pairings']), [m['verdict'] for m in r['pairings']])
         self.assertTrue(all(m['signflip'] and m['inferential'] for m in r['pairings']))
         self.assertEqual([(p['player'], p['rank'], p['rank_kind']) for p in r['players']],
@@ -76,7 +125,7 @@ class TestInference(unittest.TestCase):
         rng = np.random.default_rng(1)
         deals = deals_between('x', 'y', 400, 20, rng, sd=100, planned=50) \
             + deals_between('x', 'z', 400, 20, rng, sd=100, planned=50) + deals_between('y', 'z', 0, 20, rng, sd=100, planned=50)
-        r = R.rate(deals, boot=100, plan=plan(['x', 'y', 'z'], 50, 4))
+        r = run(deals, plan(['x', 'y', 'z'], 50, 4))
         self.assertIsNone(r['leader'])
         self.assertTrue(all(m['verdict'] == 'open' and m['looks_used'] == 0 for m in r['pairings']))
         self.assertTrue(all(p['rank'] is None and p['rank_kind'] == 'descriptive' for p in r['players']))
@@ -90,7 +139,7 @@ class TestInference(unittest.TestCase):
         """Below min_conversations a completed look gives 'early', however large the edge (R3-#1)."""
         rng = np.random.default_rng(10)
         deals = deals_between('x', 'y', 500, 50, rng, sd=50, rounds=3, reps=2)
-        r = R.rate(deals, boot=50, plan=plan(['x', 'y'], 50, 6, reps=2))
+        r = run(deals, plan(['x', 'y'], 50, 6, reps=2))
         [m] = r['pairings']
         self.assertEqual((m['verdict'], m['conversations'], m['looks_used'], m['min_conversations']), ('early', 6, 3, 8))
         self.assertIn('at least 8', m['reason'])
@@ -103,7 +152,7 @@ class TestInference(unittest.TestCase):
         deals = deals_between('x', 'y', 300, 50, rng, sd=100, rounds=4, reps=2) \
             + deals_between('x', 'z', 300, 50, rng, sd=100, rounds=4, reps=2) \
             + deals_between('y', 'z', 0, 50, rng, rounds=4, reps=2)
-        r = R.rate(deals, boot=50, plan=plan(['x', 'y', 'z'], 50, 4, reps=2))
+        r = run(deals, plan(['x', 'y', 'z'], 50, 4, reps=2))
         s = {p['player']: p for p in r['players']}
         self.assertEqual((s['x']['rank'], s['y']['rank'], s['z']['rank']), (1, None, None))
         self.assertEqual(s['y']['rank_range'], [2, 3])
@@ -114,7 +163,7 @@ class TestInference(unittest.TestCase):
         rng = np.random.default_rng(3)
         deals = deals_between('a', 'b', 300, 50, rng, sd=100, rounds=3, reps=3) \
             + deals_between('c', 'd', 30, 50, rng, rounds=3, reps=3)
-        r = R.rate(deals, boot=50, plan=plan(['a', 'b', 'c', 'd'], 50, 3, reps=3, matchups=[['a', 'b'], ['c', 'd']]))
+        r = run(deals, plan(['a', 'b', 'c', 'd'], 50, 3, reps=3, matchups=[['a', 'b'], ['c', 'd']]))
         self.assertEqual(r['components'], [['a', 'b'], ['c', 'd']])
         self.assertEqual([g['leader'] for g in r['groups']], ['a', None])
         self.assertEqual(r['groups'][1]['front_runner'] in ('c', 'd'), True)
@@ -123,7 +172,7 @@ class TestInference(unittest.TestCase):
 
     def test_one_conversation_gives_no_verdict(self):
         rng = np.random.default_rng(4)
-        r = R.rate(deals_between('a', 'b', 500, 100, rng, sd=100), boot=50, plan=plan(['a', 'b'], 100, 1))
+        r = run(deals_between('a', 'b', 500, 100, rng, sd=100), plan(['a', 'b'], 100, 1))
         [m] = r['pairings']
         self.assertEqual((m['verdict'], m['basis'], m['conversations']), ('early', 'blocks', 1))
         self.assertIsNone(r['leader'])
@@ -156,11 +205,11 @@ class TestInference(unittest.TestCase):
             self.assertIn('No preregistered design', text)
             self.assertIn('Retrospective', text)
             self.assertNotIn('Planned to detect', text)
-            self.assertIn('no preregistered design', r['inference'])
+            self.assertIn('not preregistered', r['inference'])
 
-    def test_identity_in_doubt_is_descriptive_in_the_run(self):
-        """A served-model mismatch or an unresolved model keeps a player out of every decided result of its run,
-        whatever the numbers say (R3-#8)."""
+    def test_identity_in_doubt_is_ineligible_in_the_run(self):
+        """A served-model mismatch stops the pairing as 'ineligible' at its first look, through the same
+        adjudicator the runner stops on, and keeps the player out of every decided result (R3-#8, R4-#3)."""
         rng = np.random.default_rng(12)
         deals = deals_between('good', 'swapped', 300, 50, rng, sd=100, rounds=4, reps=2) \
             + deals_between('good', 'bot', 300, 50, rng, sd=100, rounds=4, reps=2) \
@@ -170,20 +219,22 @@ class TestInference(unittest.TestCase):
                 'swapped': {'identity': 'codex:gpt-y:high', 'kind': 'model', 'identity_resolved': True,
                             'quarantine_reason': 'answered by gpt-old, not the configured gpt-y'},
                 'bot': {'identity': 'bot:rule', 'kind': 'bot', 'quarantine_reason': None, 'identity_resolved': True}}
-        r = R.rate(deals, boot=30, meta=meta, plan=plan(['good', 'swapped', 'bot'], 50, 4, reps=2))
+        who = {'good': MODEL, 'swapped': {**MODEL, 'backend': 'codex', 'requested_model': 'gpt-y',
+                                          'identity': 'mismatch', 'observed_models': ['gpt-old']}}
+        r = run(deals, plan(['good', 'swapped', 'bot'], 50, 4, reps=2), boot=30, meta=meta, who=who)
         v = {frozenset((m['a'], m['b'])): m for m in r['pairings']}
         clean = v[frozenset(('good', 'bot'))]
-        self.assertEqual((clean['verdict'], clean['inferential']), ('a', True))
+        self.assertEqual((clean['verdict'], clean['inferential'], clean['official']), ('a', True, True))
         for other in ('good', 'bot'):
             m = v[frozenset(('swapped', other))]
-            self.assertEqual((m['verdict'], m['inferential']), ('descriptive', False))
-            self.assertIn('gpt-old', m['reason'])
-        self.assertIn(v[frozenset(('swapped', 'good'))]['test_verdict'], ('a', 'b'))
+            self.assertEqual((m['verdict'], m['inferential'], m['eligible'], m['looks_used']), ('ineligible', False, False, 1))
+            self.assertTrue(any('gpt-old' in x for x in m['ineligible_reasons']))
         self.assertIsNone(r['leader'])                                  # good's win over swapped does not count
         s = {p['player']: p for p in r['players']}
         self.assertEqual((s['swapped']['inferential'], s['swapped']['in_fit'], s['swapped']['rank']), (False, True, None))
+        self.assertEqual(s['swapped']['identity_status'], 'mismatch')
         self.assertIsNone(s['good']['rank'])
-        self.assertTrue(any('identity is in doubt' in n for n in r['notes']))
+        self.assertTrue(any('Ineligible for a decided result' in n for n in r['notes']))
 
     def test_pooled_is_descriptive(self):
         rng = np.random.default_rng(6)
@@ -194,12 +245,18 @@ class TestInference(unittest.TestCase):
         self.assertTrue(all(p['rank'] is None for p in r['players']))
         self.assertIn('descriptive', R.summary(r))
 
-    def test_recorded_verdict_kept_apart(self):
+    def test_a_record_without_the_registered_judge_is_not_official(self):
+        """A look recorded by decide alone (no adjudicator, no judge) is not an official decision."""
         rng = np.random.default_rng(7)
         deals = deals_between('x', 'y', 0, 50, rng, rounds=2)
-        r = R.rate(deals, boot=30, plan=plan(['x', 'y'], 50, 4), recorded={'x__vs__y': [{'verdict': 'a', 'looks_used': 2}]})
-        self.assertEqual((r['pairings'][0]['verdict'], r['pairings'][0]['recorded_verdict']), ('early', 'a'))
-        self.assertTrue(any('earlier version' in n for n in r['notes']))
+        p = plan(['x', 'y'], 50, 4)
+        p['registration'] = R.registration(R.normalize_design(p), created=0)
+        r = R.rate(deals, boot=30, plan=p, recorded={'x__vs__y': [{'verdict': 'open', 'looks_used': 1},
+                                                                  {'verdict': 'a', 'looks_used': 2}]},
+                   eligibility={frozenset('xy'): facts(p['registration'], 'xy')})
+        [m] = r['pairings']
+        self.assertEqual((m['verdict'], m['recorded_verdict'], m['official'], m['retrospective']), ('early', 'a', False, True))
+        self.assertIsNone(r['leader'])
 
 
 class TestBootstrap(unittest.TestCase):
@@ -309,7 +366,7 @@ class TestSessionElo(unittest.TestCase):
         swings = [400.0, -400.0] * 4
         deals = deals_between('p', 'q', 0, 50, rng, sd=20, rounds=8, effects=swings) \
             + deals_between('p', 'bot', 0, 50, rng, sd=20, rounds=8) + deals_between('q', 'bot', 0, 50, rng, sd=20, rounds=8)
-        r = R.rate(deals, boot=200, plan=plan(['p', 'q', 'bot'], 50, 8))
+        r = run(deals, plan(['p', 'q', 'bot'], 50, 8), boot=200)
         p = next(x for x in r['players'] if x['player'] == 'p')
         self.assertEqual(p['session_elo_basis'], 'bootstrap')
         names = sorted({'p', 'q', 'bot'})
@@ -334,7 +391,7 @@ class TestDesign(unittest.TestCase):
         p = {'deals': 50, 'design': {}, 'replicates': 4, 'matchups': THREE}
         d = R.normalize_design(p)
         self.assertLessEqual(DESIGN_KEYS, set(d))
-        self.assertEqual((d['max_rounds_basis'], d['registered'], d['underpowered']), ('power', True, False))
+        self.assertEqual((d['max_rounds_basis'], d.get('registered'), d['underpowered']), ('power', None, False))
         self.assertEqual(d['min_conversations'], R.first_verdict(d['alpha_pairing'], d['max_rounds'], 4))
         self.assertTrue(d['min_conversations'] >= R.MIN_CONVERSATIONS and d['min_conversations'] % 4 == 0)
         self.assertGreaterEqual(d['power_at_max'], 0.8)
@@ -379,14 +436,15 @@ class TestDesign(unittest.TestCase):
         self.assertIsNone(R.normalize_design({'deals': 20, 'seed': 0}))
         legacy = R.normalize_design({'deals': 20, 'until_decided': 60, 'seed': 0})
         self.assertEqual((legacy['max_rounds'], legacy['registered']), (3, False))
+        self.assertFalse(R.registration_status({'deals': 20, 'until_decided': 60, 'seed': 0})['registered'])
 
     def test_runner_and_ratings_agree(self):
         """The design a run's ratings judge by is the one the runner played by: replicates included (R2-#9)."""
         rng = np.random.default_rng(9)
         p = {'players': ['a', 'b'], 'matchups': [['a', 'b']], 'deals': 50, 'design': {'max_rounds': 3}, 'replicates': 2}
         deals = deals_between('a', 'b', 0, 50, rng, rounds=2, reps=2)
-        out = R.rate(deals, boot=30, plan=p)
-        self.assertEqual(out['design'], R.normalize_design(p))
+        out = run(deals, p, boot=30)
+        self.assertEqual(out['design'], {**R.normalize_design(p), 'registered': True})
         [m] = out['pairings']
         self.assertEqual((m['looks_used'], m['conversations'], m['looks_planned']), (2, 4, 3))
 
@@ -448,15 +506,17 @@ class TestContract(unittest.TestCase):
 
     def test_no_misleading_language(self):
         rng = np.random.default_rng(9)
-        r = R.rate(deals_between('a', 'b', 0, 50, rng, rounds=4, reps=2), boot=30,
-                   plan={'players': ['a', 'b'], 'matchups': [['a', 'b']], 'deals': 50, 'design': {'max_rounds': 4},
-                         'replicates': 2})
+        r = run(deals_between('a', 'b', 0, 50, rng, rounds=4, reps=2),
+                {'players': ['a', 'b'], 'matchups': [['a', 'b']], 'deals': 50, 'design': {'max_rounds': 4},
+                 'replicates': 2}, boot=30)
         text = R.summary(r)
         for bad in ('too close', 'established', 'cancels', 'at least +', 'level with'):
             self.assertNotIn(bad, text)
         self.assertIn('not evidence that they are equal', text)
         self.assertIn('descriptive', text)
         self.assertIn('symmetric', text)
+        self.assertIn('if its assumptions hold', text)
+        self.assertNotRegex(text, r'(?<!assumptions hold, )at most 5% chance')
 
 
 if __name__ == '__main__':

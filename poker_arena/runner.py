@@ -25,13 +25,15 @@ says hands_committed includes it. Rerunning a stopped match first cuts every log
 (rows past them go to interrupted.jsonl), then resumes, only with the recorded settings. If the stopped run
 was inside a hand, every CLI conversation is rebuilt from the committed turns, so no seat remembers a hand
 that the record dropped. A tournament directory also holds plan.json (the plan, its normalized design and the
-players' specs, which a rerun must match), decisions.json (every look of the sequential design), tournament.json
+players' specs, which a rerun must match, and the registration written before the first hand), decisions.json
+(every look of the sequential design, as the judge decided it then: the official record), tournament.json
 (whether the runner is running, finished or stopped, and where each pairing stands) and source/ (a tarball of the
 package for every implementation the run used).
 
 The implementation is frozen: a rerun whose engine, agents, backends, runner, ratings or prompt templates differ
 (by content hash) from what the run recorded raises ResumeMismatch, unless `allow_code_change` is given; then the
-change is recorded (in config.json / plan.json `implementation_changes`) and the new source is saved.
+change is recorded (in config.json / plan.json `implementation_changes`), the new source is saved and the
+registration is void.
 """
 from __future__ import annotations
 import asyncio
@@ -435,6 +437,7 @@ async def run_match(game, seat_players: list[tuple[str, dict]], seeds: list[int]
                 **_thought_fields(d, last, err),
                 'seconds': round(sum(c.get('latency') or 0 for c in d.calls), 1),
                 'served_model': next((c['served_model'] for c in reversed(d.calls) if c.get('served_model')), None),
+                **{k: d.calls[-1].get(k) if d.calls else None for k in ('requested_model', 'observed_model', 'identity')},
                 'audit': d.calls[-1].get('audit') if d.calls else None}}
             _append(out / 'events.jsonl', thought)
             log_calls(seat, d.calls)
@@ -543,36 +546,90 @@ def is_bot(spec):
     return 'bot' in spec
 
 
-def _pair_xs(out: Path, folders: list[str], a: str, bb: float) -> tuple[list[float], list[str]]:
-    """a's result per duplicate deal in bb/100, in play order over the given matchup folders, and the folder
-    of each deal (so blocks never span two matches)."""
-    xs, groups = [], []
+def _played(out: Path) -> bool:
+    return any(p.stat().st_size for p in out.glob('*/*/hands.jsonl')) if out.exists() else False
+
+
+def _declined(plan: dict) -> bool:
+    return plan.get('registered') is False or (plan.get('design') or {}).get('registered') is False
+
+
+def eligibility(out: Path, folders: list[str], players, registration: dict | None = None) -> dict:
+    """The facts the judge's eligibility rules need about a pairing, from its match folders: the registration,
+    accepted code changes, and per player its kind, backend, requested model, protocol fingerprints, the models
+    its calls named and their identity status, and the audit status of every decision it made. Summaries per
+    player: `identity` 'attested' (every reply named the requested model) | 'unattested' (some named none) |
+    'mismatch' (some named another model) | 'none' (no replies yet), bots 'bot'; `audit` 'complete' (every decision
+    verified) | 'opaque' (some came from a backend that exposes no record) | 'incomplete'; `protocol_consistent`."""
+    from .ratings import same_model
+    facts = {p: {'kind': None, 'backend': None, 'requested_model': None, 'protocols': set(), 'replies': 0,
+                 'identity_counts': {}, 'observed_models': set(), 'decisions': 0, 'audit_counts': {}, 'fallbacks': 0}
+             for p in players}
+    bump = lambda d, k: d.__setitem__(k, d.get(k, 0) + 1)
+    changes, started = [], []
     for f in folders:
-        ha = {h['hand']: h for h in _read_jsonl(out / f / 'a-first' / 'hands.jsonl')}
-        hb = {h['hand']: h for h in _read_jsonl(out / f / 'b-first' / 'hands.jsonl')}
-        first = (json.loads((out / f / 'a-first' / 'config.json').read_text())['players'][0]
-                 if (out / f / 'a-first' / 'config.json').exists() else a)
-        sign = 1 if first == a else -1
-        both = sorted(set(ha) & set(hb))
-        xs += [sign * (ha[k]['net'][0] + hb[k]['net'][1]) / bb / 2 * 100 for k in both]
-        groups += [f] * len(both)
-    return xs, groups
+        for label in ('a-first', 'b-first'):
+            d = Path(out) / f / label
+            cfg = json.loads((d / 'config.json').read_text()) if (d / 'config.json').exists() else {}
+            if cfg.get('started') is not None:
+                started.append(cfg['started'])
+            changes += [{'match': f'{f}/{label}', 'from': c.get('from'), 'to': (c.get('to') or {}).get('fingerprint'),
+                         'files': c.get('files'), 'after_hand': c.get('after_hand')}
+                        for c in cfg.get('implementation_changes') or []]
+            for p, x in facts.items():
+                spec = (cfg.get('specs') or {}).get(p)
+                if spec:
+                    x['kind'] = 'bot' if is_bot(spec) else 'model'
+                    x['backend'] = spec.get('backend') or (f'bot:{spec["bot"]}' if is_bot(spec) else None)
+                    x['requested_model'] = spec.get('model')
+                proto = ((cfg.get('protocol') or {}).get(p) or {}).get('fingerprint')
+                if proto:
+                    x['protocols'].add(proto)
+            for c in _read_jsonl(d / 'calls.jsonl'):
+                x = facts.get(c.get('player'))
+                if x is None or c.get('backend_failed'):
+                    continue
+                x['replies'] += 1
+                bump(x['identity_counts'], c.get('identity') or 'unrecorded')
+                if c.get('observed_model'):
+                    x['observed_models'].add(c['observed_model'])
+            for e in _read_jsonl(d / 'events.jsonl'):
+                data = e.get('data') or {}
+                x = facts.get(data.get('player')) if e.get('kind') == 'thought' else None
+                if x is not None:
+                    x['decisions'] += 1
+                    x['fallbacks'] += bool(data.get('fallback'))
+                    bump(x['audit_counts'], data.get('audit') or ('bot' if x['kind'] == 'bot' else 'unrecorded'))
+    for x in facts.values():
+        x['protocols'], x['observed_models'] = sorted(x['protocols']), sorted(x['observed_models'])
+        x['protocol_consistent'] = len(x['protocols']) <= 1
+        if x['kind'] == 'bot':
+            x['identity'], x['audit'] = 'bot', 'complete'
+            continue
+        wrong = [m for m in x['observed_models'] if not x['requested_model'] or not same_model(x['requested_model'], m)]
+        x['identity'] = ('none' if not x['replies'] else 'mismatch' if wrong else
+                         'attested' if set(x['identity_counts']) == {'attested'} else 'unattested')
+        audits = set(x['audit_counts'])
+        x['audit'] = 'opaque' if 'opaque' in audits else 'complete' if audits <= {'verified'} else 'incomplete'
+    return {'registration': registration, 'implementation_changes': changes, 'conversations': len(folders),
+            'first_started': min(started) if started else None, 'players': facts}
 
 
 def _record_decision(out: Path, a, b, v: dict):
     path = out / 'decisions.json'
     allv = json.loads(path.read_text()) if path.exists() else {}
     looks = allv.setdefault(matchup_name(a, b), [])
-    looks[v['looks_used'] - 1:] = [{'t': round(time.time()), **v}]
+    looks[v['looks_used'] - 1:] = [{**v, 'recorded_at': round(time.time())}]
     _write(path, allv, indent=2)
 
 
-TERMINAL = {'a': 'decided', 'b': 'decided', 'even': 'decided'}
+TERMINAL = {'a': 'decided', 'b': 'decided', 'even': 'decided', 'ineligible': 'ineligible'}
 
 
 class Lifecycle:
     """<out>/tournament.json: whether the runner is running, finished or stopped, the round being played, and
-    each pairing's status ('waiting' for its turn or its next round, 'playing', 'decided', 'exhausted'), with
+    each pairing's status ('waiting' for its turn or its next round, 'playing', 'decided', 'exhausted',
+    'ineligible': stopped because the judge found the pairing can't give a decided result), with
     its latest verdict and looks used. Pairings this invocation doesn't run keep their recorded state."""
 
     def __init__(self, out: Path, plan: dict, rounds: int):
@@ -602,7 +659,7 @@ class Lifecycle:
         self.write()
 
     def end(self, status=None):
-        done = all(p['status'] in ('decided', 'exhausted') for p in self.doc['pairings'].values())
+        done = all(p['status'] in ('decided', 'exhausted', 'ineligible') for p in self.doc['pairings'].values())
         self.doc['status'] = status or ('finished' if done else 'stopped')
         self.write()
 
@@ -612,12 +669,15 @@ async def run_plan(plan: dict, *, only=None, concurrency=None, log=print, allow_
     cards across the whole tournament). `concurrency` caps how many matches use each backend (each CLI)
     at once, so one subscription's rate limits don't stall the others; bot-only matches run freely.
 
-    The plan's `design` is enforced here: after each round of a pairing, `ratings.decide` judges all of its
-    deals so far; the pairing stops on a verdict ('a', 'b', 'even') or after `max_rounds` looks, never more.
-    Every look is kept in the run's decisions.json. Rounds, replicates and deals come only from
-    `ratings.normalize_design(plan)`. The plan, that design, the players' specs and the implementation are
-    recorded in plan.json; a rerun resumes, and one that would change the experiment (or the code, unless
-    `allow_code_change`) raises ResumeMismatch before any model is called."""
+    The plan's `design` is enforced here, and only through the judge: after each round of a pairing,
+    `ratings.adjudicate` judges all of its deals so far with the pairing's eligibility facts (see `eligibility`);
+    the pairing stops on a verdict ('a', 'b', 'even'), on 'ineligible', or after `max_rounds` looks, never more.
+    Every look is kept in the run's decisions.json as the official decision, with the judge's fingerprint.
+    Rounds, replicates and deals come only from `ratings.normalize_design(plan)`. The plan, that design, the
+    players' specs and the implementation are recorded in plan.json, and so is the `registration` (see
+    `ratings.registration`), written before the first hand unless the plan says `registered: false`; a run without it
+    is not preregistered. A rerun resumes, and one that would change the experiment (or the code, unless
+    `allow_code_change`, which then voids the registration) raises ResumeMismatch before any model is called."""
     players = load_players(plan.get('players_file', 'players.toml'), effort=plan.get('effort'))
     design = plan_design(plan)
     rounds, reps, deals = _shape(plan, design)
@@ -665,9 +725,18 @@ async def run_plan(plan: dict, *, only=None, concurrency=None, log=print, allow_
     labels = {pid: display_name(pid, spec) for pid, spec in players.items() if pid in plan['players']}
     snapshot = save_source(out, impl)
     changes = (stored or {}).get('implementation_changes', []) + ([{**change, 'source': snapshot}] if change else [])
+    reg = (stored or {}).get('registration')
+    from . import ratings
+    if reg is None and design and not _declined(plan) and not _played(out):
+        reg = ratings.registration(design)
+    if reg and change and reg.get('status') != 'void':
+        reg = {**reg, 'status': 'void', 'voided': change['t'],
+               'void_reason': 'the code that plays or judges changed after registration (allow_code_change): '
+                              + ', '.join(change['files'])}
     _write(out / 'plan.json', {**plan, **manifest, 'labels': labels, 'code_version': code_version(),
                                'implementation': (stored or {}).get('implementation') or impl,
                                **({'implementation_changes': changes} if changes else {}),
+                               **({'registration': reg} if reg else {}),
                                'sources': sorted({*(stored or {}).get('sources', []), snapshot}),
                                'created': (stored or {}).get('created') or round(time.time())},
            indent=2)  # for the viewer, and the manifest a rerun must match
@@ -690,15 +759,20 @@ async def run_plan(plan: dict, *, only=None, concurrency=None, log=print, allow_
                 if not design:
                     life.pairing(a, b, status='exhausted', looks_used=1)
                     return res
-                from . import ratings
-                xs, groups = _pair_xs(out, folders, a, game.big_unit)
-                v = ratings.decide(xs, design, len(plan['matchups']), r, groups=groups)
+                facts = eligibility(out, folders, (a, b), reg)
+                v = ratings.adjudicate({**ratings.pairing_data(out, folders, a), 'b': b}, design,
+                                       len(plan['matchups']), r, facts)
+                v = {**v, 'implementation': impl['fingerprint'],
+                     'eligibility': {**facts, 'registration': {k: w for k, w in (reg or {}).items() if k != 'design'}
+                                     if reg else None}}
                 _record_decision(out, a, b, v)
                 final = v['verdict'] in TERMINAL or r >= rounds
                 life.pairing(a, b, verdict=v['verdict'], looks_used=v['looks_used'],
                              status=TERMINAL.get(v['verdict']) or ('exhausted' if final else 'waiting'))
                 if final:
-                    who = {'a': f'decided: {a} is better', 'b': f'decided: {b} is better', 'even': 'decided: even (within the equivalence margin)', 'exhausted': 'undecided, every planned look used'}.get(v['verdict'], v['verdict'])
+                    who = {'a': f'decided: {a} is better', 'b': f'decided: {b} is better', 'even': 'decided: even (within the equivalence margin)', 'exhausted': 'undecided, every planned look used',
+                           'ineligible': 'ineligible for a decided result (' + '; '.join(
+                               map(str, v.get('ineligible_reasons') or [])) + ')'}.get(v['verdict'], v['verdict'])
                     log(f'{a} vs {b}: {who} after {r} of {rounds} rounds ({v.get("deals")} deals, '
                         f'{a} {v.get("edge") if v.get("edge") is not None else "?"} bb/100)')
                     return v

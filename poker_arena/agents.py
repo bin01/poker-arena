@@ -141,7 +141,8 @@ class ModelAgent(Agent):
                 reply = await self.backend.send(message)
             except BackendError as e:  # the CLI gave up: keep what was tried, for the log
                 calls.append({'prompt': message, 'output': None, 'attempt': attempt, 'error': str(e)[:2000],
-                              'backend_failed': True, 'audit': 'no_reply', **getattr(e, 'meta', {})})
+                              'backend_failed': True, 'audit': 'no_reply', **getattr(self.backend, 'identity', dict)(),
+                              **getattr(e, 'meta', {})})
                 e.calls = calls
                 raise
             calls.append({'prompt': message, 'output': reply.text, 'thinking': reply.thinking, 'usage': reply.usage,
