@@ -59,7 +59,10 @@ def display_name(pid: str, spec: dict) -> str:
         return pid
     from .runner import EFFORT_BACKENDS
     effort = spec.get('effort') or ('default' if spec.get('backend') in EFFORT_BACKENDS else '')
-    return pretty_model(str(spec['model'])) + (f' · {effort}' if effort else '')
+    name = pretty_model(str(spec['model']))
+    if effort and name.lower().endswith(' ' + effort.lower()):   # gemini-4-neon-high already says its level
+        name = name[: -len(effort) - 1]
+    return name + (f' · {effort.title() if effort != "default" else "default effort"}' if effort else '')
 
 
 def load_labels(players_file='players.toml') -> dict:
@@ -153,7 +156,7 @@ def _runs_and_matchups(root: Path):
                 by.setdefault(run, []).append({
                     'id': str(rel / f'{a}__vs__{b}') if run != '.' else f'{a}__vs__{b}', 'run': run, 'a': a, 'b': b,
                     'started': False, 'round': 1, 'matches': [], 'deals_total': plan.get('deals', 0), 'pairs_done': 0,
-                    'pair_net_a': 0, 'kinds': {}, 'labels': {**plan.get('labels', {}), **LABELS}, 'bb': 1, 'live': False, 'finished': False,
+                    'pair_net_a': 0, 'kinds': {}, 'labels': {**{k: v for k, v in plan.get('labels', {}).items() if v != k}, **LABELS}, 'bb': 1, 'live': False, 'finished': False,
                     'updated': 0, 'times': []})
     return by
 

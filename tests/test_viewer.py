@@ -209,11 +209,12 @@ class TestNames(unittest.TestCase):
         self.assertEqual(server.pretty_model('claude-opus-5-5'), 'Claude Opus 5.5')
         self.assertEqual(server.pretty_model('gpt-6-luna'), 'GPT-6 Luna')
         self.assertEqual(server.pretty_model('gemini-4-neon-high'), 'Gemini 4 Neon High')
-        self.assertEqual(server.display_name('x', {'backend': 'codex', 'model': 'gpt-6-luna', 'effort': 'high'}), 'GPT-6 Luna · high')
+        self.assertEqual(server.display_name('x', {'backend': 'codex', 'model': 'gpt-6-luna', 'effort': 'high'}), 'GPT-6 Luna · High')
+        self.assertEqual(server.display_name('x', {'backend': 'agy', 'model': 'gemini-4-neon-high', 'effort': 'high'}), 'Gemini 4 Neon · High')
         self.assertEqual(server.display_name('x', {'label': 'Mine', 'model': 'm'}), 'Mine')
         self.assertEqual(server.display_name('codex-gpt', {'backend': 'codex'}), 'codex-gpt')  # no model: the id
         self.assertEqual(server.display_name('s', {'backend': 'claude', 'model': 'claude-sonnet-5-5'}),
-                         'Claude Sonnet 5.5 · default')   # a run from before levels were set
+                         'Claude Sonnet 5.5 · default effort')   # a run from before levels were set
 
 
 

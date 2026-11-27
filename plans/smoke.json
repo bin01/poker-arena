@@ -3,17 +3,17 @@
   "game_config": {},
   "players_file": "players.toml",
   "players": [
-    "claude-sonnet",
+    "claude-sonnet-5-5-high",
     "rule",
     "station"
   ],
   "matchups": [
     [
-      "claude-sonnet",
+      "claude-sonnet-5-5-high",
       "rule"
     ],
     [
-      "claude-sonnet",
+      "claude-sonnet-5-5-high",
       "station"
     ],
     [
