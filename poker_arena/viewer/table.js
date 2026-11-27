@@ -83,7 +83,8 @@
     const startStack = Array.isArray(d.stack) ? d.stack : Array(n).fill(d.stack ?? 0);
     const seats = Array.from({ length: n }, (_, i) => ({ stack: startStack[i], bet: 0, folded: false, allIn: false,
       hole: (d.hole || [])[i] || [], shown: false, net: null, won: false, last: '', made: '', draw: '' }));
-    let collected = 0, board = [], street = 'preflop', actor = null;
+    let collected = 0, board = [], street = 'preflop', actor = null, returned = null;
+    const committed = Array(n).fill(0);
     // whose turn it is, as the engine recorded it (undefined in logs from before it did)
     const out = [], log = [];
     let rec = 'to_act' in d ? d.to_act : undefined;
@@ -101,7 +102,14 @@
       return out.length - 1;
     };
     const sweep = () => { for (const s of seats) { collected += s.bet; s.bet = 0; if (!s.folded) s.last = ''; } };
-    const put = (i, amt) => { const a = Math.min(amt, seats[i].stack); seats[i].stack -= a; seats[i].bet += a; if (seats[i].stack === 0) seats[i].allIn = true; };
+    const put = (i, amt) => { const a = Math.min(amt, seats[i].stack); seats[i].stack -= a; seats[i].bet += a; committed[i] += a; if (seats[i].stack === 0) seats[i].allIn = true; };
+    // unmatched chips go back to their seat: the engine says so with a 'return' event; for hands recorded
+    // before it did, the amount is the largest contribution's excess over the next largest
+    const giveBack = (i, amt) => {
+      const fromBet = Math.min(seats[i].bet, amt);
+      seats[i].bet -= fromBet; collected -= amt - fromBet; seats[i].stack += amt; committed[i] -= amt;
+      returned = { seat: i, amount: amt };
+    };
 
     for (const e of evs) if (e.kind === 'blind') put(e.data.seat, e.data.amount);
     log.push({ kind: 'start', step: snap('Blinds posted'),
@@ -140,6 +148,8 @@
         made(x.omniscient && x.omniscient.made_hand);
         if ('to_act' in x) rec = x.to_act;
         log.push({ kind: 'board', step: snap(STREET_NAMES[street] || street), street, cards: x.cards || [] });
+      } else if (e.kind === 'return') {
+        giveBack(x.seat, x.amount);
       } else if (e.kind === 'runout') {
         log.push({ kind: 'runout', step: out.length - 1 });
       } else if (e.kind === 'showdown') {
@@ -149,16 +159,23 @@
         for (const [i, h] of Object.entries(x.hands || {})) { seats[i].shown = true; seats[i].best = h.best; }
         log.push({ kind: 'showdown', step: snap('Showdown'), hands: x.hands || {} });
       } else if (e.kind === 'result') {
+        let pot = x.pot;
+        if (!returned && !('uncalled_return' in x)) {
+          const top = committed.indexOf(Math.max(...committed));
+          const excess = committed[top] - Math.max(0, ...committed.filter((_, i) => i !== top));
+          if (excess > 0) { giveBack(top, excess); pot = (x.pot ?? 0) - excess; }
+        }
         sweep();
         actor = null;
         rec = null;
         if (x.board) board = x.board;
         const won = x.won || [];
-        seats.forEach((s, i) => { s.net = (x.net || [])[i] ?? 0; s.won = (won[i] || 0) > 0; s.stack = startStack[i] + s.net; });
+        const contested = i => (won[i] || 0) - (returned && returned.seat === i && !('uncalled_return' in x) ? returned.amount : 0);
+        seats.forEach((s, i) => { s.net = (x.net || [])[i] ?? 0; s.won = contested(i) > 0; s.stack = startStack[i] + s.net; });
         collected = 0;
         const winners = seats.map((s, i) => s.won ? i : null).filter(i => i != null);
-        log.push({ kind: 'result', step: snap('Result', { done: true, finalPot: x.pot, winners, showdown: !!x.showdown }),
-          winners, pot: x.pot, showdown: !!x.showdown, net: x.net || [] });
+        log.push({ kind: 'result', step: snap('Result', { done: true, finalPot: pot, returned, winners, showdown: !!x.showdown }),
+          winners, pot, returned, showdown: !!x.showdown, net: x.net || [] });
       }
     }
     // who acts next: the recorded `to_act` when the log has it, else the seat of the next action; and what

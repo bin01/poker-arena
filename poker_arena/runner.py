@@ -930,6 +930,10 @@ def make_tournament(player_ids, name=None, out='runs/pilot', tracks=('official',
         if track not in ratings.TRACKS:
             raise ValueError(f'unknown track {track!r}: choose from {", ".join(ratings.TRACKS)}')
         kw = {**defaults[track], **given[track]}
+        if track == 'official' and int(kw.get('deals') or 1) != 1:
+            raise ValueError(f'the official track is one deal per conversation (fresh conversations every deal), '
+                             f'but {kw["deals"]} deals per conversation were asked for: leave --deals at 1, and '
+                             f'measure long conversations on the adaptation track (--adaptation-deals)')
         design = {**(kw.pop('design', None) or {}), 'track': track}
         plan = make_plan(player_ids, out=str(Path(out) / track), design=design, **kw, **common)
         plans[track] = {**plan, 'track': track, 'tournament': name}
@@ -1350,7 +1354,7 @@ async def run_plan(plan: dict, *, only=None, concurrency=None, log=print, allow_
     changes = (stored or {}).get('implementation_changes', []) + ([{**change, 'source': snapshot}] if change else [])
     reg = (stored or {}).get('registration')
     from . import ratings
-    if reg is None and design and not _declined(plan) and not _played(out):
+    if reg is None and design and not _declined(plan) and not ratings.contract_problems(design) and not _played(out):
         reg = {**ratings.registration(design), 'cli_versions': versions, 'cli_artifacts': artifacts}
     if reg and change and reg.get('status') != 'void':
         reg = {**reg, 'status': 'void', 'voided': change['t'],

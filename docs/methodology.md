@@ -227,7 +227,12 @@ protocols; each hand's recorded seed and fingerprint must match the configs and 
 play of the hand goes through the engine's record verifier (`games.holdem.verify_hand`), with the seed and
 button the config assigns it (not the ones the hand records): the deal is regenerated from the seed, the
 recorded actions are replayed as legal moves of the seat to act, and the cards, board, every action's pot and
-price, the payouts, the summary and the hand's events must equal the replay. Only committed hands count (rows
+price, the payouts, the summary and the hand's events must equal the replay. The largest contribution's
+excess over the next largest, which nobody matched, goes back to its seat before the pot is awarded (a `return`
+event with the seat and amount); the summary's `pot` is the contested pot and `uncalled_return` the chips
+returned, so a 200-chip shove folded to records a 4-chip pot and 198 returned. Both are derived fields: a hand
+recorded before them (the 198 counted in its pot and in what its seat won) verifies against the same replay,
+and one that records them must match it. Net results are unchanged. Only committed hands count (rows
 past `state.json`'s `hands_committed` are an interrupted hand, not a result). A failing conversation or hand is
 left out and reported (`rejected`), and the pairing is ineligible; a verifier that is missing or fails to run
 rejects everything (fail closed). The round 5 probe (one hand edited to hold a duplicated ace and pay 200,000
@@ -291,7 +296,7 @@ and the viewer shows (nothing else builds one):
 | key | default | meaning |
 |---|---|---|
 | `alpha` | 0.05 | chance of any false verdict over the tournament |
-| `round_deals` | the plan's `deals` (1 from `plan` on the command line) | deals per conversation |
+| `round_deals` | the plan's `deals` (always 1 on the official track) | deals per conversation; an official-track plan with more is not registered (`contract_violations`, registration status `invalid`), so nothing in it is official |
 | `replicates` | 1 in a plan, 25 from `plan` on the command line | conversations per pairing per round (one look per round) |
 | `max_rounds` | from the power target | rounds (looks) at most, up to 200; `max_rounds_basis`: `power`, `given` or `budget` |
 | `budget_deals` | none | a cap on deals per pairing; a plan it cuts short is `underpowered` |
@@ -354,7 +359,8 @@ conversation):
 | 25 | 1,128 | 28,200 |
 | 50 | 1,112 | 55,600 |
 
-So the default is now **one duplicate deal per conversation**: each conversation is the two one-hand matches of
+So the official track is **one duplicate deal per conversation**, enforced: `plan` refuses more, and a plan
+edited to more is never registered: each conversation is the two one-hand matches of
 one deal, with fresh memories. The price is what such a run measures: how well a model plays a hand against this
 opponent, not what it learns about the opponent over a match. Adaptation is measured on its own track (*Two
 tracks*, below), not by lengthening the official conversations. Each conversation is a fresh session for both players, so a run makes many more of them (1,475
@@ -584,13 +590,17 @@ differ (earlier measurement: 0.895 with a conversation effect of the size of the
 
 ## Session Elo (secondary, descriptive)
 
-How often a player wins a session (10 deals of one conversation, or the whole of a shorter one; up by more
-than 1 big blind; closer is a tie), as a Bradley–Terry fit
+How often a player wins a session, as a Bradley–Terry fit
 on the Elo scale with a Gaussian prior (1.5 logits), centred on 1500 within each group. Sessions of one
 conversation are not independent, so the interval is the wider of two: the Laplace (posterior) interval, which
 treats sessions as independent and cannot collapse to a point, and a bootstrap that refits the ratings under the
 strength bootstrap's weights, so sessions move with their slate and conversation (`session_elo_basis` says which
-one set it). It can disagree with strength (many narrow wins and a few heavy losses), and it never decides
+one set it). A session is up to 10 deals of one conversation, or the whole of a shorter one (a trailing part
+counts if it has at least half), so on the official track, one deal per conversation, a session is a single
+duplicate deal; on the adaptation track (50 deals) it is 10. A session is won when it ends more than 0.1 big
+blinds per deal up over both plays (0.1 bb for a one-deal session, 1 bb for a 10-deal one); closer is a tie. The
+ratings report the run's own definition as `session` (`deals`, `deal_counts`, `tie_bb`, `text`) and
+`session_deals`, and the CLI and the viewer quote its `text`. It can disagree with strength (many narrow wins and a few heavy losses), and it never decides
 anything.
 
 ## Who is a player

@@ -127,8 +127,9 @@ python -m poker_arena view runs/pilot                                 # follows 
 
 `tournament` resumes: rerun the same command after a crash or a stop, and each match continues after its last
 finished hand. Write your own preregistered plan with `python -m poker_arena plan A B C reference --out runs/mine --write plans/mine.json`:
-both tracks by default (`--tracks official` for one), the official one with one deal per conversation
-(`--deals`, `--replicates`), the adaptation one with 50 (`--adaptation-deals`, `--adaptation-replicates`,
+both tracks by default (`--tracks official` for one), the official one with exactly one deal per conversation
+(`--replicates`; `plan` refuses `--deals` other than 1, and a plan edited to more is not registered, so nothing
+in it is official), the adaptation one with 50 (`--adaptation-deals`, `--adaptation-replicates`,
 `--adaptation-budget-deals`); `tournament --track official` plays one track, and `--concurrency` applies to each.
 
 ### How sure the results are
@@ -173,8 +174,8 @@ official, never counted. The adaptation track is judged by that gate, so its res
 
 **What it costs.** Needing nothing has a price set by the bound: a pairing needs about log(2 / alpha per
 pairing) × 10,000 / edge independent conversations, however long each is (about 1,450 to detect 50 bb/100 among
-3 models). So `plan` now defaults to **one duplicate deal per conversation** (`--deals 1`, 25 conversations per
-round): about as many deals as round 6's design (1,475 per pairing for 3 models, 2,150 for 9), but each
+3 models). So the official track is **one duplicate deal per conversation** (always; 25 conversations per
+round by default): about as many deals as round 6's design (1,475 per pairing for 3 models, 2,150 for 9), but each
 conversation is a fresh session, and the run measures play hand by hand rather than what a model learns about
 its opponent over a match. Longer conversations measure that, at many more deals (`plan` prints the table: 55,600
 deals per pairing at 50 deals per conversation). Shallower stacks (`--stack`) shrink the bound and the cost with
@@ -222,7 +223,10 @@ retrospective recomputation and never replaces it.
 
 **Every counted hand is replayed.** A deal counts only if both of its plays replay from their seeds through the
 engine's record verifier: the deal is dealt again, the recorded actions are replayed as legal moves, and the
-cards, board, pots, payouts and events must match. A hand edited after the fact (a duplicated ace, a payout no
+cards, board, pots, payouts and events must match. Chips nobody matched (a shove that is folded to) go back to
+their seat as a `return` event before the pot is awarded, and the hand records the contested `pot` and the
+`uncalled_return` ({seat, amount}); the replay shows both. Hands recorded before that, with the returned chips
+counted in the pot and the winnings, still verify; net results are the same either way. A hand edited after the fact (a duplicated ace, a payout no
 stack could cover) is rejected, here, in the history and in the style statistics, and the pairing can't be
 decided. One reader (`ratings.read_conversation`) says which hands are verified results and which are still
 provisional; everything that counts uses it, and it gives each written hand one status (verified, provisional or

@@ -844,6 +844,13 @@ def registration(design: dict, created: float | None = None) -> dict:
             'calibration_id': calibration_id(design), 'created': round(created if created is not None else time.time())}
 
 
+def contract_problems(design: dict | None) -> list[str]:
+    """Why a design breaks its track's contract (empty: it keeps it). The official track is one deal per
+    conversation: every deal is played in fresh conversations, so no model remembers an earlier deal. A plain
+    plan that names no track is a single-track run and keeps its own conversation length."""
+    return list((design or {}).get('contract_violations') or [])
+
+
 def registration_problems(reg: dict | None, design: dict | None, first_started=None, implementation=None,
                           changes=()) -> list[str]:
     """Why a registration doesn't preregister this design (empty: it does). `first_started` is when the run's
@@ -859,6 +866,7 @@ def registration_problems(reg: dict | None, design: dict | None, first_started=N
     if not reg.get('judge_fingerprint') or reg.get('created') is None:
         out.append('the registration names no judge or no time')
     if design is not None:
+        out += contract_problems(design)
         diff = [k for k, v in _inputs(design).items() if _inputs(reg.get('design') or {}).get(k) != v]
         if diff:
             out.append(f'the design differs from the registered one ({", ".join(diff)})')
@@ -910,6 +918,8 @@ def registration_status(plan: dict | None, evidence: dict | None = None) -> dict
         return {**out, 'status': 'legacy', 'reasons': ['played under an older stopping rule, not a registered design']}
     if not design:
         return {**out, 'reasons': ['the run has no sequential design']}
+    if contract_problems(design):
+        return {**out, 'status': 'invalid', 'reasons': contract_problems(design)}
     ev = evidence or {}
     problems = registration_problems(reg, design, ev.get('first_started'), plan.get('implementation'),
                                      [*(plan.get('implementation_changes') or []), *(ev.get('implementation_changes') or [])])
@@ -931,7 +941,7 @@ _COMPUTED = ('replicates', 'n_pairings', 'alpha_pairing', 'nominal_alpha', 'deal
              'underpowered', 'registered', 'sd_conversation_bb100', 'calibration', 'equivalence_alpha',
              'power_by_edge', 'power_basis', 'leader_chances', 'outcome_bound_bb100', 'official_test',
              'assumption_free', 'threshold', 'bet_cap', 'equiv_bb100', 'official', 'model_based', 'judge_test',
-             'label', 'model_min_conversations', 'nominal_alpha_model')
+             'label', 'model_min_conversations', 'nominal_alpha_model', 'contract_violations')
 _PLAN_KEYS = ('design', 'deals', 'until_decided', 'replicates', 'matchups', 'target_edge_bb100', 'prior_sd_bb100',
               'registered', 'game', 'game_config', 'track')
 
@@ -986,8 +996,13 @@ def _normalized(key: str) -> str:
              'max_rounds': max(1, plan['until_decided'] // plan['deals']), 'legacy': 'until_decided'}
     reps = int(plan.get('replicates') or (plan.get('design') or {}).get('replicates') or 1)
     bound = outcome_bound(plan.get("game") or "holdem", json.dumps(plan.get("game_config") or {}, sort_keys=True))
-    return json.dumps(_complete(d, reps, plan['n'], plan.get('target_edge_bb100') or d.get('target_edge_bb100'),
-                                plan.get('prior_sd_bb100') or d.get('prior_sd_bb100'), plan.get('players'), bound))
+    out = _complete(d, reps, plan['n'], plan.get('target_edge_bb100') or d.get('target_edge_bb100'),
+                    plan.get('prior_sd_bb100') or d.get('prior_sd_bb100'), plan.get('players'), bound)
+    if plan.get('track') == 'official' and out['round_deals'] != 1:
+        out['contract_violations'] = [f'the official track is one deal per conversation, but this plan has '
+                                      f'{out["round_deals"]} deals per conversation (long conversations belong on '
+                                      f'the adaptation track)']
+    return json.dumps(out)
 
 
 @lru_cache(maxsize=64)
@@ -2519,6 +2534,26 @@ def sessions(obs, size=SESSION) -> list[dict]:
     return out
 
 
+def session_definition(games, size=SESSION, conversation=None) -> dict:
+    """What a session is in this run, from the sessions actually formed (or, with none yet, from the planned
+    conversation length): {'deals' (the most deals in one session), 'deal_counts', 'size' (the most a session
+    may hold), 'tie_bb_per_deal', 'tie_bb' (the tie band of a full session, in big blinds over both plays),
+    'text'}. On the official track a conversation is one deal, so a session is one duplicate deal."""
+    counts = sorted({int(g['deals']) for g in games}) or [max(1, min(size, int(conversation or size)))]
+    most = counts[-1]
+    tie = round(TIE_BB * most, 2)
+    if most == 1:
+        what = 'one duplicate deal (each conversation is one deal, so a session is a single deal)'
+    elif len(counts) == 1:
+        what = f'{most} deals of one conversation'
+    else:
+        what = (f'up to {most} deals of one conversation ({"-".join(map(str, (counts[0], most)))} here: a shorter '
+                f'conversation is one session, and a trailing part counts if it has at least half)')
+    return {'deals': most, 'deal_counts': counts, 'size': size, 'tie_bb_per_deal': TIE_BB, 'tie_bb': tie,
+            'text': f'a session is {what}; it is won by finishing more than {tie:g} big blinds up over both plays '
+                    f'({TIE_BB:g} per deal), and anything closer is a tie'}
+
+
 def outcome(s) -> float:
     band = TIE_BB * s['deals']
     return 1.0 if s['net_bb'] > band else 0.0 if s['net_bb'] < -band else 0.5
@@ -2683,6 +2718,7 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
         return 'win' if (x['verdict'] == 'a') == (x['a'] == p) else 'loss'
 
     games = sessions(obs, session)
+    session_def = session_definition(games, session, (design or {}).get('round_deals') or (plan or {}).get('deals'))
     elo, cov = _elo(names, comps, games) if names else (np.zeros(0), np.zeros((0, 0)))
     elo_draws = np.zeros((0, len(names)))
     if names and games and len(W) >= 2:
@@ -2841,7 +2877,7 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
         roster.append({'player': p, 'status': status})
 
     notes = list(notes) + _notes(pooled, design, pairings, comps, groups, obs, repeats, excluded, unrated, players, block,
-                                 reg, list(rejected), adaptation)
+                                 reg, list(rejected), adaptation, session_def)
     return {'objective': OBJECTIVE, 'design': design, 'registration': reg, 'pooled': pooled, 'deals': len(raw),
             'track': track, 'official': not pooled and not adaptation, 'model_based': adaptation,
             'language': 'descriptive' if pooled or not registered else 'exploratory' if adaptation else 'confirmatory',
@@ -2857,7 +2893,7 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
                                 'bootstrap standard error; additivity "warning" when it is beyond 2 of them',
                     'primary': 'the direct pairwise results; strengths summarise them'},
             'observations': len(obs), 'repeats': repeats, 'block': block, 'boot': boot,
-            'equiv_bb100': EQUIV_BB100, 'session_deals': session,
+            'equiv_bb100': EQUIV_BB100, 'session_deals': session_def['deals'], 'session': session_def,
             'min_conversations': (design or {}).get('min_conversations') or MIN_CONVERSATIONS,
             'inference': ('descriptive only: pooled across runs, so no result here is a test' if pooled else
                           'descriptive only: this run is not preregistered (no valid registration before play), '
@@ -2917,7 +2953,7 @@ def _headline_adaptation(lead, front, margin, ci95, pairings) -> str:
 
 
 def _notes(pooled, design, pairings, comps, groups, obs, repeats, excluded, unrated, players, block, reg=None,
-           rejected=(), adaptation=False) -> list:
+           rejected=(), adaptation=False, session_def=None) -> list:
     notes = []
     if adaptation and design.get('registered'):
         notes.append(ADAPTATION_ASSUMPTIONS)
@@ -3041,9 +3077,8 @@ def _notes(pooled, design, pairings, comps, groups, obs, repeats, excluded, unra
             f'{x["a"]} vs {x["b"]} (observed {x["observed_edge"]:+.0f}, the strengths imply {x["fitted_edge"]:+.0f})'
             for x in misfit) + ': one number per player cannot describe these results, so read the pairings '
             'directly; a strength is an average over the opponents a player happened to meet.')
-    notes.append('Session Elo is the share of sessions won (10 deals of one conversation, or the whole of a shorter '
-                 'one): a different, secondary statistic that never '
-                 'decides anything. Its interval is the wider of a posterior one and a bootstrap that resamples '
+    notes.append(f'Session Elo is the share of sessions won ({(session_def or session_definition([]))["text"]}): '
+                 'a different, secondary statistic that never decides anything. Its interval is the wider of a posterior one and a bootstrap that resamples '
                  'sessions with their slates and conversations.')
     return notes
 

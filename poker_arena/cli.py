@@ -107,12 +107,15 @@ def cmd_plan(args):
     per = {'official': {'max_rounds': args.max_rounds, 'budget_deals': args.budget_deals},
            'adaptation': {'max_rounds': args.adaptation_max_rounds, 'budget_deals': args.adaptation_budget_deals}}
     tracks = [t.strip() for t in args.tracks.split(',') if t.strip()]
-    doc = make_tournament(args.players_list, out=args.out, tracks=tracks, seed=args.seed, players_file=args.players,
-                          concurrency=args.concurrency, game_config={'stack': args.stack} if args.stack else None,
-                          official={'deals': args.deals, 'replicates': args.replicates,
-                                    'design': {**shared, **{k: v for k, v in per['official'].items() if v is not None}}},
-                          adaptation={'deals': args.adaptation_deals, 'replicates': args.adaptation_replicates,
-                                      'design': {**shared, **{k: v for k, v in per['adaptation'].items() if v is not None}}})
+    try:
+        doc = make_tournament(args.players_list, out=args.out, tracks=tracks, seed=args.seed, players_file=args.players,
+                              concurrency=args.concurrency, game_config={'stack': args.stack} if args.stack else None,
+                              official={'deals': args.deals, 'replicates': args.replicates,
+                                        'design': {**shared, **{k: v for k, v in per['official'].items() if v is not None}}},
+                              adaptation={'deals': args.adaptation_deals, 'replicates': args.adaptation_replicates,
+                                          'design': {**shared, **{k: v for k, v in per['adaptation'].items() if v is not None}}})
+    except ValueError as e:
+        raise SystemExit(f'plan: {e}')
     designs = {}
     for track, plan in doc['tracks'].items():
         if per[track]['max_rounds'] is None:
@@ -225,7 +228,8 @@ def _ratings(root, args, json_path):
         why = '; '.join(reg.get('reasons') or []) or 'no preregistered design'
         test = f'none (not preregistered: {why}; everything is descriptive)'
     print(f'\n{r["deals"]} duplicate deals ({r["hands"]} hands), {r["observations"]} distinct. Verdicts: {test}; '
-          f'strengths: descriptive; session Elo: share of {r["session_deals"]}-deal sessions won (secondary, '
+          f'strengths: descriptive; session Elo: share of sessions won, where '
+          f'{(r.get("session") or {}).get("text") or str(r["session_deals"]) + " deals make a session"} (secondary, '
           f'descriptive).')
     if r.get('rejected'):
         print(f'{len(r["rejected"])} duplicate pairs failed validation and were left out (see the notes).')
@@ -356,9 +360,8 @@ def main(argv=None):
     p = sub.add_parser('plan', help='write a round-robin tournament plan')
     p.add_argument('players_list', nargs='+')
     p.add_argument('--deals', type=int, default=1,
-                   help='duplicate deals per conversation on the official track (default 1: the official test needs a '
-                        'number of independent conversations set by the stacks, so one deal each needs the fewest deals; '
-                        'adaptation within a match is measured on the adaptation track)')
+                   help='duplicate deals per conversation on the official track: must be 1 (fresh conversations every '
+                        'deal); long conversations, where models adapt, are the adaptation track (--adaptation-deals)')
     p.add_argument('--stack', type=int, help='chips per stack (default 200: 100 big blinds); the official test\'s bound, '
                                              'and so the conversations it needs, scale with it')
     p.add_argument('--seed', type=int, default=1000)

@@ -456,7 +456,7 @@ function outcomeRow(rt, g, multi, first = true) {
     ${card}
     <div class="o-main"><div class="o-kicker">${multi ? `<span class="o-group">${esc(groupName(g))}</span>` : ''}${kicker}</div>
       ${p && !(misfit && !g.leader && !g.qualified_leader) ? `<div class="o-who">${monogram(who, 'lg')}<div class="o-name">${name(who)}</div></div>` : ''}
-      ${misfit && !g.leader && !g.qualified_leader ? '<div class="o-lead">The matchups don\'t line up in one order, so here is each one directly.</div>' : ''}</div>
+      ${misfit && !g.leader && !g.qualified_leader ? '<div class="o-lead">One strength per player cannot describe every matchup\'s margin here, so here is each matchup directly.</div>' : ''}</div>
     ${num}
     <div class="o-facts">${facts.filter(Boolean).join('')}</div>
     ${direct}
@@ -561,10 +561,17 @@ function planPanel(rt) {
           a different one; <b>model unconfirmed</b>: it reported none, so only the configured name is known.</dd>
         <dt>Fit</dt><dd><b>off the fit</b>: a matchup's result disagrees with what the strengths predict; <b>insufficient evidence to assess fit</b>: too few
           matchups link these players to test it (always so with two players).</dd>
-        <dt>Session Elo</dt><dd>A different number: how often it wins a 10-deal session. For reference, never used to rank.</dd>
+        <dt>Session Elo</dt><dd>A different number: how often it wins a session, where ${esc(sessionText(rt))}. For reference, never used to rank.</dd>
       </dl>
       ${notes ? `<div class="pp-notes"><b>Notes from the ratings</b><ul>${notes}</ul></div>` : ''}
     </div></details>`;
+}
+
+// What a session is in this run, as the ratings define it (older ratings: their session length).
+function sessionText(rt) {
+  if (rt.session?.text) return rt.session.text;
+  const n = rt.session_deals || 10;
+  return n === 1 ? 'a session is one duplicate deal' : `a session is ${n} deals of one conversation`;
 }
 
 // The official test when it is the assumption-free one (from the design, or every decided pairing), else null.
@@ -938,7 +945,7 @@ function standings(rt, waiting) {
       `${control}<div class="board-list ${ranked ? '' : 'unranked'}"><div class="board-head">${ranked ? '<span title="Decided rank"><span class="hide-xs">Rank</span><span class="show-xs">#</span></span>' : ''}<span>${ranked ? 'Player' : 'Player, by points'}</span>
          <span class="r" title="${esc(STRENGTH_TIP)}">Fitted strength</span>
          <span class="axis-head"><span>${signed(-ax.lim, 0)}</span><span>0</span><span>${signed(ax.lim, 0)}</span></span>
-         <span class="r hide-sm" title="${esc(OBSERVED_TIP)}">Observed</span><span class="r hide-sm">Net</span><span class="r hide-sm" title="Share of 10-deal sessions won (secondary; not used to rank)">Sessions</span></div>
+         <span class="r hide-sm" title="${esc(OBSERVED_TIP)}">Observed</span><span class="r hide-sm">Net</span><span class="r hide-sm" title="Share of sessions won, where ${esc(sessionText(rt))} (secondary; not used to rank)">Sessions</span></div>
        ${rows}${extra}</div>`,
       `${points && ranked ? 'Sorted by fitted strength, which describes results and decides nothing: a numeral is a rank the matchups decided. ' : ''}Fitted strengths are centred: the difference of two predicts their matchup edge. Observed is what each won: the average of its matchup edges, one per opponent.`);
   });
@@ -1241,6 +1248,9 @@ async function renderQuiz(spotId) {
   $app.innerHTML = head + fixture + (spot ? spotView(q, spot) : lede + quizScores(q) + quizSpots(q));
   if (spot) drawSpot(spot);
   else bindSpotFilters(q);
+  $app.querySelectorAll('.qcat-pick').forEach(sel => sel.onchange = () => {
+    sel.closest('.qcat-narrow').querySelectorAll('.qcat-one').forEach(d => { d.hidden = d.dataset.i !== sel.value; });
+  });
 }
 
 function quizScores(q) {
@@ -1271,15 +1281,25 @@ function quizCategories(q) {
   if (q.categories.length < 2 || !cats.length) return '';
   const count = c => q.spots.filter(s => (s.category || s.kind || 'other') === c).length;
   const head = `<thead><tr><th>Player</th>${cats.map(c => `<th class="num" title="${esc((q.category_info[c] && q.category_info[c].about) || '')}">${esc(catTitle(q, c))}<small class="nof">${plural(count(c), 'spot')}</small></th>`).join('')}</tr></thead>`;
-  const rows = q.players.map(x => `<tr><td class="who-cell">${player(x.player, '', { details: false })}</td>${cats.map(c => {
+  const cell = (x, c) => {
     const k = (x.by_category || {})[c];
-    if (!k || !k.total) return '<td class="num"><span class="dim">–</span></td>';
+    if (!k || !k.total) return { cls: '', html: '<span class="dim">–</span>' };
     const r = (k.correct ?? 0) / k.total;
     const lost = num(k.ev_lost_bb, k.ev_loss_bb);
-    return `<td class="num qcat ${r === 1 ? 'full' : r < 0.5 ? 'low' : ''}">${k.correct ?? 0}<small class="nof">/${k.total}${k.fallbacks ? ` · ${k.fallbacks} fb` : ''}${lost != null ? ` · ${trim(Math.round(lost * 10) / 10)} bb lost` : ''}</small></td>`;
+    return { cls: `qcat ${r === 1 ? 'full' : r < 0.5 ? 'low' : ''}`, html: `${k.correct ?? 0}<small class="nof">/${k.total}${k.fallbacks ? ` · ${k.fallbacks} fb` : ''}${lost != null ? ` · ${trim(Math.round(lost * 10) / 10)} bb lost` : ''}</small>` };
+  };
+  const rows = q.players.map(x => `<tr><td class="who-cell">${player(x.player, '', { details: false })}</td>${cats.map(c => {
+    const v = cell(x, c);
+    return `<td class="num ${v.cls}">${v.html}</td>`;
   }).join('')}</tr>`).join('');
+  const pick = `<label class="metric-bar qcat-bar"><span>Category</span><select class="qcat-pick" aria-label="Which category">${cats.map((c, i) =>
+    `<option value="${i}">${esc(catTitle(q, c))} · ${plural(count(c), 'spot')}</option>`).join('')}</select></label>`;
+  const narrow = `<div class="qcat-narrow">${pick}${cats.map((c, i) => `<div class="qcat-one" data-i="${i}"${i ? ' hidden' : ''}>${q.players.map(x => {
+    const v = cell(x, c);
+    return `<div class="qcat-row">${player(x.player, '', { details: false })}<span class="num ${v.cls}">${v.html}</span></div>`;
+  }).join('')}</div>`).join('')}</div>`;
   return section(q.scored_category ? 'Harder categories, scored separately' : 'By category', 'each out of its own spots: they separate players the basics cannot',
-    `<div class="scroll"><table class="style-t qcat-t">${head}<tbody>${rows}</tbody></table></div>`,
+    `<div class="scroll qcat-wide"><table class="style-t qcat-t">${head}<tbody>${rows}</tbody></table></div>${narrow}`,
     `Right answers out of the category's own spots; fb: fallbacks, which never count as right. ${q.scored_category ? 'None of these enter the headline score above.' : ''}
      ${cats.some(c => { const i = q.category_info[c] || {}; const sm = i.sampling && (i.sampling.design || i.sampling); return sm !== 'independent'; }) ? 'Counts on these spots, descriptive: no error ranges, since the spots are not an independent sample of a defined population.' : ''}`);
 }
@@ -1889,7 +1909,8 @@ function playPanel(p, cur, bb) {
       const early = !e.showdown && lastAct?.action === 'fold' && lastAct.street === 'preflop';
       const why = !e.showdown && lastAct?.action === 'fold'
         ? `${early ? 'Hand over before the flop' : `Hand over on the ${esc(lastAct.street)}`}: ${shortName(lastAct.seat)} folded. ` : '';
-      log += `<div class="outcome" data-step="${s}">${why}${e.winners.length > 1 ? `Split pot ${how}` : `<b>${shortName(e.winners[0])}</b> takes <b class="gold">${fmt(e.pot)}</b> ${how}`}${early ? '<span class="soft"> · no board was dealt</span>' : ''}</div>`;
+      const back = e.returned ? `<span class="soft"> · ${shortName(e.returned.seat)}'s uncalled ${fmt(e.returned.amount)} goes back to them, outside the pot</span>` : '';
+      log += `<div class="outcome" data-step="${s}">${why}${e.winners.length > 1 ? `Split pot of ${fmt(e.pot)} ${how}` : `<b>${shortName(e.winners[0])}</b> takes the contested pot of <b class="gold">${fmt(e.pot)}</b> ${how}`}${back}${early ? '<span class="soft"> · no board was dealt</span>' : ''}</div>`;
     } else if (e.kind === 'action') {
       const t = e.thought;
       if (t?.notes) thoughtsBy[e.seat] = t.notes;
@@ -1964,7 +1985,8 @@ function lastText(p, k, fmt, long) {
   if (e.kind === 'showdown') return '<b>Showdown</b>: both hands are shown';
   if (e.kind === 'result') {
     const w = e.winners;
-    return w.length > 1 ? `Split pot${e.showdown ? ' at showdown' : ''}` : `<b>${who(w[0])}</b> takes <b class="gold">${fmt(e.pot)}</b>${e.showdown ? ' at showdown' : ''}`;
+    const back = e.returned ? ` · ${who(e.returned.seat)}'s uncalled ${fmt(e.returned.amount)} returned` : '';
+    return (w.length > 1 ? `Split pot${e.showdown ? ' at showdown' : ''}` : `<b>${who(w[0])}</b> takes <b class="gold">${fmt(e.pot)}</b>${e.showdown ? ' at showdown' : ''}`) + back;
   }
   const amt = ['call', 'bet', 'raise'].includes(e.action) ? ` ${fmt(e.amount)}` : '';
   const f = e.facing;

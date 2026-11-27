@@ -68,6 +68,7 @@ class HoldemHand(Episode):
         self.done = False
         self.payoffs = [0] * n
         self.result = {}
+        self.uncalled = None
         self.made_by_street = {'preflop': self.made_hands()}
 
         self._emit('hand_start', {'hand': index, 'button': self.button, 'names': names, 'stack': self.start,
@@ -341,8 +342,20 @@ class HoldemHand(Episode):
     def _finish(self):
         self._award(None)
 
+    def _return_uncalled(self):
+        """The part of the largest contribution nobody matched goes back to its seat before the pot is awarded
+        (a 'return' event), so the pot is only what was contested."""
+        top = max(range(self.n), key=lambda i: self.committed[i])
+        excess = self.committed[top] - max(c for i, c in enumerate(self.committed) if i != top)
+        if excess > 0:
+            self.committed[top] -= excess
+            self.stacks[top] += excess
+            self.uncalled = {'seat': top, 'amount': excess}
+            self._emit('return', dict(self.uncalled))
+
     def _award(self, scores):
         """Main and side pots by contribution level; ties split, odd chips to the first seat left of the button."""
+        self._return_uncalled()
         contenders = self._in_hand()
         won = [0] * self.n
         levels = sorted({self.committed[i] for i in contenders if self.committed[i] > 0})
@@ -372,6 +385,7 @@ class HoldemHand(Episode):
             self.stacks[i] += won[i]
         self.payoffs = [self.stacks[i] - self.start for i in range(self.n)]
         self.result = {'won': won, 'net': self.payoffs, 'board': list(self.board), 'pot': self.pot,
+                       'uncalled_return': self.uncalled,
                        'showdown': scores is not None and len(contenders) > 1,
                        'best': {i: describe(scores[i]) for i in contenders} if scores else {}}
         self._emit('result', self.result)
@@ -408,6 +422,8 @@ class HoldemHand(Episode):
         if ev.kind == 'showdown':
             return 'Showdown: ' + '; '.join(f'{you(int(i))} {cards_text(h["cards"])} ({h["best"]})'
                                             for i, h in d['hands'].items()) + '.'
+        if ev.kind == 'return':
+            return f'{you(d["seat"])} get{"" if d["seat"] == seat else "s"} back the uncalled {d["amount"]}.'
         if ev.kind == 'result':
             winners = [i for i, w in enumerate(d['won']) if w > 0]
             parts = [f'{you(i)} win{"" if i == seat else "s"} {d["won"][i]}' for i in winners]
@@ -485,7 +501,25 @@ def _plain(x):
 
 # Fields the engine derives from the cards and actions (added to the logs over time). A record that lacks one is
 # checked on everything else; a record that has one must match the replay.
-DERIVED = {'pot_before', 'pot_odds', 'to_act', 'to_call', 'omniscient', 'made_hand'}
+DERIVED = {'pot_before', 'pot_odds', 'to_act', 'to_call', 'omniscient', 'made_hand', 'uncalled_return'}
+
+
+def _with_uncalled(result: dict, uncalled: dict | None) -> dict:
+    """A result in the form recorded before uncalled chips were returned explicitly: the returned chips counted
+    in the pot and in what their seat won."""
+    out = {k: v for k, v in result.items() if k != 'uncalled_return'}
+    if uncalled:
+        out['pot'] = result['pot'] + uncalled['amount']
+        out['won'] = [w + (uncalled['amount'] if i == uncalled['seat'] else 0) for i, w in enumerate(result['won'])]
+    return out
+
+
+def _as_recorded(result: dict, recorded: dict, uncalled: dict | None) -> dict:
+    """The replayed result in the recorded hand's form: a hand recorded before `uncalled_return` existed may
+    count the returned chips in its pot and winnings."""
+    if 'uncalled_return' in recorded or not uncalled or recorded.get('pot') == result.get('pot'):
+        return result if 'uncalled_return' in recorded else {k: v for k, v in result.items() if k != 'uncalled_return'}
+    return _with_uncalled(result, uncalled)
 
 
 def verify_hand(game: Holdem, seed, button, recorded_hand: dict, events: list | None = None) -> dict:
@@ -539,8 +573,8 @@ def verify_hand(game: Holdem, seed, button, recorded_hand: dict, events: list | 
     if not errors and not ep.done:
         errors.append('the recorded actions end before the hand is over')
     if not errors:
-        replayed = _plain(ep.summary())
-        for key in ('board', 'won', 'net', 'pot', 'showdown', 'best', 'omniscient'):
+        replayed = _as_recorded(_plain(ep.summary()), rec, _plain(ep.uncalled))
+        for key in ('board', 'won', 'net', 'pot', 'uncalled_return', 'showdown', 'best', 'omniscient'):
             if key in DERIVED and key not in rec:
                 continue
             if rec.get(key) != replayed.get(key):
@@ -556,6 +590,10 @@ def _verify_events(ep: HoldemHand, evs: list) -> list[str]:
     out = []
     played = [e for e in evs if e.get('kind') != 'thought']
     engine = [_plain(e.to_json()) for e in ep.events]
+    rec = next((e.get('data') or {} for e in played if e.get('kind') == 'result'), {})
+    if 'uncalled_return' not in rec:   # recorded before uncalled chips were returned explicitly
+        engine = [{**e, 'data': _as_recorded(e['data'], rec, _plain(ep.uncalled))} if e['kind'] == 'result' else e
+                  for e in engine if e['kind'] != 'return']
     if len(played) != len(engine):
         return [f'events: {len(played)} recorded, the replay emits {len(engine)}']
     for k, (got, want) in enumerate(zip(played, engine)):
