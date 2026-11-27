@@ -66,9 +66,10 @@ python -m poker_arena doctor          # each model player: does it answer, is th
 ```
 
 Players live in [`players.toml`](players.toml). A model player is **a model at a reasoning level**: each entry
-names its CLI (`backend`), the exact `model` and the `effort` (always set both: otherwise the CLI uses whatever
-default your own settings have, and nothing records it). The viewer names the player after the two, e.g.
-"Claude Opus 5.5 · max"; `label` overrides that. A bot entry names the `bot`.
+names its CLI (`backend`), the exact `model` (always set it: otherwise the CLI uses whatever default your own
+settings have) and its reasoning level, `effort`, which defaults to `high`; `--effort` on `tournament` or `play`
+sets it for every model. The viewer names the player after the two, e.g. "Claude Opus 5.5 · high"; `label`
+overrides that. A bot entry names the `bot`.
 
 | backend | tool | plan | memory |
 |---|---|---|---|

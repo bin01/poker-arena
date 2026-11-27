@@ -137,5 +137,21 @@ class TestNames(unittest.TestCase):
         self.assertEqual(server.display_name('codex-gpt', {'backend': 'codex'}), 'codex-gpt')  # no model: the id
 
 
+
+class TestEffort(unittest.TestCase):
+    def test_default_and_override(self):
+        from poker_arena.runner import load_players
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / 'p.toml'
+            f.write_text('[players.a]\nbackend = "claude"\nmodel = "m"\n[players.b]\nbackend = "codex"\nmodel = "m"\n'
+                         'effort = "low"\n[players.c]\nbackend = "command"\ncommand = ["x"]\n[players.d]\nbot = "rule"\n')
+            ps = load_players(f)
+            self.assertEqual(ps['a']['effort'], 'high')     # the default
+            self.assertEqual(ps['b']['effort'], 'low')      # the player's own
+            self.assertNotIn('effort', ps['c'])             # a CLI without reasoning levels
+            self.assertNotIn('effort', ps['d'])
+            self.assertEqual(load_players(f, effort='max')['b']['effort'], 'max')  # tournament-wide override
+
+
 if __name__ == '__main__':
     unittest.main()

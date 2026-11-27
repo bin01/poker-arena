@@ -29,9 +29,20 @@ from .games import get_game
 NAMES = ['Alex', 'Blair', 'Casey', 'Devon', 'Emery', 'Finley', 'Gray', 'Harper', 'Indy']
 
 
-def load_players(path) -> dict:
+DEFAULT_EFFORT = 'high'                      # reasoning level for a model player that doesn't set one
+EFFORT_BACKENDS = {'claude', 'codex', 'agy'}  # the CLIs that take a reasoning level
+
+
+def load_players(path, effort: str | None = None) -> dict:
+    """Players from a TOML file. Every model on a CLI that takes a reasoning level gets one: `effort` (a
+    tournament-wide override) wins, then the player's own `effort`, then DEFAULT_EFFORT. The level is
+    recorded in each match's config, so results always say which level played."""
     data = tomllib.loads(Path(path).read_text())
-    return data.get('players', data)
+    players = data.get('players', data)
+    for spec in players.values():
+        if spec.get('backend') in EFFORT_BACKENDS:
+            spec['effort'] = effort or spec.get('effort') or DEFAULT_EFFORT
+    return players
 
 
 def _append(path: Path, obj):
@@ -186,7 +197,7 @@ async def run_plan(plan: dict, *, only=None, concurrency=None, log=print):
     cards across the whole tournament). `concurrency` caps how many matches use each backend (each CLI)
     at once, so one subscription's rate limits don't stall the others; bot-only matches run freely.
     Rerun to resume."""
-    players = load_players(plan.get('players_file', 'players.toml'))
+    players = load_players(plan.get('players_file', 'players.toml'), effort=plan.get('effort'))
     cfg = {'hands_per_match': plan['deals'], **plan.get('game_config', {})}
     game = get_game(plan.get('game', 'holdem'))(cfg)
     seeds = [plan['seed'] + k for k in range(plan['deals'])]

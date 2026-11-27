@@ -159,7 +159,7 @@ class ClaudeCLI(Backend):
             cmd += ['--thinking-display', self.thinking_display]
         if self.model:
             cmd += ['--model', self.model]
-        if self.effort:  # low, medium, high, xhigh or max; unset, Claude Code's default may not think at all
+        if self.effort:  # low, medium, high, xhigh or max (players.toml); unset, Claude may not think at all
             cmd += ['--effort', self.effort]
         if self.session:
             cmd += ['--resume', self.session]

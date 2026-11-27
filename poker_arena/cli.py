@@ -12,7 +12,7 @@ from .runner import load_players, make_plan, run_duplicate, run_plan
 
 
 def cmd_play(args):
-    players = load_players(args.players)
+    players = load_players(args.players, effort=args.effort)
     game = get_game(args.game)({'hands_per_match': args.deals})
     seeds = [args.seed + k for k in range(args.deals)]
     res = asyncio.run(run_duplicate(game, (args.a, players[args.a]), (args.b, players[args.b]), seeds, Path(args.out)))
@@ -38,6 +38,8 @@ def cmd_plan(args):
 
 def cmd_tournament(args):
     plan = json.loads(Path(args.plan).read_text())
+    if args.effort:
+        plan['effort'] = args.effort
     if args.dry_run:
         for a, b in plan['matchups']:
             print(f'{a} vs {b}: 2 x {plan["deals"]} hands -> {plan["out"]}/{a}__vs__{b}')
@@ -151,6 +153,7 @@ def main(argv=None):
     p.add_argument('--game', default='holdem')
     p.add_argument('--players', default='players.toml')
     p.add_argument('--out', default='runs/play')
+    p.add_argument('--effort', help='reasoning level for every model (default: each player\'s own, else high)')
     p.set_defaults(fn=cmd_play)
 
     p = sub.add_parser('plan', help='write a round-robin tournament plan')
@@ -168,6 +171,7 @@ def main(argv=None):
     p.add_argument('--only', nargs='*', help='only these players or matchups')
     p.add_argument('--concurrency', type=int, help='matches at once per CLI (overrides the plan)')
     p.add_argument('--dry-run', action='store_true')
+    p.add_argument('--effort', help='reasoning level for every model, e.g. high (overrides players.toml and the plan)')
     p.set_defaults(fn=cmd_tournament)
 
     p = sub.add_parser('ratings', help='Elo and bb/100 from every finished duplicate deal under a folder')
