@@ -269,3 +269,37 @@ Round 4 report: `/private/tmp/claude-501/-Users-snehal-Code-poker-arena/7391e5d9
   outcome row instead of tall hero, one expandable planning panel, audit summary per run (tool rejections, unverified,
   fallbacks, identity coverage) and per-decision audit/identity details, mobile label overflow fixed and mobile stats
   metric selector, made-hand / to-call / pot-odds / duplicate comparison in replay, fit residuals (R4-#10–#15, #2, #9).
+
+---
+
+# Round 5 → 6
+
+Round 5 report: `/private/tmp/claude-501/-Users-snehal-Code-poker-arena/7391e5d9-a258-4fd4-b230-fb0d350c6f8f/scratchpad/review/r5-report.md`
+(ux=8 gameplay=8 evals=7 judges=6 overall=7). Issues R5-#n. Same tracks and file ownership.
+
+## Contract additions
+- **Record verifier (C writes, A uses):** `games.holdem.verify_hand(game, seed, button, recorded_hand, events) -> {ok, errors}`
+  regenerates the deal from the seed, replays the recorded actions legally, and compares cards, board, payouts and
+  summary. `runner`/`ratings.pairing_data` run it for every counted hand; the official decision record stores
+  `evidence_hash` (hash of the verified hands at that look). A failed verification rejects the hand pair (R5-#4).
+- **Decision coverage (C):** eligibility requires every model action event to have exactly one decision (thought) event
+  and its call records; missing protocol fingerprints fail; empty evidence never passes (R5-#2).
+- **CLI version pinning (C, A):** registration pins CLI versions; resume across a CLI version change is refused unless
+  `--allow-code-change`, which voids registration; history identity splits at version changes (R5-#3).
+- **Identity (C, A, B):** calls carry `identity_reported: bool` and `identity_match: 'match'|'mismatch'|'unattested'`
+  via `ratings.same_model`; every consumer uses `identity_match` (R5-#5).
+- **Current validity of historical wins (A):** an official verdict counts toward a current leader/rank only if today's
+  evidence check (verifier, coverage, identity) still passes; lost evidence vs rule change are distinguished (R5-#1).
+- **Wording (A, B):** "diagnostics passed; distribution assumptions unverified" instead of "within calibrated range" (R5-#6).
+- **Power from the full adjudicator (A):** plan/power scenarios simulate the complete `adjudicate` (both arms, diagnostics);
+  report pairwise counting power and probability of a decided tournament leader under stated edge scenarios (R5-#7).
+- **Equivalence calibration (A):** simulations at ±15 and just outside, skew families, simultaneous pairings; false-"even"
+  rates reported in docs and a test (R5-#8).
+- **Competence vs peers (C bot, A/B presentation):** a fixed, versioned `reference` bot policy (solid
+  tight-aggressive, position-aware, equity/pot-odds based with a fixed bluff frequency) recommended in every plan; and a
+  small `quiz` suite of poker decision spots with objectively correct answers (pot-odds calls/folds, all-in EV spots,
+  computed by exact/MC equity) that models answer through the same backends, scored separately as "poker
+  fundamentals". Present peer-relative winnings and fundamentals separately (R5-#9).
+- **Viewer (B):** cache signature includes .json run files (R5-#10); "untestable" fit shown as insufficient evidence
+  (R5-#11); when additivity fails, the hero leads with direct matchup results (R5-#12); mobile fixes (R5-#13); playback
+  speed control, pause on "why?", jump to divergent decisions and big swings (R5-#14).
