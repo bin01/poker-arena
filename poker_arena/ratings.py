@@ -3556,10 +3556,9 @@ def quiz_link(x: dict, doc: dict, player: dict | str | None) -> dict:
     same model and level, shown apart under its own name), with `differences` saying what differs or is
     unrecorded."""
     prov = player if isinstance(player, dict) else {'identity': player}
-    if (x.get('eligibility') or {}).get('status') == 'bot':
-        return {'status': 'attached', 'differences': []}
+    bot = (x.get('eligibility') or {}).get('status') == 'bot'
     diffs = []
-    if (x.get('eligibility') or {}).get('status') != 'eligible':
+    if not bot and (x.get('eligibility') or {}).get('status') != 'eligible':
         diffs.append('its answers are not eligible')
     proto = x.get('protocol') if isinstance(x.get('protocol'), dict) else {}
     mine = (proto.get('settings') or {}).get('player') if isinstance(proto.get('settings'), dict) else proto.get('player')
@@ -3575,6 +3574,8 @@ def quiz_link(x: dict, doc: dict, player: dict | str | None) -> dict:
         diffs.append('code not recorded on both sides')
     elif theirs == MIXED or any(mine[k] != theirs[k] for k in set(mine) & set(theirs)) or not set(mine) & set(theirs):
         diffs.append('different code')
+    if bot:   # a bot has no CLI, but its policy is code: the same settings and code, recorded on both sides
+        return {'status': 'model-level' if diffs else 'attached', 'differences': diffs}
     cli = x.get('cli') if isinstance(x.get('cli'), dict) else {}
     for key, have, want in (('CLI version', x.get('cli_version') or cli.get('version'), prov.get('cli_version')),
                             ('CLI file', cli.get('sha256'), prov.get('cli_sha256'))):

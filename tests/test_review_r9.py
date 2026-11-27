@@ -223,3 +223,16 @@ class TestClosingActionShowsNobodyToAct(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestBotQuizAttachment(unittest.TestCase):
+    def test_bot_score_needs_the_same_code(self):
+        from poker_arena import ratings
+        x = {'eligibility': {'status': 'bot'}, 'protocol': {'settings': {'player': {'bot': 'reference'}}},
+             'implementation': {'files': {'poker_arena/agents.py': 'OLD'}}}
+        same = {'identity': 'bot:reference', 'settings': {'bot': 'reference'}, 'code': {'poker_arena/agents.py': 'OLD'}}
+        new = {**same, 'code': {'poker_arena/agents.py': 'NEW'}}
+        self.assertEqual(ratings.quiz_link(x, {}, same)['status'], 'attached')
+        r = ratings.quiz_link(x, {}, new)
+        self.assertEqual(r['status'], 'model-level')
+        self.assertIn('different code', r['differences'])
