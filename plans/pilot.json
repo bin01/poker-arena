@@ -6,7 +6,7 @@
     "claude-opus",
     "claude-sonnet",
     "codex-gpt",
-    "gemini-pro",
+    "gemini-agy",
     "rule",
     "station",
     "random"
@@ -22,7 +22,7 @@
     ],
     [
       "claude-opus",
-      "gemini-pro"
+      "gemini-agy"
     ],
     [
       "claude-opus",
@@ -42,7 +42,7 @@
     ],
     [
       "claude-sonnet",
-      "gemini-pro"
+      "gemini-agy"
     ],
     [
       "claude-sonnet",
@@ -58,7 +58,7 @@
     ],
     [
       "codex-gpt",
-      "gemini-pro"
+      "gemini-agy"
     ],
     [
       "codex-gpt",
@@ -73,15 +73,15 @@
       "random"
     ],
     [
-      "gemini-pro",
+      "gemini-agy",
       "rule"
     ],
     [
-      "gemini-pro",
+      "gemini-agy",
       "station"
     ],
     [
-      "gemini-pro",
+      "gemini-agy",
       "random"
     ],
     [

@@ -2,7 +2,8 @@
 # Subscription backends use the official CLIs, signed in with your own plan:
 #   claude  -> Claude Code (`claude login`), Claude Pro/Max
 #   codex   -> Codex CLI (`codex login`), ChatGPT Plus/Pro
-#   gemini  -> Gemini CLI (sign in on first run)
+#   agy     -> Google Antigravity CLI (Gemini models, Google account)
+#   gemini  -> Gemini CLI, where still installed
 #   command -> any CLI that reads a prompt on stdin, e.g. pi or ollama
 # Optional keys for any model: extra_args (list), timeout (seconds per call), rate_limit_wait (seconds
 # to wait when the plan's usage limit is hit), max_wait (total seconds to keep waiting).
@@ -21,9 +22,9 @@ backend = "codex"
 # model = "gpt-6.1-sol"   # leave unset to use your Codex default
 effort = "high"
 
-[players.gemini-pro]
-backend = "gemini"
-# model = "gemini-3-pro"  # leave unset to use the CLI's default
+[players.gemini-agy]
+backend = "agy"
+# model = "gemini-4-neon-high"   # see `agy models`; leave unset for the CLI's default
 
 # [players.pi-default]
 # backend = "command"

@@ -5,7 +5,8 @@ match costs nothing beyond the subscription:
 
     claude   Claude Code (`claude -p`), Claude Pro/Max. The CLI keeps the conversation (--resume).
     codex    Codex CLI (`codex exec`), ChatGPT Plus/Pro. The CLI keeps the conversation (exec resume).
-    gemini   Gemini CLI (`gemini -p`), Google account. Stateless: the transcript is re-sent each turn.
+    agy      Google Antigravity CLI (`agy -p`), Google account: Gemini models. The CLI keeps the conversation.
+    gemini   Gemini CLI (`gemini -p`), for installs that still have it. Stateless: the transcript is re-sent.
     command  Any other CLI that reads a prompt on stdin and prints a reply (pi -p, ollama run, ...).
              Stateless.
 
@@ -56,6 +57,7 @@ class Backend:
         self.label = label
         self.turns: list[list[str]] = []   # [user, assistant] pairs (kept by stateless backends)
         self.session: str | None = None    # the CLI's own conversation id (stateful backends)
+        self.workdir: str | None = None    # one empty folder per seat, kept for the match (CLIs key sessions by folder)
 
     # ---- state for resuming a stopped match -------------------------------------------------
     def state(self):
@@ -112,20 +114,18 @@ class Backend:
         exe = shutil.which(cmd[0])
         if not exe:
             raise BackendError(f'{cmd[0]!r} is not installed or not on PATH')
-        workdir = cwd or tempfile.mkdtemp(prefix='poker-arena-')  # an empty folder: no project files or instructions
+        if not cwd and not self.workdir:
+            self.workdir = tempfile.mkdtemp(prefix='poker-arena-')  # empty: no project files or instructions
+        workdir = cwd or self.workdir
+        proc = await asyncio.create_subprocess_exec(
+            exe, *cmd[1:], cwd=workdir, stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         try:
-            proc = await asyncio.create_subprocess_exec(
-                exe, *cmd[1:], cwd=workdir, stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            try:
-                out, err = await asyncio.wait_for(proc.communicate(stdin.encode() if stdin is not None else None),
-                                                  self.timeout)
-            except asyncio.TimeoutError:
-                proc.kill()
-                raise BackendError(f'{cmd[0]} timed out after {self.timeout:.0f}s')
-        finally:
-            if not cwd:
-                shutil.rmtree(workdir, ignore_errors=True)
+            out, err = await asyncio.wait_for(proc.communicate(stdin.encode() if stdin is not None else None),
+                                              self.timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise BackendError(f'{cmd[0]} timed out after {self.timeout:.0f}s')
         out_s, err_s = out.decode(errors='replace'), err.decode(errors='replace')
         if proc.returncode != 0:
             raise BackendError(f'{cmd[0]} exited {proc.returncode}: {(err_s or out_s).strip()[-1500:]}')
@@ -227,6 +227,38 @@ class CodexCLI(Backend):
         return Reply(messages[-1], '\n'.join(thinking), usage, meta={'session': self.session})
 
 
+class AgyCLI(Backend):
+    """Google Antigravity CLI (`agy -p`), signed in with a Google account: Gemini models. The system prompt goes
+    in the first message (there is no flag for it); later turns continue the same conversation by id. stdin is
+    closed (scripted output can go missing otherwise) and `--sandbox` limits terminal use. agy keeps its own
+    tools loaded (there is no flag to drop them); in headless mode anything needing approval is refused."""
+    stateful = True
+
+    def __init__(self, system, *, effort=None, print_timeout='15m', **kw):
+        super().__init__(system, **kw)
+        self.effort, self.print_timeout = effort, print_timeout
+
+    async def _call(self, text):
+        prompt = text if self.session else self.system + '\n\n=== THE MATCH BEGINS ===\n' + text
+        cmd = ['agy', '--output-format', 'json', '--sandbox', '--print-timeout', self.print_timeout]
+        if self.model:
+            cmd += ['--model', self.model]
+        if self.effort:
+            cmd += ['--effort', self.effort]
+        if self.session:
+            cmd += ['--conversation', self.session]
+        cmd += self.extra_args + ['-p', prompt]  # flags must come before -p
+        out = await self.run(cmd)
+        try:
+            data = json.loads(out[out.find('{'):])
+        except ValueError:
+            raise BackendError(f'agy returned non-JSON output: {out.strip()[-1500:] or "(empty)"}')
+        if data.get('status') != 'SUCCESS':
+            raise BackendError(f'agy {data.get("status")}: {json.dumps(data.get("error") or data)[:1500]}')
+        self.session = data.get('conversation_id') or self.session
+        return Reply(data.get('response') or '', '', data.get('usage') or {}, meta={'session': self.session})
+
+
 class GeminiCLI(Backend):
     """Gemini CLI in headless mode; the transcript is re-sent every turn (as an argument, so it is capped
     lower than the other stateless backends; the oldest turns go first and the notes carry what matters)."""
@@ -238,7 +270,7 @@ class GeminiCLI(Backend):
     async def _call(self, text):
         cmd = ['gemini', '--output-format', 'json']
         if self.model:
-            cmd += ['-m', self.model]
+            cmd += ['--model', self.model]
         cmd += self.extra_args + ['-p', self.transcript(text)]
         out = await self.run(cmd)
         try:
@@ -247,7 +279,7 @@ class GeminiCLI(Backend):
             raise BackendError(f'gemini returned non-JSON output: {out.strip()[-1500:]}')
         if data.get('error'):
             raise BackendError(f'gemini: {json.dumps(data["error"])[:1500]}')
-        return Reply(data.get('response') or '', '', data.get('stats') or {})
+        return Reply(data.get('response') or '', '', data.get('usage') or data.get('stats') or {})
 
 
 class CommandCLI(Backend):
@@ -292,7 +324,7 @@ class OpenAICompat(Backend):
         return Reply(msg.get('content') or '', msg.get('reasoning') or '', raw.get('usage') or {})
 
 
-BACKENDS = {'claude': ClaudeCLI, 'codex': CodexCLI, 'gemini': GeminiCLI, 'command': CommandCLI,
+BACKENDS = {'claude': ClaudeCLI, 'codex': CodexCLI, 'agy': AgyCLI, 'gemini': GeminiCLI, 'command': CommandCLI,
             'openai_compat': OpenAICompat}
 
 

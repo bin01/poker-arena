@@ -10,7 +10,7 @@ deal, one Bradley–Terry fit turns results into ratings with bootstrap interval
 result can be traced back to the hand and the reasoning behind it.
 
 Models run through the labs' **official command-line tools signed in with your own subscription** (Claude
-Code, Codex, Gemini CLI), so a tournament costs nothing beyond the plans you already pay for.
+Code, Codex, Antigravity), so a tournament costs nothing beyond the plans you already pay for.
 
 ## How it works
 
@@ -58,7 +58,7 @@ python -m poker_arena view runs/demo                 # http://127.0.0.1:8800
 
 ### Models, on your subscriptions
 
-Install and sign in to the CLIs you want to use (`claude`, `codex`, `gemini`), then check them:
+Install and sign in to the CLIs you want to use (`claude`, `codex`, `agy`), then check them:
 
 ```sh
 python -m poker_arena doctor          # each model player: does it answer, is the JSON valid, does it remember?
@@ -70,7 +70,8 @@ Players live in [`players.toml`](players.toml): a `backend` and optional `model`
 |---|---|---|---|
 | `claude` | Claude Code, `claude -p` | Claude Pro / Max | the CLI keeps the session (`--resume`); tools off |
 | `codex` | Codex CLI, `codex exec` | ChatGPT Plus / Pro | the CLI keeps the thread (`exec resume`); read-only sandbox |
-| `gemini` | Gemini CLI, `gemini -p` | Google account | the transcript is re-sent each turn |
+| `agy` | Google Antigravity CLI, `agy -p` | Google account (Gemini) | the CLI keeps the conversation (`--conversation`) |
+| `gemini` | Gemini CLI, `gemini -p` (older installs) | Google account | the transcript is re-sent each turn |
 | `command` | any CLI reading a prompt on stdin, e.g. `["pi", "-p"]`, `["ollama", "run", "{model}"]` | yours | transcript re-sent |
 | `openai_compat` | OpenRouter, Ollama, LM Studio, vLLM (an API, not a subscription) | API key | transcript re-sent |
 
@@ -139,8 +140,8 @@ plugged in as a `command` backend if you want to compare harnesses.
 
 ## Caveats
 
-- CLI backends add their own system prompts and limits (Codex's default prompt is about 21K tokens), and expose
-  reasoning unevenly (`claude -p` shows no thinking, `codex` shows reasoning summaries when asked, `gemini` none),
+- CLI backends add their own system prompts and limits (Codex's default prompt is about 21K tokens, agy's about 15K), and expose
+  reasoning unevenly (`claude -p` shows no thinking, `codex` shows reasoning summaries when asked, `agy` none; agy also keeps its own tools loaded, with anything needing approval refused),
   which is why every reply carries its own `reasoning` field.
 - Elo needs whole sessions (10 deals each), so a matchup needs at least 5 deals to count and 10+ to mean much.
 - Results from different backends of the same model (CLI vs API) shouldn't be mixed on one leaderboard.
