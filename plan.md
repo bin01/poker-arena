@@ -189,3 +189,40 @@ Round 2 report: `/private/tmp/claude-501/-Users-snehal-Code-poker-arena/7391e5d9
 
 ### Stats (A)
 - `stats.collect` gives each rate as `{n, of}` plus per-opponent breakdown (R2-#20).
+
+---
+
+# Round 3 → 4
+
+Round 3 report: `/private/tmp/claude-501/-Users-snehal-Code-poker-arena/7391e5d9-a258-4fd4-b230-fb0d350c6f8f/scratchpad/review/r3-report.md`
+(ux=7 gameplay=8 evals=5 judges=6 overall=6). Issues R3-#n. Same three tracks, same file ownership.
+
+## Contract additions
+- **Inference validity (A):** a verdict needs at least `min_conversations` (default 8) independent conversations per
+  pairing; below that the verdict is `early` whatever t is. The boundary is calibrated (and tested) against normal,
+  skewed/discrete and heavy-tailed conversation-mean distributions at that minimum; the documented guarantee states its
+  assumptions and the worst calibrated case. If a robust alternative (e.g. a studentized bootstrap or a
+  sign-flip randomization test on conversation means combined with the minimum) is better calibrated in those cases,
+  use it. Zero-variance conversations never produce a decision (R3-#1).
+- **Power (A):** plan from conversation-mean variance with explicit dependence assumptions
+  (`assumed_icc`, `assumed_ar1`), report `power_scenarios` (optimistic / moderate / pessimistic) and choose
+  `max_rounds` by default so the moderate scenario reaches 80% power at the target; a budget cap only via an explicit
+  `budget_deals` setting, and then `underpowered: true` (R3-#2, #3).
+- **Unregistered runs (A, B):** runs without a recorded design get `design: {registered: false}`; no inferential
+  verdicts; any sample-size numbers labelled retrospective (R3-#6).
+- **Identity (A, C):** exact canonical model ids with an explicit alias map; served-model mismatch or unresolved identity
+  removes the player from inferential results in that run too (R3-#7, #8). Protocol identity includes the match horizon
+  and memory-reset schedule (C writes them, A pools on them) (R3-#9).
+- **One source of design (C):** the runner executes only from `ratings.normalize_design(plan)`; conflicting
+  `plan.replicates` vs `design.replicates` is an error (R3-#10).
+- **Session Elo (A):** interval from resampling conversations jointly, or omitted with the assumption stated (R3-#11).
+- **Audit (C):** agy turns whose transcript can't be read are `audit: 'unverified'` and rejected/retried like tool use;
+  every call carries `audit` status (R3-#4). Each match config records `implementation`: content hashes of the engine,
+  agents, backends, ratings modules and prompt templates; resume refuses a different implementation unless
+  `--allow-code-change` is given (and then records it); a source snapshot (`git diff` or tarball of the package) is
+  saved once per run (R3-#5).
+- **Viewer (B):** provisional order labelled as such, numerals only for decided ranks (R3-#12); mobile autoplay plays
+  Play 1 then Play 2 before the next deal; desktop offers street-aligned comparison or independent timelines (R3-#13);
+  navigation grouped pairing → round → replicate with correct counts (R3-#14); during playback the scoreboard and deal
+  map collapse so the table is in the first viewport on mobile, and matchup labels are complete (R3-#15); position split
+  and visible "Plays preflop"/"Raises preflop" labels (R3-#16); unregistered runs say so.
