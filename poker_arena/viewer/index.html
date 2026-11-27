@@ -5,17 +5,21 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Poker Arena</title>
 <link rel="stylesheet" href="style.css">
+<!--static-->
 </head>
 <body>
-<header>
-  <div class="brand"><span class="logo">♠</span> Poker Arena</div>
-  <nav>
-    <a href="#/" data-tab="board">Leaderboard</a>
-    <a href="#/matches" data-tab="matches">Matches</a>
-  </nav>
-  <div id="status" class="muted"></div>
+<header class="top">
+  <div class="top-inner">
+    <a class="brand" href="#/"><span class="mark">♠</span><span class="label">Poker Arena</span></a>
+    <label class="run-pick"><span class="sr">Run</span><select id="run" aria-label="Run"></select></label>
+    <nav>
+      <a data-tab="board">Leaderboard</a>
+      <a data-tab="matches">Matches</a>
+    </nav>
+    <div id="status"></div>
+  </div>
 </header>
-<main id="app"></main>
+<main id="app"><div class="loading">Loading…</div></main>
 <script src="app.js"></script>
 </body>
 </html>

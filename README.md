@@ -114,14 +114,36 @@ so 100 hands take 30–90 minutes per model seat. The pilot is about 6,000 model
 | `state.json` | what a stopped match needs to resume |
 | `result.json` | totals and bb/100 when the match finishes |
 
+A tournament also writes its `plan.json` into `runs/<plan>/`, so the viewer can show matchups that haven't started.
+
 ## The viewer
 
-`python -m poker_arena view runs/pilot` serves:
+`python -m poker_arena view runs` serves every run under `runs/` at http://127.0.0.1:8800, with a picker for the
+run (a tournament's `out` folder, or a `play --out`). It follows running matches live.
 
-- **Leaderboard**: Elo with intervals, bb/100, sessions won, and a head-to-head bb/100 matrix.
-- **Matches**: every matchup with a strip of its deals coloured by who won the deal over both plays. Pick a deal
-  to see **both plays of it side by side** (same cards, seats swapped): hole cards, board, every action, the
-  table talk, and each player's private reasoning and notes.
+- **Leaderboard.** Progress of the run (hands played, pace, time left), then:
+  - **Ratings**: Elo with its 90% interval on a shared axis, bb/100 with its 95% margin (coloured only when the
+    margin excludes zero), sessions won–tied–lost. Only players with at least 3 sessions are ranked; the rest
+    are listed with how far they are from a rating.
+  - **Head to head**: bb/100 for every pair, shaded when the edge is larger than its margin; a cell opens the matchup.
+  - **How they play**: VPIP, PFR, aggression after the flop, how often it goes to showdown and wins there, and
+    how often it talks.
+  - **Reliability** (model players): mean and slowest reply, retries, fallbacks, corrected bet sizes, tokens per
+    decision, and which model the CLI says answered.
+- **Matches.** Every matchup (playing, played, not started). A strip of its deals, shaded by who won each deal
+  over both plays and by how much. Each deal shows **both plays side by side** (same cards, seats swapped):
+  hole cards, board, every action in big blinds, the table talk, each decision's private reasoning (and the
+  CLI's own thinking where it exposes it), badges for retries, fallbacks, corrected sizes and reply time, and
+  each player's notes on its opponent. <kbd>←</kbd> <kbd>→</kbd> move between deals, <kbd>r</kbd> hides the reasoning.
+
+```sh
+python -m poker_arena status runs                 # the same progress in the terminal
+python -m poker_arena export runs --out site       # a static copy (no server needed) to host or share
+python -m http.server -d site 8000
+```
+
+The export holds the viewer and every match's events (cards, actions, talk, reasoning, notes), but not the
+raw prompts and replies in `calls.jsonl`, and player settings are reduced to backend and model.
 
 ## Extending it
 

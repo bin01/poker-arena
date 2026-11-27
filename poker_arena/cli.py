@@ -66,6 +66,37 @@ def cmd_view(args):
     serve(args.root, args.port, args.host)
 
 
+def cmd_export(args):
+    from .server import export
+    n = export(args.root, args.out)
+    print(f'wrote {args.out}: the viewer and {n} data files. Open it with any static file server, e.g.\n'
+          f'  python -m http.server -d {args.out} 8000')
+
+
+def cmd_status(args):
+    """Progress of every run under a folder: hands played, matchups playing, pace and time left."""
+    from .server import index, runs
+    root = Path(args.root).resolve()
+    for r in runs(root):
+        if args.run and r['run'] != args.run:
+            continue
+        state = 'finished' if r['finished'] else 'playing' if r['live'] else 'paused'
+        line = f"{r['run']}: {state}, {r['hands']:,} of {r['hands_planned']:,} hands, " \
+               f"{r['matchups_finished']} of {r['matchups']} matchups done"
+        if r['hands_per_hour']:
+            line += f", {r['hands_per_hour']:,} hands an hour"
+        if r['eta_seconds']:
+            line += f", about {r['eta_seconds'] / 3600:.1f} h left" if r['eta_seconds'] >= 3600 \
+                else f", about {max(1, round(r['eta_seconds'] / 60))} min left"
+        print(line)
+        for m in index(root, r['run']):
+            if m['finished'] and not args.all:
+                continue
+            mark = 'playing' if m['live'] else 'not started' if not m['started'] else 'done' if m['finished'] else 'paused'
+            net = f", {m['a']} {m['pair_net_a'] / m['bb']:+.1f} bb" if m['pairs_done'] else ''
+            print(f"  {m['a']} vs {m['b']}: {m['pairs_done']}/{m['deals_total']} deals, {mark}{net}")
+
+
 def cmd_doctor(args):
     """Checks each model player's backend: it answers, its JSON parses, and it remembers an earlier turn."""
     from .agents import parse_json
@@ -142,6 +173,17 @@ def main(argv=None):
     p.add_argument('--port', type=int, default=8800)
     p.add_argument('--host', default='127.0.0.1')
     p.set_defaults(fn=cmd_view)
+
+    p = sub.add_parser('export', help='write the viewer and a run\'s data as a static site you can host anywhere')
+    p.add_argument('root', nargs='?', default='runs')
+    p.add_argument('--out', default='site')
+    p.set_defaults(fn=cmd_export)
+
+    p = sub.add_parser('status', help='progress of each run: hands played, pace, time left')
+    p.add_argument('root', nargs='?', default='runs')
+    p.add_argument('--run', help='only this run')
+    p.add_argument('--all', action='store_true', help='list finished matchups too')
+    p.set_defaults(fn=cmd_status)
 
     p = sub.add_parser('doctor', help='check that each model player answers and remembers')
     p.add_argument('ids', nargs='*')

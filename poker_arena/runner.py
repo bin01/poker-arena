@@ -127,12 +127,14 @@ async def run_match(game, seat_players: list[tuple[str, dict]], seeds: list[int]
             thought = {'kind': 'thought', 'episode': k, 'visible': [], 'data': {
                 'seat': seat, 'player': ids[seat], 'reasoning': d.reasoning, 'thinking': d.thinking,
                 'notes': agents[seat].notes if agents[seat].kind == 'model' else '', 'fallback': d.fallback,
-                'tries': len(d.calls), 'action': last.get('action'), 'amount': last.get('amount')}}
+                'tries': len(d.calls), 'action': last.get('action'), 'amount': last.get('amount'),
+                'seconds': round(sum(c.get('latency') or 0 for c in d.calls), 1),
+                'served_model': next((c['served_model'] for c in reversed(d.calls) if c.get('served_model')), None)}}
             _append(out / 'events.jsonl', thought)
             for c in d.calls:
                 _append(out / 'calls.jsonl', {'hand': k, 'seat': seat, 'player': ids[seat], **c})
             flush()
-        summary = ep.summary()
+        summary = {**ep.summary(), 't': round(time.time(), 1)}  # when it finished: the viewer's progress and ETA
         totals = [t + x for t, x in zip(totals, ep.payoffs)]
         _append(out / 'hands.jsonl', summary)
         state = {'hands': k + 1, 'pending': pending, 'agents': [a.state() for a in agents], 'fallbacks': fallbacks}
@@ -189,6 +191,8 @@ async def run_plan(plan: dict, *, only=None, concurrency=None, log=print):
     game = get_game(plan.get('game', 'holdem'))(cfg)
     seeds = [plan['seed'] + k for k in range(plan['deals'])]
     limit = concurrency or plan.get('concurrency', 2)
+    Path(plan['out']).mkdir(parents=True, exist_ok=True)
+    (Path(plan['out']) / 'plan.json').write_text(json.dumps(plan, indent=2))  # the viewer shows unstarted matchups
     sems = {}
     tasks = []
     for a, b in plan['matchups']:

@@ -134,8 +134,11 @@ def bb100(deals, names):
 def ratings(root, boot=300, anchor: tuple[str, float] | None = None, seed=0, session=SESSION) -> dict:
     deals = load_deals(root)
     names = sorted({d['a'] for d in deals} | {d['b'] for d in deals})
+    from .stats import collect
+    style = collect(root)
     if not names:
-        return {'players': [], 'matchups': [], 'deals': 0, 'sessions': 0, 'session_deals': session}
+        return {'players': [], 'matchups': [], 'deals': 0, 'sessions': 0, 'session_deals': session,
+                'min_sessions': MIN_SESSIONS, 'stats': style}
     games = sessions(deals, session)
     w = fit(games, names)
 
@@ -166,13 +169,18 @@ def ratings(root, boot=300, anchor: tuple[str, float] | None = None, seed=0, ses
         provisional = len(mine) < MIN_SESSIONS
         lo, hi = (np.percentile(samples[:, i], [5, 95]) if len(samples) and not provisional else (None, None))
         m, se, hands = rates[n]
-        players.append({'player': n, 'elo': round(float(point[i])), 'provisional': provisional,
+        players.append({'player': n, 'elo': round(float(point[i])), 'provisional': provisional, 'rated': not provisional,
+                        'sessions_needed': max(0, MIN_SESSIONS - len(mine)),
+                        'net_bb': round(sum((d['net_a'] if d['a'] == n else -d['net_a']) / d['bb']
+                                            for d in deals if n in (d['a'], d['b'])), 1),
+                        'bb_per_100_ci95': None if se is None else [round(m - 1.96 * se), round(m + 1.96 * se)],
                         'elo90': [round(float(lo)), round(float(hi))] if lo is not None else None,
                         'bb_per_100': None if m is None else round(m, 1),
                         'bb_per_100_se': None if se is None else round(se, 1),
                         'hands': hands, 'sessions': len(mine), 'session_wins': wins, 'session_ties': ties,
                         'session_losses': len(mine) - wins - ties})
-    players.sort(key=lambda p: -p['elo'])
+    # rated players by rating; the rest after them, by how much they've played (their numbers are too noisy to rank)
+    players.sort(key=lambda p: (not p['rated'], -p['elo'] if p['rated'] else -p['hands']))
     matchups = []
     for name, ds in sorted(by_matchup.items()):
         a, b = ds[0]['a'], ds[0]['b']
@@ -181,10 +189,11 @@ def ratings(root, boot=300, anchor: tuple[str, float] | None = None, seed=0, ses
         sd = (sum((x - m) ** 2 for x in xs) / max(1, len(xs) - 1)) ** 0.5
         matchups.append({'matchup': name, 'a': a, 'b': b, 'deals': len(ds),
                          'net_a_chips': sum(d['net_a'] for d in ds), 'a_bb_per_100': round(m, 1),
-                         'se': round(sd / math.sqrt(len(ds)), 1),
+                         'se': round(sd / math.sqrt(len(ds)), 1), 'hands': 2 * len(ds),
                          'a_session_wins': sum(outcome(g) == 1.0 for g in games_by[name]),
                          'b_session_wins': sum(outcome(g) == 0.0 for g in games_by[name])})
     return {'players': players, 'matchups': matchups, 'deals': len(deals), 'sessions': len(games),
+            'min_sessions': MIN_SESSIONS, 'tie_bb_per_deal': TIE_BB, 'stats': style,
             'session_deals': session, 'anchor': list(anchor) if anchor else None, 'boot': boot}
 
 
