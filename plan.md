@@ -339,3 +339,21 @@ Round 6 report: `/private/tmp/claude-501/-Users-snehal-Code-poker-arena/7391e5d9
   refresh in the background, never block navigation/replay on ratings (R6-#11); all-runs view leads with the current
   model cohort, groups named by participants, cohort selector (R6-#12); mobile replay: compact sticky controls, current
   action and price beside the table, synchronized two-play comparison, larger explanatory text (R6-#13).
+
+---
+
+# Tracks: official and adaptation (design A+C)
+
+- **A, official track:** fresh conversation every deal (`plan` default `--deals 1 --replicates 25`), assumption-free
+  betting test, the only source of decided ranks and leaders.
+- **C, adaptation track:** the same players and seeds in 50-deal conversations (4 per round), so models remember and
+  adapt; judged and stopped by the model-based gate under its own registered design (`design.track: 'adaptation'`,
+  power from `procedure_model_based`, at most the gate's calibrated 40 looks / 200 conversations). Verdicts carry
+  `track: 'adaptation'`, `official: false`, `model_based: true`; `counts_toward_leader` is always false, groups report
+  `model_based_leader` beside `leader: null`; labelled "adaptation · model-based · not official".
+- One tournament file (`runner.make_tournament`) holds `{tournament, out, tracks: {official: plan, adaptation: plan}}`;
+  each track runs into `<out>/<track>` with its own plan.json and registration. `tournament --track` picks one;
+  both run at once by default. `ratings <out>` judges each track apart. History records each run's track (`runs`
+  table) and `all_time(track=...)` never pools them. The viewer groups the two runs under one tournament in the
+  picker, shows the official standings first, a track tab bar, an explanation, and an adaptation section.
+- Tests: `tests/test_tracks.py`.

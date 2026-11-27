@@ -1,0 +1,84 @@
+{
+  "tournament": "tracks-demo",
+  "out": "runs/tracks-demo",
+  "tracks": {
+    "official": {
+      "game": "holdem",
+      "game_config": {},
+      "players_file": "players.toml",
+      "players": [
+        "reference",
+        "rule",
+        "station"
+      ],
+      "matchups": [
+        [
+          "reference",
+          "rule"
+        ],
+        [
+          "reference",
+          "station"
+        ],
+        [
+          "rule",
+          "station"
+        ]
+      ],
+      "deals": 1,
+      "seed": 1000,
+      "out": "runs/tracks-demo/official",
+      "concurrency": 2,
+      "design": {
+        "alpha": 0.05,
+        "block": 10,
+        "round_deals": 1,
+        "max_rounds": 2,
+        "track": "official",
+        "max_rounds_basis": "given"
+      },
+      "replicates": 25,
+      "track": "official",
+      "tournament": "tracks-demo"
+    },
+    "adaptation": {
+      "game": "holdem",
+      "game_config": {},
+      "players_file": "players.toml",
+      "players": [
+        "reference",
+        "rule",
+        "station"
+      ],
+      "matchups": [
+        [
+          "reference",
+          "rule"
+        ],
+        [
+          "reference",
+          "station"
+        ],
+        [
+          "rule",
+          "station"
+        ]
+      ],
+      "deals": 50,
+      "seed": 1000,
+      "out": "runs/tracks-demo/adaptation",
+      "concurrency": 2,
+      "design": {
+        "alpha": 0.05,
+        "block": 10,
+        "round_deals": 50,
+        "max_rounds": 3,
+        "track": "adaptation",
+        "max_rounds_basis": "given"
+      },
+      "replicates": 4,
+      "track": "adaptation",
+      "tournament": "tracks-demo"
+    }
+  }
+}

@@ -68,6 +68,16 @@ function ago(t) {
 const clock = d => d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
 const runLabel = r => (state.runs.find(x => x.run === r)?.title) || r.split('/').pop();
 const runLink = (run, rest = '') => `#/r/${encodeURIComponent(run)}${rest}`;
+// A tournament's runs, one per track, official first; a run outside any tournament is a set of one.
+const tourKey = r => r && r.tournament ? `${r.run.split('/').slice(0, -1).join('/')}|${r.tournament}` : null;
+function trackSet(run) {
+  const r = state.runs.find(x => x.run === run);
+  const k = tourKey(r);
+  if (!k) return r ? [r] : [];
+  return state.runs.filter(x => !x.all && tourKey(x) === k).sort((x, y) => (x.track === 'official' ? 0 : 1) - (y.track === 'official' ? 0 : 1));
+}
+const siblingTrack = (run, track) => trackSet(run).find(r => r.track === track) || null;
+const TRACK_TITLE = { official: 'Official standings', adaptation: 'Adaptation (models remember the session)' };
 const matchLink = (id, hand) => runLink(state.run, '/m/' + encodeURIComponent(id) + (hand != null ? `?deal=${hand + 1}` : ''));
 
 // ---- data ---------------------------------------------------------------------------------------
@@ -169,9 +179,20 @@ async function route(opts = {}) {
       return;
     }
     state.run = run;
-    const option = r => `<option value="${esc(r.run)}" ${r.run === run ? 'selected' : ''}>
-      ${esc(runLabel(r.run))}${r.live && !r.all ? ' · live' : ''}</option>`;
-    const all = state.runs.filter(r => r.all), each = state.runs.filter(r => !r.all);
+    const mine = new Set(trackSet(run).map(r => r.run));
+    const option = r => {
+      const set = trackSet(r.run);
+      const live = set.some(x => x.live) && !r.all;
+      const tracks = set.length > 1 ? ' · 2 tracks' : r.track === 'adaptation' ? ' · adaptation' : '';
+      return `<option value="${esc(r.run)}" ${mine.has(r.run) ? 'selected' : ''}>${esc(runLabel(r.run))}${tracks}${live ? ' · live' : ''}</option>`;
+    };
+    const seenT = new Set();
+    const all = state.runs.filter(r => r.all), each = state.runs.filter(r => !r.all).filter(r => {
+      const lead = trackSet(r.run)[0];
+      if (seenT.has(lead.run)) return false;
+      seenT.add(lead.run);
+      return true;
+    }).map(r => trackSet(r.run)[0]);
     $run.innerHTML = all.map(option).join('') + (all.length ? `<optgroup label="Runs">${each.map(option).join('')}</optgroup>` : each.map(option).join(''));
     $run.onchange = () => { location.hash = runLink($run.value); };
     const here = state.runs.find(r => r.run === run);
@@ -241,7 +262,8 @@ function runHead(r, rt) {
   const deals = Math.max(0, ...state.index.map(m => m.deals_total || 0));
   const pairings = new Set(state.index.map(m => [m.a, m.b].sort().join('|'))).size;
   const players = new Set([...state.index.flatMap(m => [m.a, m.b]), ...rt.roster.map(x => x.player)]).size;
-  const rounds = rt.design?.round_deals ? (rt.design.max_rounds > 1 ? `up to ${rt.design.max_rounds} rounds of ${rt.design.round_deals} deals` : `${rt.design.round_deals} deals per matchup`)
+  const conv = d => d.replicates > 1 ? `${d.replicates} conversations of ${plural(d.round_deals, 'deal')}` : plural(d.round_deals, 'deal');
+  const rounds = rt.design?.round_deals ? (rt.design.max_rounds > 1 ? `up to ${rt.design.max_rounds} rounds of ${conv(rt.design)}` : `${conv(rt.design)} per matchup`)
     : state.index.some(m => m.round > 1) ? `rounds of ${deals} deals` : `${deals} deals each`;
   const sub = [plural(players, 'player'), plural(pairings, 'matchup'), rounds];
   const share = r.finished ? 1 : r.hands_planned ? r.hands / r.hands_planned : 0;
@@ -271,6 +293,7 @@ function historyHead(r, rt) {
   if (gone) notes.push(`${plural(gone, 'run')} kept from the history after ${gone === 1 ? 'its folder was' : 'their folders were'} deleted.`);
   const self = (rt.runs || []).reduce((n, x) => n + (x.self_play || 0), 0);
   if (self) notes.push(`${plural(self, 'deal')} between two entries of the same model and level don't count.`);
+  if ((rt.other_track_runs || []).length) notes.push(`Official tracks only: ${plural(rt.other_track_runs.length, 'adaptation-track run')} (long conversations, model-based, never official) ${rt.other_track_runs.length === 1 ? 'is' : 'are'} kept apart, never pooled here.`);
   return `<div class="page-head"><div><div class="eyebrow">History</div><h1>All runs</h1><div class="sub">${sub.join(' · ')}</div></div>
     <div class="progress-block"><div class="line">One player per model and reasoning level, pooled across every run
       ${r.started_at ? `since ${new Date(r.started_at * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}` : ''}.</div>
@@ -313,6 +336,7 @@ function runKind(rt) {
   const d = rt.design || {};
   const v = voidReason(d);
   if (rt.pooled) return chip('pooled history', 'quiet', 'Pooled across runs, each stopped by its own rule: described, never decided.');
+  if (rt.track === 'adaptation') return chip('adaptation · model-based · not official', 'warn', 'Long conversations, judged by a model-based test: never official, never a rank or a leader.');
   if (v) return chip('registration void', 'warn', `The test plan no longer binds: ${v}. Nothing here is decided.`);
   if (rt.unregistered) return chip('unregistered', 'warn', 'Played before its test plan was recorded: everything here is ahead on points only, and sample sizes are retrospective.');
   if (d.registered || d.registration) return chip('registered plan', 'ok', 'The test plan was recorded before the first hand.');
@@ -325,16 +349,23 @@ function outcomeRow(rt, g, multi, first = true) {
   const by = Object.fromEntries(rt.players.map(p => [p.player, p]));
   const n = g.ranked.length;
   const verdicts = g.pairings.map(p => verdict(p, plain));
-  const decided = verdicts.filter(v => v.decided).length;
+  const decided = verdicts.filter(v => v.decided || v.model).length;
   const ineligible = verdicts.filter(v => v.tone === 'bad').length;
   const settled = !rt.pooled && !rt.unregistered && g.pairings.length && g.pairings.every(p => ['a', 'b', 'even', 'exhausted', 'ineligible'].includes(p.verdict));
   const misfit = g.misfits > 0 && g.members.length > 2;
-  const who = g.leader || g.qualified_leader || (n > 1 ? g.front_runner : null);
+  const who = g.leader || g.qualified_leader || (rt.track === 'adaptation' && g.model_based_leader) || (n > 1 ? g.front_runner : null);
   const p = who && by[who];
   const descriptive = rt.pooled || rt.unregistered || voidReason(rt.design);
   const others = g.members.length === 2 ? 'the other player' : `each of the other ${g.members.length - 1} players`;
   let kicker, tone, why;
-  if (g.qualified_leader) {
+  if (rt.track === 'adaptation') {
+    const mb = g.model_based_leader;
+    kicker = mb ? 'Won every matchup · model-based, not official' : 'Ahead on points · model-based track';
+    tone = 'points';
+    why = n < 2 ? 'Only one player in this group has results so far.'
+      : mb ? `It beat ${others} by the model-based test. That test rests on distribution assumptions, so this is not an official leader and never changes the official standings.`
+      : `Not official: ${decided} of ${plural(g.pairings.length, 'matchup')} ${decided === 1 ? 'has' : 'have'} a model-based verdict. ${p ? `${plain(who)} leads on points.` : ''}`;
+  } else if (g.qualified_leader) {
     kicker = 'Leader, outside the calibrated range';
     tone = 'qualified';
     why = `It won its matchup against ${others}, but at least one of those wins is outside the range the test is calibrated for, so it does not count as a decided leader.`;
@@ -360,7 +391,7 @@ function outcomeRow(rt, g, multi, first = true) {
     else why = `Not decided${over ? '' : ' yet'}: ${decided} of ${plural(g.pairings.length, 'matchup')} ${decided === 1 ? 'has' : 'have'} a result${over ? '' : ', and play continues'}. ${p ? `${plain(who)} leads on points.` : ''}`;
   }
   const facts = [first ? runKind(rt) : ''];
-  if (!descriptive && g.pairings.length) facts.push(chip(`${decided} of ${plural(g.pairings.length, 'matchup')} decided`, decided ? '' : 'quiet'));
+  if (!descriptive && g.pairings.length) facts.push(chip(`${decided} of ${plural(g.pairings.length, 'matchup')} ${rt.track === 'adaptation' ? 'called, model-based' : 'decided'}`, decided && rt.track !== 'adaptation' ? '' : 'quiet'));
   if (ineligible) facts.push(chip(`${ineligible} ineligible`, 'bad', 'Matchups the judge may not decide (identity, audit, protocol or registration): see Matchups.'));
   if (g.leader || g.qualified_leader) facts.push(assumeChip({ status: g.leader_assumption || 'unknown', label: Core.ASSUME[g.leader_assumption || 'unknown'], detail: '' }));
   const wrong = first && rt.audit && rt.audit.totals && rt.audit.totals.identity && rt.audit.totals.identity.mismatch;
@@ -431,6 +462,10 @@ function planPanel(rt) {
   const v = voidReason(d);
   let test;
   if (rt.pooled) test = 'Pooled across runs, each stopped by its own rule, so nothing here is decided: every order and number is <b>ahead on points</b>.';
+  else if (rt.track === 'adaptation') test = `<b>Adaptation track.</b> The same players keep one conversation for ${plural(d.round_deals || 0, 'deal')}, so models remember and can adapt to the opponent.
+    Each matchup is checked after every round of ${plural(d.replicates || 1, 'conversation')}, at most ${plural(d.max_rounds || 1, 'time')}, and stops on a verdict of the <b>model-based</b> test
+    (a conversation-level t and a sign-flip test with bars calibrated for a family of result shapes). Its ${Math.round((d.alpha || 0.05) * 100)}% error bound holds only under those assumptions,
+    so its verdicts are <b>never official</b>: they rank no one, name no leader and never change the official standings.`;
   else if (v) test = `This run's test plan is void (${esc(v)}), so nothing in it is decided: every order and verdict is <b>ahead on points</b>.`;
   else if (rt.unregistered) test = 'This run was played before its test plan was recorded, so nothing in it is decided: every order and verdict is <b>ahead on points</b>, and any sample size quoted is retrospective.';
   else if (d.round_deals && officialFree(rt)) {
@@ -447,6 +482,7 @@ function planPanel(rt) {
   else test = 'Decided results come only from a planned sequential test; everything else is ahead on points.';
   const target = rt.pooled ? '' : targetLine(rt, rt.pairings);
   const summary = rt.pooled ? 'Pooled across runs: described, never decided'
+    : rt.track === 'adaptation' ? 'Adaptation track · model-based test · not official'
     : v ? 'Test plan void: described, never decided'
     : rt.unregistered ? 'No recorded test plan: described, never decided'
     : d.round_deals && officialFree(rt) ? `Assumption-free sequential test · ${Math.round((d.alpha || 0.05) * 100)}% error bound if conversations are independent`
@@ -563,6 +599,61 @@ function auditSection(rt) {
     { id: 'audit', fold: true });
 }
 
+// ---- tracks: the official standings, and the adaptation track (the same players in long conversations) ----
+function trackBar(run, rest = '') {
+  const set = trackSet(run);
+  if (set.length < 2 && !(set[0] && set[0].track === 'adaptation')) return '';
+  const tab = r => `<a role="tab" class="track ${r.run === run ? 'on' : ''} t-${r.track}" aria-selected="${r.run === run}" href="${runLink(r.run, rest)}">
+    <span class="tr-t">${esc(TRACK_TITLE[r.track] || r.track)}</span><small>${r.track === 'adaptation' ? 'model-based · not official' : 'fresh conversation every deal · decides ranks'}</small></a>`;
+  return `<div class="track-bar" role="tablist" aria-label="Track">${set.map(tab).join('')}</div>`;
+}
+function trackNote(rt) {
+  const set = trackSet(state.run);
+  if (rt.track === 'adaptation') {
+    const d = rt.design || {};
+    return `<div class="track-note adaptation" role="note"><span class="tn-k">${chip('adaptation · model-based · not official', 'warn')}</span>
+      <p>Here the same players keep one conversation for ${d.round_deals ? plural(d.round_deals, 'deal') : 'many deals'}, so a model remembers earlier hands and can adapt to its opponent.
+      Its verdicts come from a <b>model-based</b> test, which assumes the results follow a family of shapes it was calibrated for, so its error rate is not guaranteed.
+      Nothing here is official: it never ranks anyone or names a leader. ${set.some(r => r.track === 'official') ? `The <a href="${runLink(siblingTrack(state.run, 'official').run)}"><u>official standings</u></a> use a fresh conversation for every deal and a test that assumes nothing about the shape of the results.` : ''}</p></div>`;
+  }
+  if (set.length < 2) return '';
+  return `<div class="track-note" role="note"><p>Two tracks, same players and cards. <b>Official</b>: a fresh conversation for every deal, judged by a test that assumes nothing about the shape of the results; only it decides ranks and leaders.
+    <b>Adaptation</b>: long conversations, so models remember and adapt to the opponent, judged by a model-based test and never official.</p></div>`;
+}
+// On the official page: the adaptation track's own standings, compact and clearly not official.
+function adaptationTeaser(rt) {
+  if (rt.track === 'adaptation') return '';
+  const sib = siblingTrack(state.run, 'adaptation');
+  if (!sib) return '';
+  const raw = ratingsStore.get(sib.run);
+  if (!raw) {
+    const here = state.run;
+    const later = (wait) => setTimeout(() => fetchRatings(sib.run).then(x => {
+      if (state.run !== here) return;
+      if (!x) later(PENDING_POLL);
+      else if (!state.replay?.playing && !location.hash.includes('/m')) route({ soft: true });
+    }).catch(() => {}), wait);
+    later(0);
+    return section(TRACK_TITLE.adaptation, 'model-based · not official', '<p class="soft">Working out the adaptation track\'s standings…</p>', '', { id: 'adaptation' });
+  }
+  const at = normalize(raw);
+  Object.assign(state.labels, raw.labels || {});
+  const ps = at.players.filter(p => p.in_fit).sort((x, y) => (y.strength ?? -1e9) - (x.strength ?? -1e9));
+  const mbl = (at.groups || []).map(g => g.model_based_leader).filter(Boolean);
+  const rows = ps.map((p, i) => `<div class="ad-row"><span class="pos-n">${i + 1}</span>${player(p.player, '', { details: false })}
+    <b class="${cls(p.strength)}">${fmtStrength(p.strength)}<small> bb/100</small></b><small class="soft">${p.strength_ci95 ? ciText(p.strength_ci95) : ''}</small></div>`).join('');
+  const called = at.pairings.filter(x => ['a', 'b', 'even'].includes(x.verdict)).map(x => {
+    const s = verdictSides(x);
+    return `<li>${s ? `${plain(s.winner)} beats ${plain(s.loser)}` : `${plain(x.a)} and ${plain(x.b)} even`} <span class="soft">(${signed(Math.abs(x.edge ?? 0), 0)} bb/100)</span></li>`;
+  }).join('');
+  const body = ps.length ? `<div class="ad-list">${rows}</div>${called ? `<div class="ad-called"><b>Model-based verdicts</b><ul>${called}</ul></div>` : ''}
+    ${mbl.length ? `<p class="small soft">${mbl.map(plain).join(', ')} won every matchup by the model-based test: not an official leader.</p>` : ''}`
+    : '<p class="soft">No finished deals on the adaptation track yet.</p>';
+  return section(TRACK_TITLE.adaptation, `${chip('model-based · not official', 'warn')}`,
+    body + `<a class="ad-open" href="${runLink(sib.run)}">Open the adaptation track ›</a>`,
+    'Ordered by points (descriptive). Long conversations, so models can adapt to the opponent; its verdicts come from a model-based test and never change the official standings above.', { id: 'adaptation' });
+}
+
 async function renderBoard(query) {
   const r = state.runs.find(x => x.run === state.run);
   let raw = ratingsStore.get(state.run) || null;
@@ -594,7 +685,8 @@ async function renderBoard(query) {
   const all = Core.cohorts(rt, { label: labelText, kind: p => state.kinds[p] });
   const cohort = all.length > 1 ? all.find(c => c.key === query?.get('c')) || all[0] : null;
   const view = cohort ? cohortView(rt, cohort) : rt;
-  let html = runHead(r, rt) + staleNote(raw) + intro(view) + (cohort ? cohortBar(all, cohort) : '');
+  rt.track = raw.track || r?.track || 'official';
+  let html = runHead(r, rt) + trackBar(state.run) + staleNote(raw) + trackNote(rt) + intro(view) + (cohort ? cohortBar(all, cohort) : '');
   const waiting = cohort && cohort !== all[0] ? [] : rt.roster.filter(x => !rt.players.some(p => p.player === x.player));
   if (!rt.players.length) {
     html += `<div class="card-box empty"><div class="big-suits">♠ ♥ ♦ ♣</div><h2>The cards are in the air</h2>
@@ -609,6 +701,7 @@ async function renderBoard(query) {
   html += `<div class="under-outcome">${planPanel(rt)}</div>`;
   html += standings(view, waiting);
   html += pairingsSection(view);
+  html += adaptationTeaser(rt);
   if (r?.quiz) html += await quizTeaser();
   html += `<div class="deep-head"><span>More detail</span><small>the full grid, play style and audit, folded away</small></div>`;
   html += headToHead(view);
@@ -861,7 +954,7 @@ function pairingsSection(rt) {
     const full = matchupId(p);
     const checks = p.looks_planned && !descriptive ? (p.looks_used ? ` · checked ${p.looks_used} of ${p.looks_planned}` : ' · not checked yet') : '';
     const conv = !descriptive && Core.conversationsShort(p) ? ` · ${p.conversations} of ${p.min_conversations} conversations a verdict needs` : '';
-    const word = v.tone === 'won' ? 'beats' : v.tone === 'even' ? 'even with' : edge ? 'ahead of' : 'level with';
+    const word = v.tone === 'won' || (v.model && p.verdict !== 'even') ? 'beats' : v.tone === 'even' || (v.model && p.verdict === 'even') ? 'even with' : edge ? 'ahead of' : 'level with';
     const fit = p.fit;
     const fitLine = fit && fit.warn ? `<div class="fitline"><span class="flag">off the fit</span> The strengths predict ${signed(up ? fit.fitted : -fit.fitted, 0)} for ${plain(lead)}; this matchup's own result is ${signed(edge, 0)}${fit.estimated ? '' : ` (residual ${signed(up ? fit.residual : -fit.residual, 0)})`}. The direct result is the evidence.</div>` : '';
     const untestable = fit && fit.untestable && rt.players.length > 2
@@ -878,7 +971,7 @@ function pairingsSection(rt) {
       ${noLine}${fitLine}</div>`;
   }).join('');
   return section('Matchups', 'who beats whom: the direct evidence, in bb/100 over duplicate deals', `<div class="pair-list">${rows}</div>`,
-    descriptive ? 'Ahead on points only: no verdict here is a decision. The range is 95%.' : 'Decided results are the planned test\'s; the rest is ahead on points. Hover a verdict for what it rests on; the range is 95%.');
+    descriptive ? 'Ahead on points only: no verdict here is a decision. The range is 95%.' : rt.track === 'adaptation' ? 'Verdicts here are the model-based test\'s: they stop play on this track, but none is official. Hover a verdict for what it rests on; the range is 95%.' : 'Decided results are the planned test\'s; the rest is ahead on points. Hover a verdict for what it rests on; the range is 95%.');
 }
 
 function headToHead(rt) {
@@ -1217,7 +1310,7 @@ async function renderMatches(id, params, soft) {
   const where = curP && curP.started.length > 1 ? `Round ${cur.round}${curP.reps.length > 1 ? ` · rep ${cur.replicate}` : ''}` : '';
   const toggle = `<button class="mtoggle" aria-expanded="${!!state.listOpen}"><span>${state.listOpen ? 'Hide matchups' : `All ${plural(pairs.length, 'matchup')}`}</span><i>▾</i></button>
     ${where ? `<span class="mwhere">${where}</span>` : ''}`;
-  const list = `<div class="mbar">${toggle}</div>` + groups.filter(g => g[1].length).map(([title, ps]) =>
+  const list = `<div class="mbar">${toggle}</div>${trackBar(state.run, '/m').replace('track-bar', 'track-bar compact')}` + groups.filter(g => g[1].length).map(([title, ps]) =>
     `<div class="group">${title}</div>` + ps.map(P => matchNav(P, cur, rt)).join('')).join('');
 
   let body, after = null;

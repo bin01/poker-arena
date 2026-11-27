@@ -109,6 +109,17 @@ ASSUMPTIONS = ('With no edge, a pairing is called for either player with chance 
                'same guarantee. Each verdict reports those checks. The model-based result shown beside it (a t and '
                'sign-flip test calibrated for a family of shapes) is secondary and never official.')
 GUARANTEE = ASSUMPTIONS
+TRACKS = ('official', 'adaptation')
+ADAPTATION_DEALS = 50       # deals per conversation on the adaptation track: models remember the session
+ADAPTATION_REPLICATES = 4   # conversations per pairing per round on the adaptation track
+ADAPTATION_LABEL = 'adaptation · model-based · not official'
+ADAPTATION_TEST = ('model-based gate (a conversation-level t and a sign-flip test, with bars calibrated for a family '
+                   'of shapes): its error rate holds only within that family, so its verdicts are never official')
+ADAPTATION_ASSUMPTIONS = ('Adaptation track: the same players in long conversations, so models remember and adapt '
+                          'to the opponent. Its verdicts come from the model-based gate (a conversation-level t and '
+                          'a sign-flip test with bars calibrated for a family of result shapes), which stops play '
+                          'by its own registered design; its error rate is not guaranteed outside that family, so '
+                          'nothing here is official, ranks no one and names no leader.')
 REFERENCE = {   # the reference bot's measured limits (docs/methodology.md, "How good at poker")
     'version': 'reference-1',
     'kind': 'a fixed heuristic, not a solver: tight-aggressive, position-aware, equity against the range the '
@@ -724,7 +735,7 @@ def calibration_id(design: dict | None) -> str | None:
 
 DESIGN_INPUTS = ('alpha', 'round_deals', 'block', 'replicates', 'max_rounds', 'target_edge_bb100', 'prior_sd_bb100',
                  'assumed_icc', 'assumed_ar1', 'budget_deals', 'n_pairings', 'allow_unattested', 'allow_opaque',
-                 'outside_calibration')
+                 'outside_calibration', 'track')
 
 
 def _inputs(d: dict) -> dict:
@@ -732,7 +743,8 @@ def _inputs(d: dict) -> dict:
     d = d or {}
     defaults = {'block': BLOCK, 'replicates': 1, 'target_edge_bb100': TARGET_EDGE, 'prior_sd_bb100': PRIOR_SD,
                 'assumed_icc': ASSUMED_ICC, 'assumed_ar1': ASSUMED_AR1, 'budget_deals': None,
-                'allow_unattested': list(ALLOW_UNATTESTED), 'allow_opaque': [], 'outside_calibration': 'exclude'}
+                'allow_unattested': list(ALLOW_UNATTESTED), 'allow_opaque': [], 'outside_calibration': 'exclude',
+                'track': 'official'}
     out = {}
     for k in DESIGN_INPUTS:
         v = d.get(k, defaults.get(k))
@@ -834,9 +846,10 @@ _COMPUTED = ('replicates', 'n_pairings', 'alpha_pairing', 'nominal_alpha', 'deal
              'max_deals', 'power_at_max', 'min_conversations', 'conversations_needed', 'power_scenarios',
              'underpowered', 'registered', 'sd_conversation_bb100', 'calibration', 'equivalence_alpha',
              'power_by_edge', 'power_basis', 'leader_chances', 'outcome_bound_bb100', 'official_test',
-             'assumption_free', 'threshold', 'bet_cap', 'equiv_bb100')
+             'assumption_free', 'threshold', 'bet_cap', 'equiv_bb100', 'official', 'model_based', 'judge_test',
+             'label', 'model_min_conversations', 'nominal_alpha_model')
 _PLAN_KEYS = ('design', 'deals', 'until_decided', 'replicates', 'matchups', 'target_edge_bb100', 'prior_sd_bb100',
-              'registered', 'game', 'game_config')
+              'registered', 'game', 'game_config', 'track')
 
 
 def _n_pairings(plan: dict) -> int:
@@ -880,6 +893,8 @@ def _normalized(key: str) -> str:
     given = {k: v for k, v in (plan.get('design') or {}).items() if k not in _COMPUTED}
     if plan.get('registered') is False or (plan.get('design') or {}).get('registered') is False:
         given['registered'] = False
+    if plan.get('track') and 'track' not in given:
+        given['track'] = plan['track']
     if plan.get('design') is not None:
         d = {**DEFAULT_DESIGN, 'round_deals': plan.get('deals') or DEFAULT_DESIGN['round_deals'], **given}
     else:
@@ -930,7 +945,15 @@ def _need_rounds(base: dict, target: float) -> int | None:
     return next((r for r, p in enumerate(curve, 1) if p >= POWER), None)
 
 
+def track_of(x: dict | None) -> str:
+    """'official' or 'adaptation': a plan's, a design's or a verdict's track (official unless it says otherwise)."""
+    x = x or {}
+    return x.get('track') or (x.get('design') or {}).get('track') or 'official'
+
+
 def _complete(d, reps, n_pairings, target, prior, players=None, bound=None) -> dict:
+    if d.get('track') == 'adaptation':
+        return _complete_adaptation(d, reps, n_pairings, target, prior, bound)
     R, B = int(d['round_deals']), int(d.get('block') or BLOCK)
     target, prior = float(target or TARGET_EDGE), float(prior or PRIOR_SD)
     icc, ar1 = float(d.get('assumed_icc', ASSUMED_ICC)), float(d.get('assumed_ar1', ASSUMED_AR1))
@@ -959,7 +982,8 @@ def _complete(d, reps, n_pairings, target, prior, players=None, bound=None) -> d
     moderate = power[1]['power']
     by_edge = {str(e): procedure(full, float(e))['counting'] for e in POWER_EDGES}
     cap = R * reps * rounds
-    out = {**d, 'round_deals': R, 'max_rounds': rounds, 'max_rounds_basis': basis, 'block': B, 'replicates': reps,
+    out = {**d, 'track': 'official', 'official': True,
+           'round_deals': R, 'max_rounds': rounds, 'max_rounds_basis': basis, 'block': B, 'replicates': reps,
            'n_pairings': n_pairings, 'alpha_pairing': ap,
            'official_test': {'name': OFFICIAL_TEST, 'assumption_free': True, 'bound_bb100': bound,
                              'bet_cap': BET_CAP, 'threshold': round(2 / ap, 3)},
@@ -983,6 +1007,76 @@ def _complete(d, reps, n_pairings, target, prior, players=None, bound=None) -> d
     if players and players >= 2 and n_pairings == players * (players - 1) // 2:
         out['leader_chances'] = leader_chances(out, players)
     return out
+
+
+def model_rounds_cap(reps: int) -> int:
+    """The most rounds the model-based gate is calibrated for at `reps` conversations a round."""
+    return max(1, min(MODEL_MAX_ROUNDS, MODEL_MAX_CONVERSATIONS // max(1, int(reps))))
+
+
+def _complete_adaptation(d, reps, n_pairings, target, prior, bound=None) -> dict:
+    """The adaptation track's design: long conversations (models remember the session), judged and stopped by
+    the model-based gate (`_model_based`), powered by simulating that gate (`procedure_model_based`). max_rounds,
+    unless given, is the fewest rounds that give 80% power at the target under the assumed dependence, within
+    what the gate is calibrated for (`model_rounds_cap`); `underpowered` when that cap or a budget leaves less."""
+    R, B = int(d['round_deals']), int(d.get('block') or BLOCK)
+    if R < 2:
+        raise ValueError('the adaptation track needs conversations of at least 2 deals (models remember the session)')
+    target, prior = float(target or TARGET_EDGE), float(prior or PRIOR_SD)
+    icc, ar1 = float(d.get('assumed_icc', ASSUMED_ICC)), float(d.get('assumed_ar1', ASSUMED_AR1))
+    ap = d['alpha'] / n_pairings
+    bound = float(bound or outcome_bound())
+    cap = model_rounds_cap(reps)
+    base = {'round_deals': R, 'block': B, 'replicates': reps, 'alpha_pairing': ap, 'assumed_icc': icc,
+            'assumed_ar1': ar1, 'prior_sd_bb100': prior, 'target_edge_bb100': target,
+            'outside_calibration': d.get('outside_calibration', 'exclude')}
+    power_at = lambda rounds, edge=target, i=icc, a=ar1: procedure_model_based({**base, 'max_rounds': rounds}, edge, i, a)
+    need = next((r for r in range(1, cap + 1) if power_at(r)['counting'] >= POWER), None)
+    if d.get('max_rounds'):
+        rounds, basis = min(cap, int(d['max_rounds'])), d.get('max_rounds_basis') or 'given'
+    else:
+        rounds, basis = need or cap, 'power'
+    if d.get('budget_deals'):
+        most = max(1, int(d['budget_deals']) // (R * reps))
+        if rounds > most:
+            rounds, basis = most, 'budget'
+    power = []
+    for name, i, a in scenarios(icc, ar1):
+        x = power_at(rounds, target, i, a)
+        power.append({'scenario': name, 'assumed_icc': i, 'assumed_ar1': a,
+                      'sd_conversation_bb100': round(sd_conversation(prior, R, i, a), 1),
+                      'power': x['counting'], 'power_decided': x['right'], 'conversations_used': x['conversations']})
+    moderate = power[1]['power']
+    a1, _, _, eligible = _calibrate(ap, rounds, reps)
+    first = next((c for c, e in zip(_look_cs(rounds, reps), eligible) if e), None)
+    deals = R * reps * rounds
+    declined = d.get('registered') is False or d.get('legacy')
+    return {**d, 'track': 'adaptation', 'official': False, 'model_based': True, 'label': ADAPTATION_LABEL,
+            'round_deals': R, 'max_rounds': rounds, 'max_rounds_basis': basis, 'block': B, 'replicates': reps,
+            'n_pairings': n_pairings, 'alpha_pairing': ap,
+            'official_test': {'name': ADAPTATION_TEST, 'assumption_free': False, 'model_based': True,
+                              'bound_bb100': bound},
+            'judge_test': 'model_based', 'assumption_free': False, 'outcome_bound_bb100': bound,
+            'threshold': round(2 / ap, 3), 'bet_cap': BET_CAP, 'equiv_bb100': EQUIV_BB100,
+            'min_conversations': first or MIN_CONVERSATIONS, 'nominal_alpha_model': a1,
+            **({'registered': False} if declined else {}), 'target_edge_bb100': target, 'prior_sd_bb100': prior,
+            'allow_unattested': sorted(d.get('allow_unattested', ALLOW_UNATTESTED)),
+            'allow_opaque': sorted(d.get('allow_opaque', ())),
+            'outside_calibration': d.get('outside_calibration', 'exclude'),
+            'assumed_icc': icc, 'assumed_ar1': ar1, 'sd_conversation_bb100': round(sd_conversation(prior, R, icc, ar1), 1),
+            'conversations_needed': need * reps if need else None, 'deals_needed': need * reps * R if need else None,
+            'deals_planned': deals, 'max_deals': deals, 'power_at_max': moderate, 'power_scenarios': power,
+            'power_by_edge': {str(e): power_at(rounds, float(e))['counting'] for e in POWER_EDGES},
+            'power_basis': ('simulated through the model-based gate (its t arm against the calibrated bar, every '
+                            'look, as the runner stops), under normal conversation means with the assumed '
+                            'dependence: the chance that the better player gets a verdict whose diagnostics pass by '
+                            'the last planned look; the gate\'s error rate itself holds only within its calibrated '
+                            'family of shapes'),
+            'underpowered': moderate < POWER,
+            'calibration': {'test': 'model_based', 'family': list(FAMILY), 'family_share': FAMILY_SHARE,
+                            'cal_sims': CAL_SIMS, 'flips': FLIPS, 'min_conversations': MIN_CONVERSATIONS,
+                            'rounds': rounds, 'replicates': reps, 'nominal_alpha': a1,
+                            'equiv_bb100': EQUIV_BB100}}
 
 
 def unregistered(round_deals, n_pairings, replicates=1, bound=None) -> dict:
@@ -1889,6 +1983,9 @@ def adjudicate(pairing_data: dict, design: dict, n_pairings: int, look: int, eli
         data = {**pairing_data_of(data), **{k: v for k, v in data.items() if k in ('a', 'b')}}
     xs, groups = list(data.get('xs') or []), data.get('groups')
     v = decide(xs, design, n_pairings, look, groups=groups)
+    adaptation = track_of(design) == 'adaptation'
+    if adaptation:
+        v = _adaptation_verdict(v, look)
     elig = eligibility or {}
     reasons = []
     if eligibility is None:
@@ -1930,6 +2027,8 @@ def adjudicate(pairing_data: dict, design: dict, n_pairings: int, look: int, eli
                            + (f' ({"; ".join(x.get("problems")[:2])})' if x.get('problems') else ''))
     reasons = list(dict.fromkeys(reasons))
     a = assumptions(v, data.get('fps'), groups)
+    if adaptation:
+        a = _adaptation_assumptions(a, v.get('gate') or {})
     calibrated = {'supported': True, 'unsupported': False}.get(a['status'])
     eligible = not reasons
     test = v['verdict']
@@ -1939,21 +2038,58 @@ def adjudicate(pairing_data: dict, design: dict, n_pairings: int, look: int, eli
     if eligible and test in DECIDED:
         standing = 'decided' if calibrated else ('decided (checks failed: conversations not shown independent)'
                                                  if calibrated is False else 'decided (checks incomplete)')
+        if adaptation:
+            standing = 'model-based (not official)' if calibrated else (
+                'model-based (not official; diagnostics failed)' if calibrated is False else
+                'model-based (not official; diagnostics incomplete)')
     judge = judge_fingerprint()
     cal = calibration_id(design)
-    official = bool(reg) and not registration_problems(reg, design) and reg.get('judge_fingerprint') == judge \
+    registered = bool(reg) and not registration_problems(reg, design) and reg.get('judge_fingerprint') == judge \
         and reg.get('calibration_id') == cal
+    track = {'track': 'adaptation', 'model_based': True, 'model_based_counts': counts,
+             'registered_record': registered, 'label': ADAPTATION_LABEL} if adaptation else \
+        {'track': 'official', 'registered_record': registered}
     return {**v, 'verdict': test if eligible else 'ineligible', 'test_verdict': test, 'eligible': eligible,
-            'ineligible_reasons': reasons, 'assumptions': a, 'calibrated': calibrated, 'counts_toward_leader': counts,
-            'standing': standing,
+            'ineligible_reasons': reasons, 'assumptions': a, 'calibrated': calibrated,
+            'counts_toward_leader': counts and not adaptation, 'standing': standing, **track,
             'identity_status': {p: (players.get(p) or {}).get('identity') for p in named},
             'audit_status': {p: (players.get(p) or {}).get('audit') for p in named},
             'identity_match': {p: _identity_of(players.get(p)) for p in named},
             'judge_fingerprint': judge, 'judge': judge, 'calibration_id': cal,
-            'registered_judge': (reg or {}).get('judge_fingerprint'), 'official': official,
+            'registered_judge': (reg or {}).get('judge_fingerprint'), 'official': registered and not adaptation,
             'evidence_hash': data.get('evidence_hash'), 'judged_evidence_hash': data.get('evidence_hash'),
             'evidence_version': data.get('evidence_version', EVIDENCE_VERSION), 'evidence_deals': len(xs),
             'linked_audit': linked or None}
+
+
+def _adaptation_verdict(v: dict, look: int) -> dict:
+    """An adaptation-track verdict: the model-based gate's (`v['model_based']`, kept as `gate`), with the
+    assumption-free test's verdict on the same data kept beside it as `assumption_free_verdict`."""
+    gate = v.get('model_based') or {}
+    verdict = gate.get('verdict') or ('open' if look < 1 else 'early')
+    return {**v, 'verdict': verdict, 'assumption_free_verdict': v.get('verdict'), 'gate': gate or None,
+            'model_based': True, 'decided_at_look': gate.get('decided_at_look'),
+            'decided_at_conversation': None, 'min_conversations': gate.get('min_conversations') or v['min_conversations'],
+            'reason': gate.get('reason') or (v.get('reason') if not gate else None),
+            'official_test': {'name': ADAPTATION_TEST, 'assumption_free': False, 'model_based': True,
+                              'bound_bb100': v.get('bound_bb100')},
+            'assumption_free': False, 't': gate.get('t', v.get('t')), 'boundary': gate.get('boundary'),
+            'signflip': gate.get('signflip'), 'ci_decision': gate.get('ci_decision'), 'equiv_ci': gate.get('equiv_ci')}
+
+
+def _adaptation_assumptions(a: dict, gate: dict) -> dict:
+    """What an adaptation verdict rests on: the record checks plus the model-based gate's diagnostic (the
+    conversation share within the calibrated family); 'supported' never means the error rate is guaranteed."""
+    checks = dict(a.get('checks') or {})
+    diag = gate.get('diagnostics') or {}
+    checks['calibrated_family'] = {'status': diag.get('status') or 'unknown', 'value': gate.get('conversation_share'),
+                                   'limit': FAMILY_SHARE,
+                                   'meaning': 'the share of the spread of conversation means that is a conversation '
+                                              'effect, within the family of shapes the model-based bars are '
+                                              'calibrated for'}
+    states = {c['status'] for c in checks.values()}
+    status = 'unsupported' if 'unsupported' in states else 'unknown' if 'unknown' in states else 'supported'
+    return {'status': status, 'summary': MODEL_DIAGNOSTICS[status], 'checks': checks, 'model_based': True}
 
 
 def _identity_of(x: dict | None) -> str | None:
@@ -2226,6 +2362,8 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
             planned_pairs.append((a, b))
     seen = {frozenset((d['a'], d['b'])) for d in raw}
     n_pairings = n_pairings or len(planned_pairs) or max(1, len(seen))
+    track = 'official' if pooled else track_of(design or plan)
+    adaptation = track == 'adaptation'
     reg = None
     if pooled:
         design = None
@@ -2242,6 +2380,7 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
             design = {**design, 'registered': True}
     block = int((design or {}).get('block') or BLOCK)
     registered = not pooled and bool(design and design.get('registered'))
+    official = registered and not adaptation
     info = lambda p: meta.get(p) or {'identity': p, 'kind': 'bot' if p.startswith('bot:') else 'model',
                                      'quarantine_reason': None, 'identity_resolved': True}
     excluded = {p for d in raw for p in (d['a'], d['b']) if pooled and info(p)['quarantine_reason']}
@@ -2291,6 +2430,17 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
         if not (x.get('counts_toward_leader') or (outside and x.get('official') and x.get('eligible')
                                                    and x.get('calibrated') is False)):
             return None
+        return _side(x, p)
+
+    def model_result(p, q):
+        """Like `result`, for the adaptation track's model-based verdicts (never official)."""
+        x = vmap.get(frozenset((p, q)))
+        if not adaptation or not x or x['verdict'] not in DECIDED or not x.get('model_based_counts') \
+                or info(p)['quarantine_reason'] or info(q)['quarantine_reason']:
+            return None
+        return _side(x, p)
+
+    def _side(x, p):
         if x['verdict'] == 'even':
             return 'even'
         return 'win' if (x['verdict'] == 'a') == (x['a'] == p) else 'loss'
@@ -2323,6 +2473,8 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
             if decided[p][0] and ranks.count(decided[p][0]) > 1:     # a cycle of verdicts: no strict order
                 decided[p] = (None,) + decided[p][1:]
         lead = next((p for p in comp if len(comp) > 1 and all(result(p, q) == 'win' for q in comp if q != p)), None)
+        mb_lead = next((p for p in comp if len(comp) > 1 and all(model_result(p, q) == 'win' for q in comp if q != p)),
+                       None)
         outside = None if lead else next((p for p in comp if len(comp) > 1 and all(
             result(p, q, True) == 'win' for q in comp if q != p)), None)
         front = order[0] if len(order) > 1 else None
@@ -2354,8 +2506,10 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
             'pairings': len(mine), 'decided': sum(x['verdict'] in DECIDED for x in mine),
             'has_bot': any(info(p)['kind'] == 'bot' for p in comp),
             'has_reference': any(str(info(p)['identity']).startswith('bot:reference') for p in comp),
-            'kind': 'descriptive' if pooled else 'decided' if lead else 'descriptive',
-            'headline': _headline(lead, front, margin, ci95, mine, pooled, outside)})
+            'kind': 'descriptive' if pooled else 'decided' if lead else 'model-based' if mb_lead else 'descriptive',
+            'model_based_leader': mb_lead, 'track': track,
+            'headline': _headline_adaptation(mb_lead, front, margin, ci95, mine) if adaptation
+            else _headline(lead, front, margin, ci95, mine, pooled, outside)})
         for pos, p in enumerate(order, 1):
             i = idx[p]
             se, sci, df, basis = interval([p], unit((p, 1)))
@@ -2381,7 +2535,7 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
                 'session_elo': round(1500 + K * float(elo[i])),
                 'session_elo_ci95': [round(1500 + K * (elo[i] - q * sd)), round(1500 + K * (elo[i] + q * sd))],
                 'session_elo_basis': elo_basis,
-                'inferential': registered and not info(p)['quarantine_reason'],
+                'inferential': official and not info(p)['quarantine_reason'],
                 'sessions': len(mine_s), 'session_w': won, 'session_t': ties, 'session_l': len(mine_s) - won - ties,
                 'quarantined': bool(info(p)['quarantine_reason']), 'quarantine_reason': info(p)['quarantine_reason'],
                 'unrated_reason': None})
@@ -2432,8 +2586,10 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
         roster.append({'player': p, 'status': status})
 
     notes = list(notes) + _notes(pooled, design, pairings, comps, groups, obs, repeats, excluded, unrated, players, block,
-                                 reg, list(rejected))
+                                 reg, list(rejected), adaptation)
     return {'objective': OBJECTIVE, 'design': design, 'registration': reg, 'pooled': pooled, 'deals': len(raw),
+            'track': track, 'official': not pooled and not adaptation, 'model_based': adaptation,
+            'label': ADAPTATION_LABEL if adaptation else None,
             'hands': 2 * len(raw), 'rejected': list(rejected), 'judge_fingerprint': judge_fingerprint(),
             'fit': {'method': 'least squares on distinct duplicate deals: each distinct deal counts once, so a '
                               'pairing weighs as much as it has deals, and a player\'s strength is against the '
@@ -2448,11 +2604,14 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
                           'descriptive only: this run is not preregistered (no valid registration before play), '
                           'so no result here is a test'
                           if not registered else
+                          'adaptation track: verdicts come from the model-based gate (stated assumptions, not '
+                          'guaranteed), never official, never a rank or a leader; strengths are descriptive'
+                          if adaptation else
                           'decided results come only from the official decisions of the preregistered '
                           'sequential test of each pairing, recorded by the registered judge; strengths, intervals '
                           'and the order by points are descriptive'),
-            'guarantee': None if not registered else GUARANTEE,
-            'assumptions': None if not registered else ASSUMPTIONS,
+            'guarantee': None if not official else GUARANTEE,
+            'assumptions': None if not registered else ADAPTATION_ASSUMPTIONS if adaptation else ASSUMPTIONS,
             'components': comps, 'groups': groups, 'leader': leaders[0] if leaders else None, 'leaders': leaders,
             'players': players, 'pairings': pairings, 'matchups': pairings, 'roster': roster, 'notes': notes}
 
@@ -2474,10 +2633,33 @@ def _headline(lead, front, margin, ci95, pairings, pooled, outside=None) -> str:
     return f'{front} is ahead on points by {margin:+.0f} bb/100 over the next player{iv}; {what}.'
 
 
+def _headline_adaptation(lead, front, margin, ci95, pairings) -> str:
+    if not front:
+        return 'Only one player in this group.'
+    iv = f', 95% {_iv(ci95)}' if ci95 else ''
+    if lead:
+        return (f'{lead} won its pairing against every other player in this group by the model-based gate '
+                f'(adaptation track: not official, so it is no decided leader); {front} is ahead on points by '
+                f'{margin:+.0f} bb/100{iv}.')
+    called = sum(x['verdict'] in DECIDED for x in pairings)
+    return (f'{front} is ahead on points by {margin:+.0f} bb/100 over the next player{iv}; the model-based gate '
+            f'called {called} of {len(pairings)} pairings (adaptation track: not official).')
+
+
 def _notes(pooled, design, pairings, comps, groups, obs, repeats, excluded, unrated, players, block, reg=None,
-           rejected=()) -> list:
+           rejected=(), adaptation=False) -> list:
     notes = []
-    if pooled:
+    if adaptation and design.get('registered'):
+        notes.append(ADAPTATION_ASSUMPTIONS)
+        bad = [x for x in pairings if x['verdict'] == 'ineligible']
+        if bad:
+            notes.append('Ineligible for a verdict: ' + '; '.join(
+                f'{x["a"]} vs {x["b"]} ({"; ".join(x.get("ineligible_reasons") or [])})' for x in bad) + '.')
+        wide = [x for x in pairings if x.get('calibrated') is False]
+        if wide:
+            notes.append('Diagnostics failed (outside the calibrated family of shapes): '
+                         + ', '.join(f'{x["a"]} vs {x["b"]}' for x in wide) + '.')
+    elif pooled:
         notes.append('All-time standings pool runs with different designs and stopping times, so they are '
                      'descriptive only: no verdict, rank or leader here is a test result. Only identical '
                      'protocols and implementations pool (model, reasoning level, the settings that change play, '
@@ -2632,7 +2814,8 @@ _DECISION_KEYS = ('verdict', 'test_verdict', 't', 'boundary', 'signflip', 'decid
                   'looks_used', 'looks_planned', 'edge', 'ci95', 'se', 'df', 'basis', 'deals', 'conversations',
                   'blocks', 'reason', 'sd_per_deal', 'power', 'alpha_pairing', 'official_test', 'assumption_free',
                   'bound_bb100', 'out_of_bound', 'capital', 'cs', 'cs_level', 'decided_at_conversation', 'model_based',
-                  'evidence_version', 'linked_audit')
+                  'evidence_version', 'linked_audit', 'gate', 'track', 'model_based_counts', 'assumption_free_verdict',
+                  'label')
 EARLIER_JUDGE = {'name': 'conversation-level t and sign-flip gate (an earlier judge: model-based, its error rate '
                          'not guaranteed beyond a calibrated family of shapes)', 'assumption_free': False}
 
@@ -2640,7 +2823,9 @@ EARLIER_JUDGE = {'name': 'conversation-level t and sign-flip gate (an earlier ju
 def _official(rec: dict | None, reg: dict | None) -> bool:
     """Whether a recorded look is an official decision: written by the adjudicator, by the registered judge,
     with the registered calibration."""
-    if not rec or not reg or not reg.get('registered') or 'eligible' not in rec or rec.get('official') is False:
+    if not rec or not reg or not reg.get('registered') or 'eligible' not in rec:
+        return False
+    if rec.get('official') is False and not (rec.get('track') == 'adaptation' and rec.get('registered_record')):
         return False
     judge = rec.get('judge_fingerprint') or rec.get('judge')
     return judge == reg.get('judge_fingerprint') and rec.get('calibration_id') == reg.get('calibration_id')
@@ -2790,17 +2975,21 @@ def _pairings(raw, obs, design, n_pairings, pooled, recorded, eligibility=None, 
                 now = evidence_now(last, today, data, eligibility.get(key), design)
                 earlier = {} if 'official_test' in last else {'official_test': EARLIER_JUDGE, 'assumption_free': False,
                                                               'cs': None, 'capital': None, 'model_based': None}
-                v = {**today, **earlier, **{k: last[k] for k in _DECISION_KEYS if k in last}, 'official': True,
-                     'retrospective': False, 'judge': last.get('judge_fingerprint') or last.get('judge'),
+                adapt = track_of(design) == 'adaptation'
+                v = {**today, **earlier, **{k: last[k] for k in _DECISION_KEYS if k in last}, 'official': not adapt,
+                     'recorded': True, 'retrospective': False, 'judge': last.get('judge_fingerprint') or last.get('judge'),
                      'recorded_counts': bool(last.get('counts_toward_leader')),
-                     'counts_toward_leader': bool(last.get('counts_toward_leader')) and now['status'] == 'verified',
+                     'counts_toward_leader': bool(last.get('counts_toward_leader')) and now['status'] == 'verified'
+                     and not adapt,
+                     **({'model_based_counts': bool(last.get('model_based_counts')) and now['status'] == 'verified'}
+                        if adapt else {}),
                      'evidence_now': now, 'integrity_now': now['status'] == 'verified',
                      'recomputed': {'verdict': today['verdict'], 'judge': today['judge'],
                                     'counts_toward_leader': today['counts_toward_leader'],
                                     'agrees': today['verdict'] == last.get('verdict')}}
             else:
                 v = {**today, 'official': False, 'retrospective': looks >= 1, 'counts_toward_leader': False,
-                     'recomputed': None}
+                     'recomputed': None, **({'model_based_counts': False} if 'model_based_counts' in today else {})}
                 if today['verdict'] in DECIDED:
                     v.update(verdict='retrospective',
                              reason='no decision by the registered judge was recorded at this look; this is today\'s '
@@ -2942,6 +3131,15 @@ def fundamentals(root, players: dict | None = None) -> dict | None:
             'versions': sorted([v for v in versions if v[0]], key=str), 'players': out}
 
 
+def track_runs(root) -> dict:
+    """{track: folder} of a tournament folder that holds one run per track (<root>/official, <root>/adaptation);
+    empty for a run folder itself. The tracks are judged apart, never pooled."""
+    root = Path(root)
+    if (root / 'plan.json').exists():
+        return {}
+    return {t: root / t for t in TRACKS if (root / t / 'plan.json').exists()}
+
+
 def ratings(root, boot=BOOT, seed=0, session=SESSION) -> dict:
     """The leaderboard of every match under root, with each player's style stats and audit summary."""
     from .stats import collect
@@ -2973,7 +3171,7 @@ def ratings(root, boot=BOOT, seed=0, session=SESSION) -> dict:
     audit = {p: {**(s.get('audit') or {}), 'identity': s.get('identity'), 'fallbacks': s.get('fallbacks'),
                  'retries': s.get('retries'), 'served_models': s.get('served_models')} for p, s in stats.items()}
     return {**r, 'stats': stats, 'stat_labels': LABELS, 'position_labels': POSITIONS, 'audit': audit,
-            'reference': REFERENCE,
+            'reference': REFERENCE, 'tournament': (plan or {}).get('tournament'),
             'populations': {'verdicts and strengths': 'verified results: duplicate deals both plays committed, '
                                                      'validated as pairs and replayed from their seeds',
                             'stats': 'the same verified results (stats.population per player)'},
@@ -3050,6 +3248,8 @@ def design_line(d) -> str:
         return (f'No preregistered design: nothing in this run is a test. Retrospective sample size only: the official '
                 f'test would need about {x["deals_needed"]:,} deals per pairing ({x["conversations_needed"]:,} '
                 f'conversations of {d["round_deals"]} deals) for 80% power at {x["target_edge_bb100"]:.0f} bb/100.')
+    if d.get('track') == 'adaptation':
+        return _design_line_adaptation(d)
     sc = {x['scenario']: x for x in d.get('power_scenarios') or []}
     per = f'{d["replicates"]} conversation{"s" if d["replicates"] != 1 else ""} of {d["round_deals"]} deal' \
           + ('s' if d['round_deals'] != 1 else '')
@@ -3078,6 +3278,25 @@ def design_line(d) -> str:
     return head
 
 
+def _design_line_adaptation(d) -> str:
+    sc = {x['scenario']: x for x in d.get('power_scenarios') or []}
+    head = (f'Adaptation track ({ADAPTATION_LABEL}): up to {d["max_rounds"]} rounds of {d["replicates"]} '
+            f'conversation{"s" if d["replicates"] != 1 else ""} of {d["round_deals"]} deals ({d["max_deals"]:,} deals per '
+            f'pairing), models remembering the whole conversation; verdicts and stopping by the model-based gate, a '
+            f'verdict possible from {d["min_conversations"]} conversations on.')
+    if sc:
+        m = sc['moderate']
+        head += (f' Chance of a model-based verdict for the better player at {d["target_edge_bb100"]:.0f} bb/100 '
+                 f'(simulated, normal conversation means): {_pct(m["power"])} with the assumed dependence, '
+                 f'{_pct(sc["optimistic"]["power"])} with none, {_pct(sc["pessimistic"]["power"])} if it is worse. Its '
+                 f'error rate holds only within its calibrated family of shapes.')
+    if d.get('underpowered'):
+        why = f'a budget of {d["budget_deals"]:,} deals' if d.get('max_rounds_basis') == 'budget' else \
+            'the most rounds the gate is calibrated for' if d.get('max_rounds_basis') == 'power' else 'its max_rounds'
+        head += f' Underpowered: capped by {why}.'
+    return head
+
+
 LEADER_SCENARIO = {'one best': 'it is {e:.0f} bb/100 better than each other player and they are equal',
                    'one best by twice the target': 'it is {e:.0f} bb/100 better than each other player',
                    'ladder': 'the players are evenly spaced {e:.0f} bb/100 apart'}
@@ -3099,8 +3318,14 @@ def verdicts(r, labels=None) -> str:
              'descriptive': 7}
     d = r.get('design')
     reg = r.get('registration') or {}
+    adaptation = r.get('track') == 'adaptation'
     if r.get('pooled'):
         lines = ['Pairings (descriptive: pooled across runs, nothing here is a test):']
+    elif adaptation and d and d.get('registered', True):
+        lines = [f'Adaptation track ({ADAPTATION_LABEL}): models keep one conversation for {d["round_deals"]} deals and '
+                 f'can adapt to the opponent. Verdicts come from the model-based gate, under its own registered '
+                 f'design (judge {reg.get("judge_fingerprint") or "?"}); its error rate holds only within the family of '
+                 f'shapes its bars are calibrated for, so none of it is official or decides a rank or leader:']
     elif d and not d.get('registered', True):
         why = '; '.join(reg.get('reasons') or []) or 'no preregistered design'
         lines = [f'Pairings (descriptive: this run is not preregistered ({why}); nothing here is a test):']
@@ -3120,18 +3345,26 @@ def verdicts(r, labels=None) -> str:
             + ('s' if m['conversations'] != 1 else '')
         if m.get('ci95'):
             head += f' (95% {_iv(m["ci95"])}, descriptive)'
-        if m.get('cs') and m['verdict'] != 'descriptive':
+        if adaptation and m.get('t') is not None and m['verdict'] != 'descriptive':
+            head += f'; model-based t = {m["t"]}' + (f' against its bar {m["boundary"]:.2f}' if m.get('boundary') else '')
+        elif m.get('cs') and m['verdict'] != 'descriptive':
             head += f'; anytime-valid {1 - m["alpha_pairing"]:.1%} interval {_iv(m["cs"])}'
         if m['verdict'] != 'descriptive' and m.get('looks_used') is not None:
             head += ', no planned look yet' if m['looks_used'] < 1 else f', look {m["looks_used"]} of {m["looks_planned"]}'
-            cap = _capital(m)
+            cap = '' if adaptation else _capital(m)
             head += f', {cap}' if cap else ''
             if m.get('decided_at_look') and m['decided_at_look'] != m['looks_used']:
                 head += f', decided at look {m["decided_at_look"]}'
         state = VERDICT_TEXT[m['verdict']].format(a=a, b=b, e=r.get('equiv_bb100', EQUIV_BB100))
-        if m['verdict'] in DECIDED and m.get('standing') and m['standing'] != 'decided':
+        if m['verdict'] in DECIDED and m.get('standing') and m['standing'].startswith('decided ('):
             state += m['standing'][len('decided'):]
-        if m.get('official'):
+        elif adaptation and m['verdict'] in DECIDED and m.get('calibrated') is not True:
+            state += ' (diagnostics ' + ('failed' if m.get('calibrated') is False else 'incomplete') + ')'
+        if adaptation and m['verdict'] in DECIDED:
+            state = state.replace(' (decided)', ' (model-based, not official)')
+        if adaptation and m.get('recorded'):
+            state += f'; recorded by judge {m.get("judge")}'
+        elif m.get('official'):
             state += f'; official (recorded by judge {m.get("judge")})'
             if (m.get('official_test') or {}).get('assumption_free') is False:
                 state += ', made by an earlier model-based test'
@@ -3146,7 +3379,7 @@ def verdicts(r, labels=None) -> str:
         if m['verdict'] not in ('descriptive',) and st and st != 'supported':
             lines.append(f'      {DIAGNOSTICS[st]}')
         mb = m.get('model_based')
-        if mb and mb.get('verdict') and m['verdict'] != 'descriptive':
+        if isinstance(mb, dict) and mb.get('verdict') and m['verdict'] != 'descriptive':
             lines.append(f'      model-based (secondary, never official; assumes a family of shapes): '
                          f'{VERDICT_TEXT.get(mb["verdict"], mb["verdict"]).format(a=a, b=b, e=r.get("equiv_bb100", EQUIV_BB100))}'
                          + (f', t = {mb["t"]} vs bar {mb["boundary"]:.2f}' if mb.get('boundary') else ''))
@@ -3163,12 +3396,16 @@ def verdicts(r, labels=None) -> str:
         if m.get('deals_since_look'):
             lines.append(f'      {m["deals_since_look"]} more deals are in a round under way, not yet looked at.')
         need = (m.get('power') or {}).get('deals_for_80pct') or {}
-        if m['verdict'] in ('open', 'exhausted') and need.get('50') and m['conversations'] >= 2:
+        if m['verdict'] in ('open', 'exhausted') and need.get('50') and m['conversations'] >= 2 and not adaptation:
             lines.append('      deals per pairing for an 80% chance that the official test decides a real edge of '
                          + ', '.join(f'{e} bb/100: about {need[e]:,}' for e in need if need[e]) + ' (approximate, from '
                          'the observed spread of its conversations and their length; a planning number, not a forecast)')
     lead = [x for x in r.get('leaders') or [] if x]
-    if not r.get('pooled') and (d or {}).get('registered', True):
+    if adaptation:
+        mb = [g['model_based_leader'] for g in r.get('groups') or [] if g.get('model_based_leader')]
+        lines.append('Won every pairing by the model-based gate (not official, not a decided leader): '
+                     + (', '.join(name(p) for p in mb) if mb else 'none') + '.')
+    elif not r.get('pooled') and (d or {}).get('registered', True):
         lines.append('Decided leader: ' + ('; '.join(f'{name(x["player"])} (won its pairing against every other '
                                                     f'player of its group: official verdicts, evidence verified today, '
                                                     f'checks passed)' for x in lead) if lead else 'none.'))

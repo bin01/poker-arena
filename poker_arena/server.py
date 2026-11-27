@@ -298,8 +298,12 @@ def runs(root: Path):
         if live and len(recent) >= 4:
             rate = (len(recent) - 1) / max(1.0, recent[-1] - recent[0])
         life = lifecycle(root, run, ms)
-        has_quiz = ((root if run == '.' else root / run) / 'quiz.json').exists()
-        out.append({'run': run, 'quiz': has_quiz, 'title': root.name if run == '.' else run.split('/')[-1], 'matchups': len(ms), 'matchups_started': sum(m['started'] for m in ms),
+        base = root if run == '.' else root / run
+        has_quiz = (base / 'quiz.json').exists()
+        track, tournament = track_info(root, run)
+        title = tournament or (root.name if run == '.' else run.split('/')[-1])
+        out.append({'run': run, 'quiz': has_quiz, 'title': title, 'track': track, 'tournament': tournament,
+                    'matchups': len(ms), 'matchups_started': sum(m['started'] for m in ms),
                     'matchups_finished': sum(m['finished'] for m in ms),
                     'players': sorted({m['a'] for m in ms} | {m['b'] for m in ms}),
                     'hands': done, 'hands_planned': planned, 'live': live,
@@ -314,6 +318,19 @@ def runs(root: Path):
     if out and (len(out) > 1 or _history_runs(root) - {r['run'] for r in out}):
         out.insert(0, _all_runs(out))
     return out
+
+
+def track_info(root: Path, run: str) -> tuple:
+    """(track, tournament) of a run: from its plan.json; a run folder named official or adaptation inside a
+    tournament folder belongs to that tournament. (None, None) for a run outside any tournament."""
+    plan = _json((root if run == '.' else root / run) / 'plan.json') or {}
+    track = plan.get('track') or (plan.get('design') or {}).get('track')
+    tail = run.split('/')
+    if not track and len(tail) > 1 and tail[-1] in ('official', 'adaptation'):
+        track = tail[-1]
+    if not track:
+        return None, None
+    return track, plan.get('tournament') or (tail[-2] if len(tail) > 1 and tail[-1] == track else run.split('/')[-1])
 
 
 def _history_runs(root: Path) -> set:

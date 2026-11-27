@@ -121,7 +121,7 @@
   // own groups, they are rebuilt from the components and the pairings' verdicts.
   function decidedLeader(members, pairings) {
     if (members.length < 2) return null;
-    return members.find(p => members.every(q => q === p || pairings.some(x =>
+    return members.find(p => members.every(q => q === p || pairings.some(x => x.track !== 'adaptation' &&
       ((x.a === p && x.b === q && x.verdict === 'a') || (x.a === q && x.b === p && x.verdict === 'b'))))) || null;
   }
 
@@ -216,6 +216,7 @@
   // Where a verdict comes from: {kind: 'official'|'retrospective'|'recorded', text} or null.
   function sourceOf(p, name = x => x) {
     if (!p) return null;
+    if (p.track === 'adaptation' && p.recorded) return { kind: 'recorded', short: 'model-based · not official', text: `recorded when play stopped${p.judge ? ` by judge ${String(p.judge).slice(0, 8)}` : ''}, by the adaptation track's model-based test: never official` };
     if (p.retrospective) return { kind: 'retrospective', short: 'retrospective', text: 'retrospective: recomputed by today\'s judge, not the one the run registered' };
     if (p.official) return { kind: 'official', short: 'official', text: `official: recorded when play stopped${p.judge ? ` by judge ${String(p.judge).slice(0, 8)}` : ''}` };
     if (p.recorded_verdict != null && p.recorded_verdict !== p.verdict && DECIDED.concat(['exhausted', 'ineligible']).includes(p.recorded_verdict)) {
@@ -297,6 +298,13 @@
       : as.status === 'supported' ? ' Its error rate holds under the test\'s assumptions: the diagnostics passed, but the distribution assumptions remain unverified.'
       : ' Its error rate holds only under the test\'s assumptions, which are not checked here.';
     const qualifier = as.status === 'unsupported' ? ASSUME.unsupported : '';
+    if (p.track === 'adaptation' && DECIDED.includes(p.verdict)) {
+      const what = p.verdict === 'even' ? `within ±${band} bb/100 of each other` : `${name(sides.winner)} beats ${name(sides.loser)}`;
+      const diag = as.status === 'unsupported' ? ' Its diagnostics failed: the results look outside the family of shapes it was calibrated for.'
+        : as.status === 'supported' ? ' Its diagnostics passed, but its error rate still rests on those assumptions.' : '';
+      return { tone: 'model', decided: false, model: true, qualifier, short: p.verdict === 'even' ? 'Even · model-based' : `${name(sides.winner)} wins · model-based`,
+        long: `Model-based verdict${looks}, not official: ${what}. On the adaptation track a model-based test (a t and sign-flip test calibrated for a family of result shapes) judges and stops play; it never decides the official standings, ranks or leaders.${diag}` };
+    }
     switch (p.verdict) {
       case 'a': case 'b':
         return { tone: 'won', decided: true, qualifier, secondary, short: `${name(sides.winner)} wins`, long: `Decided${looks}: ${name(sides.winner)} beats ${name(sides.loser)}; the edge cleared the sequential test's bar.${out}` };

@@ -39,6 +39,9 @@ Tables:
               and fingerprint (ratings.fingerprint)
     tallies   per match and player, the raw style counts of its verified results that stats.summarize turns into rates
     rejected  duplicate pairs (or single deals of them) that failed validation, with the reason
+    runs      each run's track ('official', or 'adaptation': long conversations, model-based) and tournament
+
+Tracks never pool: all-time standings are built from one track's runs at a time (official by default).
 """
 from __future__ import annotations
 import hashlib
@@ -71,6 +74,7 @@ CREATE TABLE IF NOT EXISTS tallies (
     match_id TEXT, pid TEXT, identity TEXT, counts TEXT, served TEXT, PRIMARY KEY (match_id, pid));
 CREATE TABLE IF NOT EXISTS rejected (
     run TEXT, matchup TEXT, deal INTEGER, reason TEXT, PRIMARY KEY (run, matchup, deal));
+CREATE TABLE IF NOT EXISTS runs (run TEXT PRIMARY KEY, track TEXT, tournament TEXT);
 """
 
 
@@ -236,7 +240,15 @@ def sync(root, db=None) -> dict:
     root = Path(root).resolve()
     con = connect(db or root / DB_NAME)
     changed = {'matches': 0, 'deals': 0}
+    from .ratings import track_of
     with con:
+        for plan_path in sorted(root.rglob('plan.json')):
+            plan = _plan(plan_path)
+            if plan is None:
+                continue
+            rel = plan_path.parent.relative_to(root)
+            con.execute('INSERT OR REPLACE INTO runs VALUES (?,?,?)',
+                        (str(rel) if str(rel) != '.' else '.', track_of(plan), plan.get('tournament')))
         for cfg_path in sorted(root.rglob('config.json')):
             d = cfg_path.parent
             if d.name not in ('a-first', 'b-first'):
@@ -284,6 +296,14 @@ def sync(root, db=None) -> dict:
             changed['deals'] += _sync_deals(con, mdir, run, gk)
     con.close()
     return changed
+
+
+def _plan(p: Path) -> dict | None:
+    try:
+        x = json.loads(_read(p) or 'null')
+    except ValueError:
+        return None
+    return x if isinstance(x, dict) else None
 
 
 def _state(d: Path) -> dict:
@@ -383,21 +403,27 @@ def _canon(ident: str, eq: dict) -> str:
     return re.sub(r'@([0-9a-f]{8})', lambda m: '@' + eq.get(m.group(1), m.group(1)), ident)
 
 
-def all_time(db, boot=200, players_file='players.toml', seed=0, equivalences=None) -> dict:
-    """The leaderboard over every run in the database, one player per model, reasoning level, protocol and
-    implementation (`equivalences`: {tag: tag it pools under}, by default from equivalences.json beside the
-    database). Descriptive only: no verdict, rank or leader here is a test result."""
+def all_time(db, boot=200, players_file='players.toml', seed=0, equivalences=None, track='official') -> dict:
+    """The leaderboard over every run of one track in the database (official by default; the tracks never pool),
+    one player per model, reasoning level, protocol and implementation (`equivalences`: {tag: tag it pools
+    under}, by default from equivalences.json beside the database). Descriptive only: no verdict, rank or leader
+    here is a test result."""
     from .ratings import quarantine_reason, identity_resolved, rate, served_mismatch
     eq = load_equivalences(Path(db).parent / 'equivalences.json') if equivalences is None else dict(equivalences)
     con = connect(db)
-    rows = con.execute('SELECT run, matchup, deal, a_identity, b_identity, net_a, bb, game_key, fp, seed FROM deals').fetchall()
-    matches = con.execute('SELECT run, game_key, code_version, started, hands_done, finished, identities '
-                          'FROM matches').fetchall()
-    people = con.execute('SELECT run, pid, identity, label, kind, spec FROM players').fetchall()
-    tallies = con.execute('SELECT m.run, t.identity, t.counts, t.served, m.game_key, m.identities, m.players FROM tallies t '
-                          'JOIN matches m ON m.id = t.match_id').fetchall()
+    tracks = dict(con.execute('SELECT run, track FROM runs').fetchall())
+    mine = lambda run: (tracks.get(run) or 'official') == track
+    rows = [r for r in con.execute('SELECT run, matchup, deal, a_identity, b_identity, net_a, bb, game_key, fp, seed '
+                                   'FROM deals').fetchall() if mine(r[0])]
+    matches = [m for m in con.execute('SELECT run, game_key, code_version, started, hands_done, finished, identities '
+                                      'FROM matches').fetchall() if mine(m[0])]
+    people = [x for x in con.execute('SELECT run, pid, identity, label, kind, spec FROM players').fetchall() if mine(x[0])]
+    tallies = [t for t in con.execute('SELECT m.run, t.identity, t.counts, t.served, m.game_key, m.identities, m.players '
+                                      'FROM tallies t JOIN matches m ON m.id = t.match_id').fetchall() if mine(t[0])]
     rejected = [{'run': run, 'matchup': mu, 'hand': None if k < 0 else k, 'reason': why}
-                for run, mu, k, why in con.execute('SELECT run, matchup, deal, reason FROM rejected ORDER BY run, matchup, deal')]
+                for run, mu, k, why in con.execute('SELECT run, matchup, deal, reason FROM rejected ORDER BY run, matchup, deal')
+                if mine(run)]
+    others = sorted({r for r, t in tracks.items() if (t or 'official') != track})
     con.close()
     rows = [(run, mu, k, _canon(a, eq), _canon(b, eq), *rest) for run, mu, k, a, b, *rest in rows]
     matches = [(*m[:6], json.dumps([_canon(i, eq) for i in json.loads(m[6] or '[]')])) for m in matches]
@@ -483,6 +509,11 @@ def all_time(db, boot=200, players_file='players.toml', seed=0, equivalences=Non
     if rejected:
         notes.append(f'{len(rejected)} duplicate pair{"s" if len(rejected) != 1 else ""} failed validation (b-first is '
                      f'not a-first with the seats swapped on the same deals) and were left out.')
+    if others:
+        notes.insert(0, f'Only {track}-track runs are pooled here; the tracks are never pooled ('
+                        + ('the adaptation track\'s long conversations are judged apart, model-based and not official'
+                           if track == 'official' else 'the official track is judged apart') + f'): {len(others)} '
+                        f'other run{"s" if len(others) != 1 else ""} left out.')
     r = rate(deals, boot=boot, seed=seed, meta=meta, pooled=True, notes=notes, playing=playing, rejected=rejected)
 
     stats, servedp = defaultdict(dict), defaultdict(set)
@@ -507,7 +538,7 @@ def all_time(db, boot=200, players_file='players.toml', seed=0, equivalences=Non
         r['notes'].insert(0, f'From before code versions were recorded: {", ".join(unversioned)}.')
     from .stats import LABELS, POSITIONS
     r.update({
-        'all_time': True, 'labels': labels, 'kinds': kinds, 'stat_labels': LABELS, 'position_labels': POSITIONS,
+        'all_time': True, 'track': track, 'other_track_runs': others, 'labels': labels, 'kinds': kinds, 'stat_labels': LABELS, 'position_labels': POSITIONS,
         'equivalences': eq,
         'ids': {i: sorted(p) for i, p in pids.items()},
         'game': json.loads(main) if main else None,

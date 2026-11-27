@@ -45,57 +45,103 @@ def _power_table(d, lengths=False) -> str:
     return '\n'.join(out)
 
 
+def _cost(plan: dict, d: dict) -> str:
+    n = len(plan['matchups'])
+    R, reps, rounds = d['round_deals'], d['replicates'], d['max_rounds']
+    per_round = 2 * n * R * reps
+    used = next((x['conversations_used'] for x in d.get('power_scenarios') or [] if x['scenario'] == 'moderate'), None)
+    line = (f'{n} pairings x {reps} conversation{"s" if reps != 1 else ""} of {R} deal{"s" if R != 1 else ""} a round: '
+            f'{per_round:,} hands a round, at most {rounds} rounds = {per_round * rounds:,} hands '
+            f'({n * reps * rounds:,} fresh conversations of two matches)')
+    if used:
+        line += (f'; if the better player of each pairing is {d["target_edge_bb100"]:.0f} bb/100 ahead, about '
+                 f'{round(2 * n * R * min(used, reps * rounds)):,} hands before the pairings stop')
+    return line
+
+
+def _track_text(track: str, plan: dict, d: dict, args) -> list[str]:
+    from .ratings import design_line
+    out = []
+    if track == 'adaptation':
+        out.append(f'ADAPTATION track -> {plan["out"]} (models remember the session; model-based, not official): '
+                   + _cost(plan, d) + '.')
+        out.append(design_line(d))
+        out += [f'  {x["scenario"]:12} ICC {x["assumed_icc"]:<5} AR(1) {x["assumed_ar1"]:<4} model-based verdict for the '
+                f'better player {_pct_(x["power"])}, after about {x["conversations_used"]:,.0f} conversations'
+                for x in d.get('power_scenarios') or []]
+        if d.get('power_by_edge'):
+            out.append('  assumed dependence, by edge: ' + ', '.join(f'{e} bb/100 {_pct_(p)}' for e, p in d['power_by_edge'].items()))
+        out.append('  Its verdicts never decide the official leaderboard, ranks or leaders.')
+        return out
+    out.append(f'OFFICIAL track -> {plan["out"]} (fresh conversations; assumption-free verdicts, the only ones that '
+               f'rank): ' + _cost(plan, d) + f'. At most {d["alpha"]:.0%} chance of any false verdict over all pairings, '
+               f'for any distribution of results, given independent conversations (fresh memories): a betting '
+               f'confidence sequence on conversation means bounded by the stacks (+-{d["outcome_bound_bb100"]:,.0f} '
+               f'bb/100), valid at every look (docs/methodology.md).')
+    out.append(design_line(d))
+    out.append(_power_table(d, lengths=True))
+    if d['underpowered']:
+        if d.get('deals_needed'):
+            out.append(f'To reach 80% with the assumed dependence, allow about {d["deals_needed"]:,} deals per '
+                       f'pairing: drop --max-rounds/--budget-deals, or --max-rounds '
+                       f'{-(-d["deals_needed"] // (d["round_deals"] * d["replicates"]))} with --replicates {d["replicates"]}.')
+        else:
+            out.append('80% at this target is out of reach of this plan\'s shape: shorten --deals (fewer deals per '
+                       'conversation), raise --replicates or --target-edge, or play shallower stacks (--stack).')
+    return out
+
+
+def _pct_(x):
+    from .ratings import _pct
+    return _pct(x)
+
+
 def cmd_plan(args):
-    from .ratings import design_line, normalize_design
-    design = {k: v for k, v in (('alpha', args.alpha), ('max_rounds', args.max_rounds), ('block', args.block),
-                                ('target_edge_bb100', args.target_edge), ('prior_sd_bb100', args.prior_sd),
-                                ('assumed_icc', args.assumed_icc), ('assumed_ar1', args.assumed_ar1),
-                                ('budget_deals', args.budget_deals)) if v is not None}
-    plan = make_plan(args.players_list, deals=args.deals, seed=args.seed, out=args.out, players_file=args.players,
-                     concurrency=args.concurrency, design=design, replicates=args.replicates,
-                     game_config={'stack': args.stack} if args.stack else None)
-    if args.max_rounds is None:
-        plan['design'].pop('max_rounds', None)          # from the power target, not a fixed default
-    d = normalize_design(plan)
-    plan['design'].update(max_rounds=d['max_rounds'], max_rounds_basis=d['max_rounds_basis'])   # preregistered
-    text = json.dumps(plan, indent=2)
-    if args.write:
-        Path(args.write).write_text(text + '\n')
-        n = len(plan['matchups'])
-        per_round = 2 * n * args.deals * d['replicates']
-        print(f'wrote {args.write}: {n} pairings, {per_round:,} hands per round, at most {d["max_rounds"]} rounds '
-              f'({per_round * d["max_rounds"]:,} hands); a pairing stops once decided or ineligible. At most '
-              f'{d["alpha"]:.0%} chance of any false verdict over all pairings, for any distribution of results, given '
-              f'independent conversations (fresh memories): the official test is a betting confidence sequence on '
-              f'conversation means bounded by the stacks (+-{d["outcome_bound_bb100"]:,.0f} bb/100), valid at every '
-              f'look (docs/methodology.md).')
-        print(f'The design is registered in {plan["out"]}/plan.json when the tournament starts, before its first '
-              f'hand; only then are its verdicts official. Change the plan after that and nothing in the run is a test.')
-        print(design_line(d))
-        print(_power_table(d, lengths=True))
-        if d['underpowered']:
-            if d.get('deals_needed'):
-                print(f'To reach 80% with the assumed dependence, allow about {d["deals_needed"]:,} deals per '
-                      f'pairing: drop --max-rounds/--budget-deals, or --max-rounds '
-                      f'{-(-d["deals_needed"] // (args.deals * d["replicates"]))} with --replicates {d["replicates"]}.')
-            else:
-                print('80% at this target is out of reach of this plan\'s shape: shorten --deals (fewer deals per '
-                      'conversation), raise --replicates or --target-edge, or play shallower stacks (--stack).')
-        try:
-            specs = load_players(args.players)
-        except (OSError, ValueError):
-            specs = {}
-        if not any(specs.get(p, {}).get('bot') == 'reference' for p in args.players_list):
-            print('No reference player in the plan: add the fixed reference bot (bot = "reference" in players.toml) so '
-                  'every model also plays one common, versioned opponent; without it strengths only compare the '
-                  'models with each other. `python -m poker_arena quiz` measures poker fundamentals separately.')
-    else:
-        print(text)
-
-
-def cmd_tournament(args):
     from .ratings import normalize_design
-    plan = json.loads(Path(args.plan).read_text())
+    from .runner import make_tournament
+    shared = {k: v for k, v in (('alpha', args.alpha), ('block', args.block), ('target_edge_bb100', args.target_edge),
+                                ('prior_sd_bb100', args.prior_sd), ('assumed_icc', args.assumed_icc),
+                                ('assumed_ar1', args.assumed_ar1)) if v is not None}
+    per = {'official': {'max_rounds': args.max_rounds, 'budget_deals': args.budget_deals},
+           'adaptation': {'max_rounds': args.adaptation_max_rounds, 'budget_deals': args.adaptation_budget_deals}}
+    tracks = [t.strip() for t in args.tracks.split(',') if t.strip()]
+    doc = make_tournament(args.players_list, out=args.out, tracks=tracks, seed=args.seed, players_file=args.players,
+                          concurrency=args.concurrency, game_config={'stack': args.stack} if args.stack else None,
+                          official={'deals': args.deals, 'replicates': args.replicates,
+                                    'design': {**shared, **{k: v for k, v in per['official'].items() if v is not None}}},
+                          adaptation={'deals': args.adaptation_deals, 'replicates': args.adaptation_replicates,
+                                      'design': {**shared, **{k: v for k, v in per['adaptation'].items() if v is not None}}})
+    designs = {}
+    for track, plan in doc['tracks'].items():
+        if per[track]['max_rounds'] is None:
+            plan['design'].pop('max_rounds', None)      # from the power target, not a fixed default
+        d = designs[track] = normalize_design(plan)
+        plan['design'].update(max_rounds=d['max_rounds'], max_rounds_basis=d['max_rounds_basis'])   # preregistered
+    text = json.dumps(doc, indent=2)
+    if not args.write:
+        print(text)
+        return
+    Path(args.write).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.write).write_text(text + '\n')
+    print(f'wrote {args.write}: tournament {doc["tournament"]}, {len(doc["tracks"])} track'
+          f'{"s" if len(doc["tracks"]) != 1 else ""} ({", ".join(doc["tracks"])}); every pairing stops once decided or '
+          f'ineligible. Each track is registered in its own plan.json when it starts, before its first hand; change '
+          f'the plan after that and nothing in that track is a test.')
+    for track, plan in doc['tracks'].items():
+        print()
+        print('\n'.join(_track_text(track, plan, designs[track], args)))
+    try:
+        specs = load_players(args.players)
+    except (OSError, ValueError):
+        specs = {}
+    if not any(specs.get(p, {}).get('bot') == 'reference' for p in args.players_list):
+        print('\nNo reference player in the plan: add the fixed reference bot (bot = "reference" in players.toml) so '
+              'every model also plays one common, versioned opponent; without it strengths only compare the '
+              'models with each other. `python -m poker_arena quiz` measures poker fundamentals separately.')
+
+
+def _prepare(plan: dict, args) -> dict:
+    plan = dict(plan)
     if args.effort:
         plan['effort'] = args.effort
     if args.until_decided:
@@ -103,36 +149,72 @@ def cmd_tournament(args):
         reps = int(plan.get('replicates') or design.get('replicates') or 1)
         design.update(max_rounds=max(1, args.until_decided // (plan['deals'] * reps)), max_rounds_basis='given')
         plan['design'] = design
-    if args.dry_run:
-        d = normalize_design(plan)
-        reps = d['replicates'] if d else plan.get('replicates', 1)
-        for a, b in plan['matchups']:
-            more = (f', in rounds; stops once decided, at most {d["max_rounds"]} rounds '
-                    f'({d["max_deals"]} deals)') if d else ''
-            print(f'{a} vs {b}: {reps} x 2 x {plan["deals"]} hands per round -> {plan["out"]}/{a}__vs__{b}{more}')
-        if d:
-            from .ratings import design_line
-            print(design_line(d))
+    return plan
+
+
+def _dry_run(track: str, plan: dict):
+    from .ratings import design_line, normalize_design
+    d = normalize_design(plan)
+    reps = d['replicates'] if d else plan.get('replicates', 1)
+    print(f'{track} track:' + (' (model-based, not official)' if track == 'adaptation' else ''))
+    for a, b in plan['matchups']:
+        more = (f', in rounds; stops once decided, at most {d["max_rounds"]} rounds '
+                f'({d["max_deals"]} deals)') if d else ''
+        print(f'  {a} vs {b}: {reps} x 2 x {plan["deals"]} hands per round -> {plan["out"]}/{a}__vs__{b}{more}')
+    if d:
+        print(design_line(d))
+        if track != 'adaptation':
             print(_power_table(d))
-        else:
-            print('No design in this plan: one round, no stopping rule, and no result of it is a test.')
+    else:
+        print('No design in this plan: one round, no stopping rule, and no result of it is a test.')
+
+
+def cmd_tournament(args):
+    from .runner import plan_tracks
+    doc = json.loads(Path(args.plan).read_text())
+    plans = {t: _prepare(p, args) for t, p in plan_tracks(doc, args.track).items()}
+    if args.dry_run:
+        for track, plan in plans.items():
+            _dry_run(track, plan)
         return
-    asyncio.run(run_plan(plan, only=args.only, concurrency=args.concurrency, allow_code_change=args.allow_code_change))
+
+    async def main():
+        return await asyncio.gather(*(run_plan(p, only=args.only, concurrency=args.concurrency,
+                                               allow_code_change=args.allow_code_change) for p in plans.values()))
+    asyncio.run(main())
     from .ratings import ratings, summary
-    print(summary(ratings(plan['out'])))
+    for track, plan in plans.items():
+        if len(plans) > 1:
+            print(f'\n== {track} track ({plan["out"]}) ==')
+        print(summary(ratings(plan['out'])))
 
 
 def cmd_ratings(args):
+    from .ratings import track_runs
+    tracks = track_runs(args.root)
+    if tracks:
+        for i, (track, base) in enumerate(tracks.items()):
+            print(f'{"" if not i else chr(10)}== {track} track ({base}) ==')
+            _ratings(base, args, f'{args.json[:-5] if args.json and args.json.endswith(".json") else args.json}-{track}.json'
+                     if args.json else None)
+        return
+    _ratings(args.root, args, args.json)
+
+
+def _ratings(root, args, json_path):
     from .ratings import ratings, summary
-    r = ratings(args.root, boot=args.boot)
-    if args.json:
-        Path(args.json).write_text(json.dumps(r, indent=2))
+    r = ratings(root, boot=args.boot)
+    if json_path:
+        Path(json_path).write_text(json.dumps(r, indent=2))
     if not r['players']:
         print('No finished duplicate deals yet.')
         return
     print(summary(r))
     reg = r.get('registration') or {}
-    if (r.get('design') or {}).get('registered'):
+    if r.get('track') == 'adaptation' and (r.get('design') or {}).get('registered'):
+        test = (f'the model-based gate (adaptation track: stated assumptions, never official), recorded when play '
+                f'stopped by the registered judge {reg.get("judge_fingerprint")}')
+    elif (r.get('design') or {}).get('registered'):
         test = (f'the official decisions of the preregistered, assumption-free sequential test on {r["objective"]}, recorded when '
                 f'play stopped by the registered judge {reg.get("judge_fingerprint")} (this judge: '
                 f'{r.get("judge_fingerprint")}; anything it recomputes differently is retrospective), each counting '
@@ -172,6 +254,11 @@ def cmd_history(args):
           f'merge implementations). Descriptive only: pooled runs are no one\'s preregistered test.')
     if len(r['code_versions']) > 1:
         print(f'Code versions: {", ".join(r["code_versions"])}')
+    if r.get('other_track_runs'):
+        x = history.all_time(db, boot=args.boot, players_file=args.players, track='adaptation')
+        if x['players']:
+            print(f'\n== Adaptation track, all time (models remember the session; model-based, not official; never '
+                  f'pooled with the official track) ==\n{history.table(x)}')
 
 
 def cmd_export(args):
@@ -267,9 +354,9 @@ def main(argv=None):
     p = sub.add_parser('plan', help='write a round-robin tournament plan')
     p.add_argument('players_list', nargs='+')
     p.add_argument('--deals', type=int, default=1,
-                   help='duplicate deals per conversation (default 1: the official test needs a number of independent '
-                        'conversations set by the stacks, so one deal each needs the fewest deals; longer conversations '
-                        'also measure adaptation within a match, at the cost `plan` prints)')
+                   help='duplicate deals per conversation on the official track (default 1: the official test needs a '
+                        'number of independent conversations set by the stacks, so one deal each needs the fewest deals; '
+                        'adaptation within a match is measured on the adaptation track)')
     p.add_argument('--stack', type=int, help='chips per stack (default 200: 100 big blinds); the official test\'s bound, '
                                              'and so the conversations it needs, scale with it')
     p.add_argument('--seed', type=int, default=1000)
@@ -289,13 +376,27 @@ def main(argv=None):
     p.add_argument('--alpha', type=float, help='chance of naming any false winner across the whole tournament (default 0.05)')
     p.add_argument('--block', type=int, help='deals per block in the within-conversation intervals (default 10)')
     p.add_argument('--replicates', type=int, default=25,
-                   help='independent duplicate pairs (conversations) per pairing per round, each with fresh memories '
+                   help='official track: independent duplicate pairs (conversations) per pairing per round, each with fresh memories '
                         '(default 25; the official test is valid at every look, so this sets only how often it looks)')
     p.add_argument('--target-edge', type=float, help='the edge in bb/100 the plan is powered to detect (default 50)')
+    p.add_argument('--tracks', default='official,adaptation',
+                   help='which tracks to plan (default both): "official" (fresh conversations, assumption-free '
+                        'verdicts that decide leaders and ranks) and "adaptation" (the same players in long '
+                        'conversations, so models remember and adapt; model-based verdicts, never official). Each '
+                        'gets its own run folder, <out>/<track>')
+    p.add_argument('--adaptation-deals', type=int, default=50, help='deals per conversation on the adaptation track (default 50)')
+    p.add_argument('--adaptation-replicates', type=int, default=4,
+                   help='conversations per pairing per round on the adaptation track (default 4)')
+    p.add_argument('--adaptation-max-rounds', type=int, help='rounds at most on the adaptation track (default: the '
+                                                             'fewest that give its model-based gate 80%% power)')
+    p.add_argument('--adaptation-budget-deals', type=int, help='cap on deals per pairing on the adaptation track')
     p.set_defaults(fn=cmd_plan)
 
-    p = sub.add_parser('tournament', help='run (or resume) every matchup of a plan')
+    p = sub.add_parser('tournament', help='run (or resume) every matchup of a plan, in each of its tracks')
     p.add_argument('plan')
+    p.add_argument('--track', action='append', choices=['official', 'adaptation'],
+                   help='only this track (repeat for both; default: every track in the plan, played at the same time, '
+                        'each with its own --concurrency)')
     p.add_argument('--only', nargs='*', help='only these players or matchups')
     p.add_argument('--concurrency', type=int, help='matches at once per CLI (overrides the plan)')
     p.add_argument('--dry-run', action='store_true')

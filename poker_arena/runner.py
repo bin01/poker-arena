@@ -787,6 +787,43 @@ def make_plan(player_ids, deals=50, seed=1000, out='runs/pilot', game='holdem', 
             'design': {**DESIGN, 'round_deals': deals, **(design or {})}, 'replicates': replicates}
 
 
+def make_tournament(player_ids, name=None, out='runs/pilot', tracks=('official', 'adaptation'), official=None,
+                    adaptation=None, **common):
+    """One tournament in up to two tracks, each its own plan with its own run folder (<out>/<track>), registration
+    and design: 'official' (fresh conversations, by default one deal each, judged by the assumption-free test,
+    the only track that decides ranks and leaders) and 'adaptation' (the same players in long conversations so
+    models remember and adapt to the opponent, judged and stopped by the model-based gate, never official).
+    `official` / `adaptation` are make_plan's per-track arguments (deals, replicates, design); `common` the
+    rest (seed, game, game_config, players_file, concurrency, matchups). Both tracks play the same seeds."""
+    from . import ratings
+    name = name or Path(out).name
+    defaults = {'official': {'deals': 1, 'replicates': 25},
+                'adaptation': {'deals': ratings.ADAPTATION_DEALS, 'replicates': ratings.ADAPTATION_REPLICATES}}
+    given = {'official': official or {}, 'adaptation': adaptation or {}}
+    plans = {}
+    for track in tracks:
+        if track not in ratings.TRACKS:
+            raise ValueError(f'unknown track {track!r}: choose from {", ".join(ratings.TRACKS)}')
+        kw = {**defaults[track], **given[track]}
+        design = {**(kw.pop('design', None) or {}), 'track': track}
+        plan = make_plan(player_ids, out=str(Path(out) / track), design=design, **kw, **common)
+        plans[track] = {**plan, 'track': track, 'tournament': name}
+    return {'tournament': name, 'out': str(out), 'tracks': plans}
+
+
+def plan_tracks(doc: dict, only=None) -> dict:
+    """{track: plan} of a tournament file (or {'official': plan} for a plain single-track plan), limited to
+    `only` (a track name or a list of them) when given."""
+    plans = dict(doc['tracks']) if 'tracks' in doc else {doc.get('track') or 'official': doc}
+    if only:
+        want = [only] if isinstance(only, str) else list(only)
+        missing = [t for t in want if t not in plans]
+        if missing:
+            raise KeyError(f'the plan has no {", ".join(missing)} track (it has {", ".join(plans)})')
+        plans = {t: plans[t] for t in want}
+    return plans
+
+
 class PlanConflict(ValueError):
     """A plan that says two different things about its design (e.g. replicates and design.replicates)."""
 

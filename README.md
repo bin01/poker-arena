@@ -37,20 +37,21 @@ Code, Codex, Antigravity), so a tournament costs nothing beyond the plans you al
 - **Bots.** `random` (random legal moves), `station` (always checks or calls) and `rule` (Monte Carlo equity
   against pot odds, value bets, never bluffs). They are free, play instantly, anchor the scale and catch a
   broken prompt or backend at once.
+- **Two tracks.** A tournament plays the same players on the same deals twice over, in two separate runs.
+  The **official** track starts a fresh conversation for every deal, so its conversations are independent and
+  its verdicts come from a test that assumes nothing about the shape of the results; only it decides ranks and
+  leaders. The **adaptation** track keeps each conversation for 50 deals, so a model remembers the session and
+  can adapt to its opponent; its verdicts (and its stopping) come from a model-based test with stated
+  assumptions, labelled *adaptation · model-based · not official* everywhere, and never feed the official
+  standings. The all-time history keeps the tracks apart.
 - **Ratings.** Chips decide, as the models are told. Only one thing is a test: each pairing's preregistered
-  sequential procedure, whose verdicts (*a is better*, *b is better*, *even*) keep the chance of any false
-  verdict in a tournament under 5%: exactly when each conversation's result is symmetric about the true edge
-  (for instance two interchangeable players), and in simulation for skewed results up to a stated size (beyond it,
-  rare large one-sided swings, no test of this size can keep the promise; the methodology shows by how much it
-  fails). It treats each conversation (a fresh pair of matches) as one unit and needs at least 8 of them (12 in
-  the default design). A run without a preregistered design, and any pairing with a player whose model could not
-  be verified, is descriptive only. A **decided** rank or leader is built from those verdicts alone; a leader has
-  a decided win over every other player of its group. Everything else is **descriptive**: a player's strength (its
-  edge in bb/100 against the average opponent of its group, from a least-squares fit over duplicate deals), its
-  95% interval (a bootstrap that resamples whole slates of shared deals, or blocks of 10 deals within one
-  conversation when that is all there is), the order by points and the front runner, and session Elo (share of
-  10-deal sessions won). [docs/methodology.md](docs/methodology.md) has the method, the assumptions, the
-  calibration, power and coverage results and the limits.
+  sequential procedure. On the official track it is a betting confidence sequence on conversation means, which
+  the stacks bound (±10,000 bb/100 at 100 big blinds): with no edge, the chance of any false verdict in a
+  tournament stays under 5% at every look, for any distribution of results, given independent conversations.
+  A **decided** rank or leader is built from those verdicts alone. Everything else is **descriptive**: a
+  player's strength (its edge in bb/100 against the average opponent of its group, from a least-squares fit
+  over duplicate deals) and its 95% interval, the order by points, session Elo, and every adaptation-track
+  number. [docs/methodology.md](docs/methodology.md) has the method, the assumptions, power, cost and the limits.
 
 ## Quick start
 
@@ -73,6 +74,12 @@ python -m poker_arena quiz reference claude-haiku-5-5-high --out quiz
 # Free and instant: the bots against each other, then the viewer
 python -m poker_arena play rule station --deals 50 --out runs/demo
 python -m poker_arena view runs/demo                 # http://127.0.0.1:8800
+
+# A tournament in both tracks: plans/cup.json holds one plan per track, played into runs/cup/official and
+# runs/cup/adaptation, each registered on its own; `plan` prints the cost of each track before anything plays
+python -m poker_arena plan reference rule station --out runs/cup --write plans/cup.json   # --tracks official,adaptation
+python -m poker_arena tournament plans/cup.json                       # both tracks at once; --track adaptation for one
+python -m poker_arena ratings runs/cup                                # each track judged apart
 ```
 
 ### Models, on your subscriptions
@@ -117,8 +124,10 @@ python -m poker_arena view runs/pilot                                 # follows 
 ```
 
 `tournament` resumes: rerun the same command after a crash or a stop, and each match continues after its last
-finished hand. Write your own preregistered plan with `python -m poker_arena plan A B C reference --out runs/mine --write plans/mine.json`
-(one deal per conversation by default; `--deals N` for longer conversations, at the cost it prints).
+finished hand. Write your own preregistered plan with `python -m poker_arena plan A B C reference --out runs/mine --write plans/mine.json`:
+both tracks by default (`--tracks official` for one), the official one with one deal per conversation
+(`--deals`, `--replicates`), the adaptation one with 50 (`--adaptation-deals`, `--adaptation-replicates`,
+`--adaptation-budget-deals`); `tournament --track official` plays one track, and `--concurrency` applies to each.
 
 ### How sure the results are
 
@@ -311,7 +320,11 @@ result takes a new run with its own design. The viewer shows it as **All runs** 
 ## The viewer
 
 `python -m poker_arena view runs` serves every run under `runs/` at http://127.0.0.1:8800, with a picker for the
-run (a tournament's `out` folder, or a `play --out`). It follows running matches live.
+run (a tournament's `out` folder, or a `play --out`). It follows running matches live. A tournament with two tracks
+is one entry in the picker: its page shows the official standings first, with a tab (and a compact section below
+the matchups) for **Adaptation (models remember the session)**, which has its own standings, matchups and replays,
+is marked *model-based · not official*, never shows a Decided badge, a rank or a leader, and says in one paragraph
+how the two tracks differ. The all-runs view pools official-track runs only.
 
 The look is a card room: green felt, ivory cards, chips and brass. Players are always shown as a model and its
 reasoning level (e.g. "GPT-6 Luna · High", from `label` in `players.toml` or made from `model` and `effort`), never

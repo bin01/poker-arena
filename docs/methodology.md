@@ -286,8 +286,8 @@ conversation):
 
 So the default is now **one duplicate deal per conversation**: each conversation is the two one-hand matches of
 one deal, with fresh memories. The price is what such a run measures: how well a model plays a hand against this
-opponent, not what it learns about the opponent over a match. A plan that wants adaptation sets `--deals` and pays
-the deals above. Each conversation is a fresh session for both players, so a run makes many more of them (1,475
+opponent, not what it learns about the opponent over a match. Adaptation is measured on its own track (*Two
+tracks*, below), not by lengthening the official conversations. Each conversation is a fresh session for both players, so a run makes many more of them (1,475
 conversations of a pairing against round 6's 40), which costs CLI start-ups and system prompts but not the long
 contexts of 50-hand conversations.
 
@@ -326,6 +326,39 @@ contexts of 50-hand conversations.
 In deals, an assumption-free verdict costs about what round 6's model-based one did, *if* conversations are one
 deal long; kept at 50 deals it costs 28 times as many. In conversations (fresh sessions) it costs about 35 to
 45 times as many either way. The round 6 numbers are its own planner's (`ratings.procedure_model_based`).
+
+## Two tracks: official and adaptation
+
+`python -m poker_arena plan` writes one tournament with two tracks (`runner.make_tournament`; `--tracks` picks
+them): the same players and seeds, played into separate run folders (`<out>/official`, `<out>/adaptation`), each
+with its own plan.json, `registration` and design (`design.track`, which is part of the registered inputs, so a
+run cannot switch tracks after registration).
+
+| | official | adaptation |
+|---|---|---|
+| conversation | a fresh one every deal (default 25 per round) | 50 deals (default 4 per round): models remember and adapt |
+| verdict and stopping | the betting confidence sequence (above): assumption-free given independent conversations | the model-based gate (below), with its stated assumptions |
+| power | `procedure` (the official test, simulated) | `procedure_model_based` (the gate, simulated), max_rounds the fewest for 80%, at most the 40 looks and 200 conversations the gate is calibrated for |
+| decides ranks and leaders | yes | never: `official: false`, `counts_toward_leader: false` |
+| labelled | official | *adaptation · model-based · not official* |
+| all-time history | pooled with official runs | pooled only with adaptation runs (`history.all_time(track=...)`), never with official ones |
+
+On the adaptation track `adjudicate` takes its verdict from the gate (`gate`, with the betting test's verdict on
+the same data kept as `assumption_free_verdict`), applies every eligibility rule as on the official track, and
+returns `track: 'adaptation'`, `official: false`, `model_based: true`, `registered_record` (made by the
+registered judge under a valid registration) and `model_based_counts` (eligible, decided, diagnostics passed).
+Its assumptions add the gate's diagnostic (`calibrated_family`: the conversation share within the calibrated
+family); *supported* there means *diagnostics passed; distribution assumptions unverified*, never a guarantee.
+The runner stops on these verdicts and records them like official ones; `rate` reads them as recorded but never
+builds a rank or a leader from them: a group reports `model_based_leader` (a counting model-based win over every
+other player) beside `leader: null`, and `inferential` is false for every adaptation player.
+
+The default 3-model adaptation design: 10 rounds of 4 conversations of 50 deals (2,000 deals per pairing at
+most), a verdict possible from 12 conversations; at 50 bb/100 the gate decides for the better player with
+diagnostics passing 83% of the time under the assumed dependence (99% with none, 60% if it is worse), after
+about 26 conversations. For 9 models: 15 rounds (3,000 deals), 83%. These powers assume normal conversation
+means; the gate's error rate holds only within its calibrated family of shapes (*The model-based gate*), which
+is why nothing on this track is official.
 
 ## The test
 
@@ -419,8 +452,9 @@ exponential, lognormal and rare-large-loss conversation effects up to half a con
 together with a sign-flip randomization test, and TOST for `even`; with its diagnostic (`conversation_share`
 within 0.5). Within that family it keeps its level (t arm alone, 200,000 sequences each: 0.0065 to 0.0157 against
 0.0167). Outside it, it does not: the round 6 counterexample above. It is labelled *model-based: secondary,
-descriptive, never official; its error rate is not guaranteed*, it never stops a pairing, never counts towards a
-rank or a leader, and the planner never uses it.
+descriptive, never official; its error rate is not guaranteed*, it never stops an official-track pairing, never
+counts towards a rank or a leader, and the official planner never uses it. On the adaptation track it is the
+judge (with its own registered design and planner), still never official.
 
 ## Strength (descriptive)
 
@@ -528,7 +562,8 @@ run's deals, under their own identity (`...!served=<model>`).
 
 ## All-time standings (descriptive only)
 
-`history.all_time` pools every run in `arena.db` that was played under the same game settings. Those runs had
+`history.all_time` pools every run of one track (official by default; the `runs` table records each run's
+track from its plan.json) in `arena.db` that was played under the same game settings; the tracks never pool. Those runs had
 different designs and stopped pairings at different times, so pooling them is no one's preregistered test:
 every pairing there has `verdict: 'descriptive'`, there is no leader and no rank, and the notes say so. Repeated
 deals are averaged; slates are matched by seed across runs, so runs on the same cards are resampled together.
