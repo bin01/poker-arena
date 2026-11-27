@@ -187,3 +187,12 @@ class TestSessionDefinition(unittest.TestCase):
         src = (VIEWER / 'app.js').read_text()
         self.assertNotIn('10-deal session', src)
         self.assertIn('sessionText(rt)', src)
+
+
+class TestMixedSessionText(unittest.TestCase):
+    def test_mixed_lengths_state_the_per_deal_band(self):
+        from poker_arena import ratings
+        d = ratings.session_definition([{'deals': 10}, {'deals': 5}])
+        self.assertIn('per deal it holds', d['text'])
+        self.assertIn('0.5 for a 5-deal session', d['text'])
+        self.assertIn('1 for a 10-deal one', d['text'])

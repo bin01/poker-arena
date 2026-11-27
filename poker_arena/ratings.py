@@ -2550,8 +2550,11 @@ def session_definition(games, size=SESSION, conversation=None) -> dict:
         what = (f'up to {most} deals of one conversation ({"-".join(map(str, (counts[0], most)))} here: a shorter '
                 f'conversation is one session, and a trailing part counts if it has at least half)')
     return {'deals': most, 'deal_counts': counts, 'size': size, 'tie_bb_per_deal': TIE_BB, 'tie_bb': tie,
-            'text': f'a session is {what}; it is won by finishing more than {tie:g} big blinds up over both plays '
-                    f'({TIE_BB:g} per deal), and anything closer is a tie'}
+            'text': (f'a session is {what}; it is won by finishing more than {tie:g} big blinds up over both plays '
+                     f'({TIE_BB:g} per deal), and anything closer is a tie') if len(counts) == 1 else
+                    (f'a session is {what}; it is won by finishing more than {TIE_BB:g} big blinds per deal it holds '
+                     f'up over both plays ({round(TIE_BB * counts[0], 2):g} for a {counts[0]}-deal session, {tie:g} for '
+                     f'a {most}-deal one), and anything closer is a tie')}
 
 
 def outcome(s) -> float:
