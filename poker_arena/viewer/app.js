@@ -807,11 +807,12 @@ async function quizTeaser() {
   let q;
   try { q = await loadQuiz(); } catch (e) { return ''; }
   if (!q || !q.players.length) return '';
-  const best = q.players.find(x => !x.reference) || q.players[0];
+  const models = q.players.filter(x => !x.reference);
   const ref = q.players.find(x => x.reference);
+  const scores = models.map(x => `<b>${plain(x.player)}</b> ${x.correct ?? '–'}/${x.total ?? '–'}`).join(' · ');
+  const ceiling = models.length > 1 && models.filter(x => x.correct === x.total).length >= 2;
   return `<a class="quiz-teaser card-box" href="${quizLink()}"><span class="qt-k">Poker fundamentals</span>
-    <span class="qt-body">A separate quiz of ${plural(q.spots.length, 'textbook spot')} with worked-out answers.
-      Best: <b>${plain(best.player)}</b> ${best.correct ?? '–'}/${best.total ?? '–'}${ref ? ` · ${plain(ref.player)} (reference) ${ref.correct ?? '–'}/${ref.total ?? '–'}` : ''}</span>
+    <span class="qt-body">A separate quiz of ${plural(q.spots.length, 'textbook spot')} with worked-out answers: ${scores}${ref ? ` · ${plain(ref.player)} (reference) ${ref.correct ?? '–'}/${ref.total ?? '–'}` : ''}${ceiling ? '<span class="soft"> · several perfect scores: these spots are too easy to separate these models</span>' : ''}</span>
     <span class="al-go">See every spot ›</span></a>`;
 }
 

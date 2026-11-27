@@ -467,6 +467,15 @@ def quiz(root: Path, run):
     for m in _runs_and_matchups(root).get(run, []):
         labels.update(m['labels'])
         kinds.update(m['kinds'])
+    try:   # quiz players named by today's players file when the run's matches don't name them
+        from .runner import load_players
+        known = load_players(PLAYERS_FILE[0])
+        for pid in (data.get('players') or {}):
+            if pid not in labels and pid in known:
+                labels[pid] = display_name(pid, known[pid])
+                kinds[pid] = 'bot' if 'bot' in known[pid] else 'model'
+    except Exception:
+        pass
     return {**data, 'labels': {**labels, **(data.get('labels') or {})}, 'kinds': {**kinds, **(data.get('kinds') or {})}}
 
 
