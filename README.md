@@ -101,6 +101,32 @@ python -m poker_arena view runs/pilot                                 # follows 
 `tournament` resumes: rerun the same command after a crash or a stop, and each match continues after its last
 finished hand. Write your own plan with `python -m poker_arena plan A B C --deals 50 --out runs/mine --write plans/mine.json`.
 
+### How many deals it takes
+
+Even with duplicate deals, one deal swings a lot: in the first model runs, the result per deal had a spread of
+about 350 bb/100. So the number of deals a pairing needs to show who is better depends on how far apart the two are
+(95% confidence, 80% chance of catching the edge):
+
+| real gap | deals per pairing |
+|---|---|
+| 100 bb/100 (a mismatch) | ~100 |
+| 50 bb/100 (clearly better) | ~380 |
+| 20 bb/100 (solidly better) | ~2,400 |
+| 10 bb/100 (slightly better) | ~9,500 |
+
+Rather than guess, play until decided:
+
+```sh
+python -m poker_arena tournament plans/pilot.json --until-decided 1000
+```
+
+The plan's `deals` becomes a round. After each round, a pairing whose edge is settled stops; the rest play another
+round on new deals (the same new deals for every pairing still playing), up to 1,000 deals. Rounds go in their own
+folders (`a__vs__b__r2`, ...), each with fresh memories, and pool in the ratings. A pairing is **settled** when its
+edge is 2.7 standard errors from even, not 1.96: checking after every round gives a false winner more chances,
+and 2.7 keeps the chance under 5% for up to 25 checks (a simulated Pocock boundary). Running it again on a finished
+plan with `--until-decided` continues from the rounds already played, so a fixed-length run can be extended.
+
 **How long it takes.** A model makes about 2–3 decisions per hand, and a CLI call takes roughly 5–30 seconds,
 so 100 hands take 30–90 minutes per model seat. The pilot is about 6,000 model calls: most of a day at
 `--concurrency 3`, longer if usage limits pause it. Start with `plans/smoke.json`.
@@ -151,6 +177,9 @@ The look is a card room: green felt, ivory cards, chips and brass. Players are s
   - **Ratings**: Elo with its 90% interval on a shared axis, bb/100 with its 95% margin (coloured only when the
     margin excludes zero), sessions won–tied–lost. Only players with at least 3 sessions are ranked; the rest
     are listed with how far they are from a rating.
+  - **Is it settled?**: for each pairing, the leader's edge with its margin, how close it is to settled, and
+    roughly how many more deals that takes at the current gap (or "too close to call", meaning over 10,000 more).
+    Above it, one line says whether the top player is the winner, and if not, what it still needs.
   - **Head to head**: bb/100 for every pair, shaded when the edge is larger than its margin; a cell opens the matchup.
   - **How they play**: VPIP, PFR, aggression after the flop, how often it goes to showdown and wins there, and
     how often it talks.

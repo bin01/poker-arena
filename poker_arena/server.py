@@ -124,7 +124,9 @@ def _matchup(root: Path, m: Path):
     hb = {h['hand']: h for h in hands['b-first']}
     both = sorted(set(ha) & set(hb))
     specs = cfg.get('specs', {})
+    rnd = m.name.rsplit('__r', 1)[1] if '__r' in m.name.split('__vs__')[-1] else ''
     return {'id': str(m.relative_to(root)), 'run': run_of(root, m), 'a': a, 'b': b, 'started': True,
+            'round': int(rnd) if rnd.isdigit() else 1,
             'matches': matches, 'deals_total': len(cfg.get('seeds', [])), 'pairs_done': len(both),
             'pair_net_a': sum(ha[k]['net'][0] + hb[k]['net'][1] for k in both),
             'kinds': {p: 'bot' if 'bot' in s else 'model' for p, s in specs.items()},
@@ -150,7 +152,7 @@ def _runs_and_matchups(root: Path):
             if (a, b) not in have:
                 by.setdefault(run, []).append({
                     'id': str(rel / f'{a}__vs__{b}') if run != '.' else f'{a}__vs__{b}', 'run': run, 'a': a, 'b': b,
-                    'started': False, 'matches': [], 'deals_total': plan.get('deals', 0), 'pairs_done': 0,
+                    'started': False, 'round': 1, 'matches': [], 'deals_total': plan.get('deals', 0), 'pairs_done': 0,
                     'pair_net_a': 0, 'kinds': {}, 'labels': {**plan.get('labels', {}), **LABELS}, 'bb': 1, 'live': False, 'finished': False,
                     'updated': 0, 'times': []})
     return by

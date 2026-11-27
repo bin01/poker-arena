@@ -40,13 +40,18 @@ def cmd_tournament(args):
     plan = json.loads(Path(args.plan).read_text())
     if args.effort:
         plan['effort'] = args.effort
+    if args.until_decided:
+        plan['until_decided'] = args.until_decided
     if args.dry_run:
         for a, b in plan['matchups']:
-            print(f'{a} vs {b}: 2 x {plan["deals"]} hands -> {plan["out"]}/{a}__vs__{b}')
+            more = f', then rounds of {plan["deals"]} until settled (at most {plan["until_decided"]} deals)' \
+                if plan.get('until_decided') else ''
+            print(f'{a} vs {b}: 2 x {plan["deals"]} hands -> {plan["out"]}/{a}__vs__{b}{more}')
         return
     asyncio.run(run_plan(plan, only=args.only, concurrency=args.concurrency))
-    from .ratings import ratings, table
-    print(table(ratings(plan['out'], boot=200)))
+    from .ratings import ratings, table, verdicts
+    r = ratings(plan['out'], boot=200)
+    print(table(r) + '\n\n' + verdicts(r))
 
 
 def cmd_ratings(args):
@@ -59,6 +64,8 @@ def cmd_ratings(args):
     if args.json:
         Path(args.json).write_text(json.dumps(r, indent=2))
     print(table(r))
+    from .ratings import verdicts
+    print('\n' + verdicts(r))
     print(f'\n{r["deals"]} duplicate deals in {r["sessions"]} sessions of {r["session_deals"]} deals '
           f'({2 * r["session_deals"]} hands). Elo: chance of winning a session; bb/100: big blinds won per 100 hands.')
 
@@ -195,6 +202,9 @@ def main(argv=None):
     p.add_argument('--concurrency', type=int, help='matches at once per CLI (overrides the plan)')
     p.add_argument('--dry-run', action='store_true')
     p.add_argument('--effort', help='reasoning level for every model, e.g. high (overrides players.toml and the plan)')
+    p.add_argument('--until-decided', type=int, metavar='MAX_DEALS',
+                   help='play the plan\'s deals as rounds, stopping each pairing once its edge is settled, '
+                        'or at MAX_DEALS deals')
     p.set_defaults(fn=cmd_tournament)
 
     p = sub.add_parser('ratings', help='Elo and bb/100 from every finished duplicate deal under a folder')

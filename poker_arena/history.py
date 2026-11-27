@@ -231,7 +231,6 @@ def all_time(db, boot=200, players_file='players.toml', seed=0) -> dict:
         pids[ident].add(pid)
     labels = {**newest, **{k: v for k, v in current_labels(players_file).items() if k in newest}}
     _disambiguate(labels)
-    r['matchups'] = _pool_pairs(r['matchups'])
 
     stats, served = defaultdict(dict), defaultdict(set)
     for ident, counts, sv, gk, seats in tallies:
@@ -275,33 +274,6 @@ def _disambiguate(labels: dict):
                 labels[ident] = f'{lab} ({tell(ident) if unique else ident})'
 
 
-def _pool_pairs(matchups: list) -> list:
-    """One head-to-head row per pair of players, pooling the pair's matchups across runs."""
-    by = {}
-    for m in matchups:
-        key = tuple(sorted((m['a'], m['b'])))
-        flip = m['a'] != key[0]
-        x = by.setdefault(key, {'matchup': m['matchup'], 'a': key[0], 'b': key[1], 'deals': 0, 'net_a_chips': 0,
-                                'sum': 0.0, 'var': 0.0, 'hands': 0, 'a_session_wins': 0, 'b_session_wins': 0,
-                                'matchups': []})
-        n = m['deals']
-        x['deals'] += n
-        x['hands'] += m['hands']
-        x['net_a_chips'] += -m['net_a_chips'] if flip else m['net_a_chips']
-        x['sum'] += n * (-m['a_bb_per_100'] if flip else m['a_bb_per_100'])
-        x['var'] += (n * m['se']) ** 2
-        x['a_session_wins'] += m['b_session_wins'] if flip else m['a_session_wins']
-        x['b_session_wins'] += m['a_session_wins'] if flip else m['b_session_wins']
-        x['matchups'].append(m['matchup'])
-        x['matchup'] = m['matchup']   # the last one, for the link
-    out = []
-    for x in by.values():
-        n = x.pop('deals')
-        s, v = x.pop('sum'), x.pop('var')
-        out.append({**x, 'deals': n, 'a_bb_per_100': round(s / n, 1), 'se': round(v ** 0.5 / n, 1)})
-    return sorted(out, key=lambda x: (x['a'], x['b']))
-
-
 def table(r) -> str:
-    from .ratings import table as base
-    return base(r, labels=r.get('labels'))
+    from .ratings import table as base, verdicts
+    return base(r, labels=r.get('labels')) + '\n\n' + verdicts(r, labels=r.get('labels'))

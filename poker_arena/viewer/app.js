@@ -179,7 +179,10 @@ function runHead(rt) {
   const r = state.runs.find(x => x.run === state.run);
   if (r.all) return historyHead(r, rt);
   const deals = Math.max(0, ...state.index.map(m => m.deals_total || 0));
-  const sub = [plural(r.players.length, 'player'), plural(r.matchups, 'matchup'), `${deals} duplicate deals each`];
+  const rounds = state.index.some(m => m.round > 1);
+  const pairings = new Set(state.index.map(m => [m.a, m.b].sort().join('|'))).size;   // rounds of a pairing count once
+  const sub = [plural(r.players.length, 'player'), plural(pairings, 'matchup'),
+    rounds ? `rounds of ${deals} duplicate deals, until settled` : `${deals} duplicate deals each`];
   const share = r.hands_planned ? r.hands / r.hands_planned : 0;
   let line;
   if (r.finished) line = `Finished · ${plural(r.hands, 'hand')} · last hand ${ago(r.updated)}`;
@@ -233,6 +236,7 @@ async function renderBoard() {
   }
   if (rated.length) html += podium(rated) + ratingsTable(r, rated);
   if (rest.length) html += unratedTable(r, rest, rated.length > 0);
+  html += settledSection(r);
   html += headToHead(r);
   html += styleTable(r);
   $app.innerHTML = html;
@@ -305,6 +309,61 @@ function unratedTable(r, rest, others) {
     'A player is rated once it has played enough sessions for the number to mean something. Until then its net result is mostly the luck of a few big pots.');
 }
 
+// How sure are we: each pairing's edge against the bar for calling it, and roughly how many more deals that takes.
+const approx = n => n < 100 ? String(n) : Number(n.toPrecision(2)).toLocaleString();
+function verdictText(m) {
+  if (m.status === 'settled') return '<span class="verdict settled">Settled</span>';
+  if (m.status === 'early') return `<span class="verdict">Too early</span><span class="soft small"> · ${m.deals} of ${m.deals + m.more_deals} deals</span>`;
+  if (m.status === 'too close') return '<span class="verdict close">Too close to call</span>';
+  return `<span class="verdict open">About ${approx(m.more_deals)} more deals</span>`;
+}
+function winnerLine(r, rated, byPair) {
+  const top = (rated.length ? rated : r.players)[0];
+  if (!top || r.players.length < 2) return '';
+  const others = r.players.filter(p => p.player !== top.player);
+  const vs = others.map(o => ({ o, m: byPair[[top.player, o.player].sort().join('|')] }));
+  const sign = ({ o, m }) => m && (m.a === top.player ? 1 : -1) * m.a_bb_per_100;
+  const missing = vs.filter(v => !v.m), lost = vs.filter(v => v.m?.status === 'settled' && sign(v) < 0);
+  const open = vs.filter(v => v.m && !(v.m.status === 'settled' && sign(v) > 0));
+  const who = esc(labelText(top.player));
+  if (!missing.length && !open.length)
+    return `<b>${who} is the winner.</b> It beats every other player, and each of those edges is settled.`;
+  if (lost.length) return `<b>${who} leads the ratings, but loses to ${lost.map(v => esc(labelText(v.o.player))).join(' and ')}</b> by a settled margin. The ratings weigh every pairing; this one goes the other way.`;
+  const hardest = open.filter(v => v.m.status !== 'too close').sort((x, y) => (y.m.more_deals ?? 0) - (x.m.more_deals ?? 0))[0];
+  const close = open.filter(v => v.m.status === 'too close');
+  let line = `<b>${who} leads, but it isn't settled yet.</b> `;
+  if (close.length) line += `Against ${close.map(v => esc(labelText(v.o.player))).join(' and ')} it's too close to call: they may be about as good as each other. `;
+  else if (hardest) line += `The closest is ${esc(labelText(hardest.o.player))}: about ${approx(hardest.m.more_deals)} more deals at the current gap. `;
+  if (missing.length) line += `It hasn't played ${missing.map(v => esc(labelText(v.o.player))).join(' or ')}.`;
+  return line;
+}
+function settledSection(r) {
+  if (!r.matchups.length) return '';
+  const rated = r.players.filter(p => p.rated);
+  const byPair = Object.fromEntries(r.matchups.map(m => [[m.a, m.b].sort().join('|'), m]));
+  const order = { settled: 0, open: 1, early: 2, 'too close': 3 };
+  const rows = [...r.matchups].sort((x, y) => order[x.status] - order[y.status] || (x.more_deals ?? 1e9) - (y.more_deals ?? 1e9))
+    .map(m => {
+      const up = (m.a_bb_per_100 ?? 0) >= 0, lead = up ? m.a : m.b, trail = up ? m.b : m.a;
+      const edge = Math.abs(m.a_bb_per_100 ?? 0);
+      const sure = m.z == null ? (m.status === 'settled' ? 1 : 0) : Math.min(1, Math.abs(m.z) / r.z_stop);
+      return `<tr><td><div class="player">${monogram(lead)}<span class="name">${name(lead)}</span></div></td>
+        <td class="soft small">over</td><td><div class="player">${monogram(trail)}<span class="name">${name(trail)}</span></div></td>
+        <td class="num"><b class="${m.status === 'settled' ? 'pos' : ''}">${edge.toFixed(0)}</b>${m.se ? `<span class="ci"> ±${Math.round(1.96 * m.se)}</span>` : ''}</td>
+        <td><span class="meter thin sure ${m.status === 'settled' ? 'done' : ''}" title="${m.z == null ? '' : `${Math.abs(m.z).toFixed(1)} of the ${r.z_stop} standard errors needed`}"><span style="width:${(sure * 100).toFixed(0)}%"></span></span></td>
+        <td>${verdictText(m)}</td><td class="num soft">${m.deals.toLocaleString()}</td></tr>`;
+    }).join('');
+  const table = `<table><thead><tr><th>Ahead</th><th></th><th>Behind</th>${th('Edge', 'bb/100 the leader wins, ± its 95% margin', 'num')}
+    ${th('How sure', `How far the edge is toward the bar for calling it: ${r.z_stop} standard errors from even`)}<th>Verdict</th>${th('Deals', '', 'num')}</tr></thead>
+    <tbody>${rows}</tbody></table>`;
+  const line = winnerLine(r, rated, byPair);
+  return section('Is it settled?', 'each pairing, over every deal it has played', (line ? `<div class="verdict-line"><span class="suit">♠</span><div>${line}</div></div>` : '') + table,
+    `A pairing is settled when the leader's edge is ${r.z_stop} standard errors from even. That's stricter than the usual 1.96,
+    because a tournament played until decided checks after every round, and every check is another chance to name the
+    wrong winner. "More deals" assumes the current edge holds. Close models need thousands of deals, so "too close to
+    call" (over 10,000 more) usually means the two play about as well as each other.`);
+}
+
 function headToHead(r) {
   if (!r.matchups.length) return '';
   const names = r.players.map(p => p.player);
@@ -373,7 +432,7 @@ async function renderMatches(id, params) {
     ['Not started', state.index.filter(m => !m.started)]];
   const list = groups.filter(g => g[1].length).map(([title, ms]) => `<div class="group">${title}</div>` + ms.map(m => {
     const where = state.run === '*' ? `${esc(runLabel(m.run))} · ` : '';
-    const count = where ? `${m.pairs_done}/${m.deals_total} deals` : `${m.pairs_done} of ${m.deals_total} deals`;
+    const count = (state.index.some(x => x.round > 1 && x.a === m.a && x.b === m.b) ? `round ${m.round} · ` : '') + (where ? `${m.pairs_done}/${m.deals_total} deals` : `${m.pairs_done} of ${m.deals_total} deals`);
     const meta = `<span>${where}${!m.started ? 'waiting for a free seat' : count}</span>`
       + (m.pairs_done ? `<b class="${cls(m.pair_net_a)}" title="${own(m, m.a)}'s net over both plays">${signedBB(m.pair_net_a, m.bb)}</b>` : '');
     return `<a href="${m.started ? matchLink(m.id) : ''}" class="${m === cur ? 'active' : ''} ${m.started ? '' : 'planned'}">
@@ -526,7 +585,8 @@ async function matchBody(cur, params) {
   const order = [...played].sort((x, y) => x - y);
   const i = order.indexOf(pick);
   const dealNet = pick in nets ? nets[pick] : null;
-  const bar = `<div class="deal-bar"><h2>Deal ${pick + 1}</h2>
+  const rounds = state.index.some(m => m.round > 1 && m.a === cur.a && m.b === cur.b);
+  const bar = `<div class="deal-bar"><h2>${rounds ? `<span class="round">Round ${cur.round}</span>` : ''}Deal ${pick + 1}</h2>
     <div class="nav"><button data-deal="${order[i - 1]}" ${i > 0 ? '' : 'disabled'} aria-label="Previous deal">←</button>
       <button data-deal="${order[i + 1]}" ${i < order.length - 1 ? '' : 'disabled'} aria-label="Next deal">→</button></div>
     <span class="soft">${dealNet == null ? 'in progress' : dealNet === 0 ? 'even over both plays'

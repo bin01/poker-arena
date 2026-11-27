@@ -175,14 +175,16 @@ async def run_match(game, seat_players: list[tuple[str, dict]], seeds: list[int]
     return result
 
 
-def matchup_name(a, b):
-    return f'{a}__vs__{b}'
+def matchup_name(a, b, round_=1):
+    """The folder of a matchup; a tournament played until decided adds rounds as `a__vs__b__r2`, ..."""
+    return f'{a}__vs__{b}' + (f'__r{round_}' if round_ > 1 else '')
 
 
-async def run_duplicate(game, a: tuple[str, dict], b: tuple[str, dict], seeds, out: Path, *, sems=(), log=print):
+async def run_duplicate(game, a: tuple[str, dict], b: tuple[str, dict], seeds, out: Path, *, sems=(), log=print,
+                        round_=1):
     """Both matches of a duplicate pair; they share deals and run at the same time (each holding `sems`,
     the concurrency slots of the CLIs it uses, while it plays)."""
-    out = Path(out) / matchup_name(a[0], b[0])
+    out = Path(out) / matchup_name(a[0], b[0], round_)
 
     async def one(order, label, s):
         for sem in sems:
@@ -211,7 +213,10 @@ async def run_plan(plan: dict, *, only=None, concurrency=None, log=print):
     """Every matchup of the plan as a duplicate pair, on the same deals (so every player sees the same
     cards across the whole tournament). `concurrency` caps how many matches use each backend (each CLI)
     at once, so one subscription's rate limits don't stall the others; bot-only matches run freely.
-    Rerun to resume."""
+
+    With `until_decided` (a number of deals) in the plan, `deals` is a round: after each round a pairing
+    whose edge is settled (ratings.settle) stops, and the rest play another round on new deals (the same
+    new deals for every pairing), until settled or `until_decided` deals. Rerun to resume."""
     players = load_players(plan.get('players_file', 'players.toml'), effort=plan.get('effort'))
     cfg = {'hands_per_match': plan['deals'], **plan.get('game_config', {})}
     game = get_game(plan.get('game', 'holdem'))(cfg)
@@ -222,6 +227,26 @@ async def run_plan(plan: dict, *, only=None, concurrency=None, log=print):
     (Path(plan['out']) / 'plan.json').write_text(json.dumps({**plan, 'labels': labels}, indent=2))  # for the viewer
     sems = {}
     tasks = []
+    cap = plan.get('until_decided')
+
+    async def pairing(a, b, mine):
+        r = 1
+        while True:
+            round_seeds = seeds if r == 1 else [plan['seed'] + (r - 1) * plan['deals'] + k for k in range(plan['deals'])]
+            res = await run_duplicate(game, (a, players[a]), (b, players[b]), round_seeds, Path(plan['out']),
+                                      sems=mine, log=log, round_=r)
+            if not cap:
+                return res
+            from .ratings import load_deals, settle
+            xs = [(d['net_a'] if d['a'] == a else -d['net_a']) / d['bb'] / 2 * 100
+                  for d in load_deals(plan['out']) if {d['a'], d['b']} == {a, b}]
+            v = settle(xs)
+            if v['status'] == 'settled' or len(xs) + plan['deals'] > cap:
+                log(f'{a} vs {b}: {"settled" if v["status"] == "settled" else "stopped at the cap"} after '
+                    f'{len(xs)} deals, {a} {v["a_bb_per_100"]:+.0f} bb/100')
+                return res
+            r += 1
+
     for a, b in plan['matchups']:
         if only and matchup_name(a, b) not in only and a not in only and b not in only:
             continue
@@ -230,8 +255,7 @@ async def run_plan(plan: dict, *, only=None, concurrency=None, log=print):
             raise KeyError(f'not in {plan.get("players_file")}: {", ".join(missing)}')
         kinds = sorted({players[p]['backend'] for p in (a, b) if not is_bot(players[p])})  # sorted: no deadlock
         mine = [sems.setdefault(k, asyncio.Semaphore(limit)) for k in kinds]
-        tasks.append(run_duplicate(game, (a, players[a]), (b, players[b]), seeds, Path(plan['out']),
-                                   sems=mine, log=log))
+        tasks.append(pairing(a, b, mine))
     results = await asyncio.gather(*tasks, return_exceptions=True)
     for r in results:
         if isinstance(r, Exception):

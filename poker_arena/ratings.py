@@ -153,9 +153,6 @@ def rate(deals, boot=300, anchor: tuple[str, float] | None = None, seed=0, sessi
 
     point = scale(w)
     rng = random.Random(seed)
-    by_matchup = defaultdict(list)
-    for d in deals:
-        by_matchup[d['matchup']].append(d)
     games_by = defaultdict(list)
     for g in games:
         games_by[g['matchup']].append(g)
@@ -185,20 +182,64 @@ def rate(deals, boot=300, anchor: tuple[str, float] | None = None, seed=0, sessi
                         'session_losses': len(mine) - wins - ties})
     # rated players by rating; the rest after them, by how much they've played (their numbers are too noisy to rank)
     players.sort(key=lambda p: (not p['rated'], -p['elo'] if p['rated'] else -p['hands']))
-    matchups = []
-    for name, ds in sorted(by_matchup.items()):
-        a, b = ds[0]['a'], ds[0]['b']
-        xs = [d['net_a'] / d['bb'] / 2 * 100 for d in ds]
-        m = sum(xs) / len(xs)
-        sd = (sum((x - m) ** 2 for x in xs) / max(1, len(xs) - 1)) ** 0.5
-        matchups.append({'matchup': name, 'a': a, 'b': b, 'deals': len(ds),
-                         'net_a_chips': sum(d['net_a'] for d in ds), 'a_bb_per_100': round(m, 1),
-                         'se': round(sd / math.sqrt(len(ds)), 1), 'hands': 2 * len(ds),
-                         'a_session_wins': sum(outcome(g) == 1.0 for g in games_by[name]),
-                         'b_session_wins': sum(outcome(g) == 0.0 for g in games_by[name])})
-    return {'players': players, 'matchups': matchups, 'deals': len(deals), 'sessions': len(games),
-            'min_sessions': MIN_SESSIONS, 'tie_bb_per_deal': TIE_BB,
+    return {'players': players, 'matchups': pairs(deals, games), 'deals': len(deals), 'sessions': len(games),
+            'min_sessions': MIN_SESSIONS, 'tie_bb_per_deal': TIE_BB, 'z_stop': Z_STOP,
             'session_deals': session, 'anchor': list(anchor) if anchor else None, 'boot': boot}
+
+
+# When is a pairing settled? Its edge (mean bb/100 over duplicate deals) must be Z_STOP standard errors from
+# zero. Not 1.96: a tournament that plays until decided looks after every round, and each look is another
+# chance to crown a false winner. 2.7 keeps that chance under 5% for up to 25 looks (a simulated Pocock
+# boundary: 2.41 for 5 looks, 2.55 for 10, 2.67 for 20, 2.77 for 40).
+Z_STOP = 2.7
+MIN_SETTLE = 20      # fewer deals than this: the spread itself is too uncertain to judge
+TOO_CLOSE = 10_000   # more deals than this still needed: call it too close
+
+
+def settle(xs) -> dict:
+    """The verdict on one pairing from a's result per duplicate deal, in bb/100."""
+    n = len(xs)
+    if n < 2:
+        return {'deals': n, 'a_bb_per_100': round(xs[0], 1) if xs else None, 'se': None, 'z': None,
+                'status': 'early', 'more_deals': None}
+    m = sum(xs) / n
+    sd = (sum((x - m) ** 2 for x in xs) / (n - 1)) ** 0.5
+    se = sd / math.sqrt(n)
+    z = m / se if se else (math.inf if m else 0.0)
+    if abs(z) >= Z_STOP and n >= MIN_SETTLE:
+        status, more = 'settled', 0
+    elif n < MIN_SETTLE:
+        status, more = 'early', MIN_SETTLE - n
+    else:
+        # at the current edge, the deals it would take for the edge to clear the bar
+        need = n * (Z_STOP / abs(z)) ** 2 if z else math.inf
+        more = math.ceil(need - n) if need - n < TOO_CLOSE else None
+        status = 'open' if more is not None else 'too close'
+    return {'deals': n, 'a_bb_per_100': round(m, 1), 'se': round(se, 1), 'z': round(z, 2) if math.isfinite(z) else None,
+            'status': status, 'more_deals': more}
+
+
+def pairs(deals, games=()) -> list:
+    """Head to head: one row per pair of players, pooling every matchup between them (rounds, runs)."""
+    by = {}
+    for d in sorted(deals, key=lambda d: (d['matchup'], d['deal'])):
+        x = by.setdefault(frozenset((d['a'], d['b'])), {'a': d['a'], 'b': d['b'], 'xs': [], 'chips': 0,
+                                                        'matchups': [], 'a_session_wins': 0, 'b_session_wins': 0})
+        sign = 1 if d['a'] == x['a'] else -1
+        x['xs'].append(sign * d['net_a'] / d['bb'] / 2 * 100)
+        x['chips'] += sign * d['net_a']
+        if d['matchup'] not in x['matchups']:
+            x['matchups'].append(d['matchup'])
+    for g in games:
+        x = by[frozenset((g['a'], g['b']))]
+        o = outcome(g) if g['a'] == x['a'] else 1 - outcome(g)
+        x['a_session_wins'] += o == 1.0
+        x['b_session_wins'] += o == 0.0
+    out = []
+    for x in by.values():
+        xs, chips = x.pop('xs'), x.pop('chips')
+        out.append({'matchup': x['matchups'][-1], **x, 'net_a_chips': chips, 'hands': 2 * len(xs), **settle(xs)})
+    return sorted(out, key=lambda m: (m['a'], m['b']))
 
 
 def table(r, labels=None) -> str:
@@ -209,4 +250,20 @@ def table(r, labels=None) -> str:
         bb = f'{p["bb_per_100"]:+.1f}' if p['bb_per_100'] is not None else ''
         lines.append(f'{labels.get(p["player"], p["player"]):28} {p["elo"]:>6} {iv:>14} {bb:>9} {p["bb_per_100_se"] or 0:>6.1f} '
                      f'{p["hands"]:>6} {p["session_wins"]:>7}-{p["session_ties"]}-{p["session_losses"]}')
+    return '\n'.join(lines)
+
+
+def verdicts(r, labels=None) -> str:
+    """Each pairing: who leads, by how much, and whether that is settled."""
+    labels = labels or {}
+    name = lambda p: labels.get(p, p)
+    lines = []
+    for m in sorted(r['matchups'], key=lambda m: (m['status'] != 'settled', m['more_deals'] or 1e9)):
+        lead, trail = (m['a'], m['b']) if (m['a_bb_per_100'] or 0) >= 0 else (m['b'], m['a'])
+        edge = abs(m['a_bb_per_100'] or 0)
+        margin = f' ±{1.96 * m["se"]:.0f}' if m['se'] else ''
+        state = ('settled' if m['status'] == 'settled' else f'too early ({m["deals"]} deals)' if m['status'] == 'early'
+                 else f'about {m["more_deals"]:,} more deals to settle' if m['status'] == 'open'
+                 else f'too close to call after {m["deals"]} deals')
+        lines.append(f'{name(lead)} over {name(trail)}: {edge:.0f}{margin} bb/100, {state}')
     return '\n'.join(lines)
