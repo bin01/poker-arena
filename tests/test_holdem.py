@@ -173,9 +173,10 @@ class TestReplayContext(unittest.TestCase):
                 pot, tc = ep.pot, ep.to_call(seat)
                 a = rng.choice(req.legal)
                 act = {'action': a, **({'amount': rng.randint(*req.data['raise_bounds'])} if a == 'raise' else {})}
+                street = ep.street
                 self.assertIsNone(ep.apply(seat, act))
                 last = ep.history[-1]
-                self.assertEqual(last['to_act'], None if ep.done else ep.to_act)
+                self.assertEqual(last['to_act'], None if ep.done or ep.street != street else ep.to_act)
                 self.assertEqual((last['to_call'], last['pot_before']), (tc, pot))
                 self.assertEqual(last['pot_odds'], round(tc / (pot + tc), 4) if tc else None)
             actions = [e for e in ep.events if e.kind == 'action']

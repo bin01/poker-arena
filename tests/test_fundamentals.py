@@ -13,6 +13,19 @@ from poker_arena import quiz, ratings as R
 
 CLI = {'exe': 'claude', 'path': '/opt/claude/2.0', 'version': '2.0 (Claude Code)', 'sha256': 'ab' * 32}
 CODEX = {'exe': 'codex', 'path': '/opt/codex.js', 'version': 'codex-cli 1.0', 'sha256': 'cd' * 32}
+FILES = {'poker_arena/agents.py': 'a1', 'poker_arena/backends.py': 'b1', 'poker_arena/ratings.py': 'r1'}
+
+
+def spec_of(backend='claude'):
+    return {'backend': backend, 'model': 'claude-x-1' if backend == 'claude' else 'gpt-y', 'effort': 'high'}
+
+
+def tournament(backend='claude', cli=CLI, **over):
+    """A tournament player's provenance (ratings.player_provenance) that matches `player(backend, cli)`."""
+    s = spec_of(backend)
+    return {'identity': f'{backend}:{s["model"]}:high', 'settings': dict(s),
+            'code': {k: v for k, v in FILES.items() if not k.endswith('ratings.py')}, 'cli_version': cli['version'],
+            'cli_sha256': cli['sha256'], **over}
 
 
 
@@ -67,9 +80,10 @@ def answer(spot, action, executed, backend='claude', model='claude-x-1', cli=CLI
 
 
 def player(answers, backend='claude', cli=CLI):
-    spec = {'backend': backend, 'model': 'claude-x-1' if backend == 'claude' else 'gpt-y', 'effort': 'high'}
-    return {'spec': spec, 'kind': 'model', 'answers': answers, 'protocol': {'fingerprint': 'p1'},
-            'implementation': {'fingerprint': 'i1'}, 'cli': dict(cli), 'cli_version': cli['version'],
+    spec = spec_of(backend)
+    return {'spec': spec, 'kind': 'model', 'answers': answers,
+            'protocol': {'fingerprint': 'p1', 'settings': {'quiz': 'quiz-3', 'player': dict(spec)}},
+            'implementation': {'fingerprint': 'i1', 'files': dict(FILES)}, 'cli': dict(cli), 'cli_version': cli['version'],
             'eligibility': {'status': 'eligible', 'reasons': []}, 'identity_match': 'match', 'audit_status': 'verified'}
 
 
@@ -91,7 +105,7 @@ class TestQuizEvidence(unittest.TestCase):
     def fund(self, doc, players=None):
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / 'quiz.json').write_text(json.dumps(doc))
-            return R.fundamentals(d, players if players is not None else {'m1': 'claude:claude-x-1:high#abcd1234'})
+            return R.fundamentals(d, players if players is not None else {'m1': tournament()})
 
     def test_untouched_answers_are_eligible(self):
         f = self.fund(quiz_doc({'opus': good()}))
@@ -188,7 +202,7 @@ class TestOneAttestationPolicy(unittest.TestCase):
         p['eligibility'] = {'status': 'ineligible', 'reasons': ['not attested']}   # the quiz's own, older rule
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / 'quiz.json').write_text(json.dumps(quiz_doc({'luna': p})))
-            f = R.fundamentals(d, {'m2': 'codex:gpt-y:high#abcd1234'})
+            f = R.fundamentals(d, {'m2': tournament('codex', CODEX)})
         x = f['players']['m2']
         self.assertEqual((x['eligibility']['status'], x['attestation']['status']), ('eligible', 'unattested'))
         self.assertTrue(x['attestation']['allowed'])

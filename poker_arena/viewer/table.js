@@ -130,6 +130,9 @@
         log.push({ kind: 'action', step: snap(x.action, { lastAmount: x.amount }), seat: x.seat, street, action: x.action,
           amount: x.amount, all_in: !!x.all_in, say: x.say || '', note: x.note || null, thought: t, pot: x.pot, facing });
       } else if (e.kind === 'board') {
+        // the action before a new street closed the betting: nobody acts until the street is dealt
+        const prev = log[log.length - 1];
+        if (prev && prev.kind === 'action') out[prev.step].recordedToAct = null;
         sweep();
         street = x.street;
         board = x.board || [...board, ...(x.cards || [])];

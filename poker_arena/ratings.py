@@ -115,11 +115,22 @@ ASSUMPTIONS = ('With no edge, a pairing is called for either player with chance 
                'conversations are independent (fresh memories, no deal repeated across them), that no duplicate '
                'deal moves more than the stacks allow, and that the null holds conditionally (given the '
                'conversations before it, each one\'s expected edge is at most the null value; a common mean is one '
-               'case). If the edge drifts, a verdict means a player was ahead for part of the run, not on average; '
-               'the drift diagnostic beside each verdict flags that. "even" (within the equivalence margin) has the '
+               'case). Reading a verdict as "the better model" needs more: that each name served one stable model, '
+               'so that each conversation\'s expected edge stayed the same over the run. If the edge drifts, a '
+               'verdict means a player was ahead for part of the run, not on average; the drift diagnostic beside '
+               'each verdict can flag that, but "no drift detected" is not evidence that the model stayed the same. '
+               '"even" (within the equivalence margin) has the '
                'same guarantee. Each verdict reports those checks. The model-based result shown beside it (a t and '
                'sign-flip test calibrated for a family of shapes) is secondary and never official.')
 GUARANTEE = ASSUMPTIONS
+STABLE_CONDITION = ('a better model only if each name served one stable model, so that each conversation\'s '
+                    'expected edge stayed the same over the run (the conditional-mean null); no drift detected is '
+                    'not proof of that, and dated model snapshots should be pinned where the provider offers them')
+STRENGTH_KIND = ('centred fitted strength (bb/100): the strengths sum to zero in each group, and the difference '
+                 'of two players\' strengths is the edge the fit predicts between them; it is not a player\'s '
+                 'winnings against an average opponent')
+OBSERVED_KIND = ('observed opponent-weighted winnings (bb/100): the mean of a player\'s direct edges, one per '
+                 'opponent it met, each opponent weighted equally')
 CI_SEQUENTIAL = 'anytime-valid sequential'
 CI_FIXED = 'fixed-time descriptive'
 INTERVALS = {
@@ -1197,7 +1208,8 @@ def _bet(Y, m, bound, state=None, prior_var=BET_PRIOR_VAR, cap=BET_CAP):
 
 def drift(ys) -> dict:
     """Whether a pairing's edge held still: its conversation means in play order, the first half against the
-    second (Welch t, two-sided). {'status' ('stable' | 'drift detected' | 'unknown': fewer than 4 conversations),
+    second (Welch t, two-sided). {'status' ('no drift detected' | 'drift detected' | 'unknown': fewer than 4
+    conversations),
     'early', 'late', 'difference', 'p', 'conversations' ([early, late]), 'meaning'}. A diagnostic beside the
     verdict, not a test of it: the official verdict stays valid under drift, but then says only that the edge
     was on that side for part of the run."""
@@ -1217,12 +1229,13 @@ def drift(ys) -> dict:
         df = (ve + vl) ** 2 / ((ve * ve / (len(e) - 1) if ve else 0.0) + (vl * vl / (len(l) - 1) if vl else 0.0))
         p = min(1.0, 2 * t_sf(abs(diff) / math.sqrt(ve + vl), max(df, 1.0)))
     found = p < DRIFT_ALPHA
-    out.update(status='drift detected' if found else 'stable', early=round(me, 1), late=round(ml, 1),
+    out.update(status='drift detected' if found else 'no drift detected', early=round(me, 1), late=round(ml, 1),
                difference=round(diff, 1), p=round(p, 6), conversations=[len(e), len(l)],
                meaning=(f'the edge changed during play ({me:+.0f} bb/100 in the first {len(e)} conversations, '
                         f'{ml:+.0f} in the last {len(l)}): a verdict means a player was ahead for part of the run, '
                         f'not that the run\'s average favours it') if found else
-               'no change of the edge between early and late conversations was detected')
+               'no drift detected between early and late conversations; this is not evidence that the edge '
+               'held still (drift that reverses within each half, or after play stopped, is not seen)')
     return out
 
 
@@ -2009,7 +2022,8 @@ MODEL_DIAGNOSTICS = {'supported': 'diagnostics passed; distribution assumptions 
 # The adjudicator: the only function whose verdicts stop, record or decide anything.
 
 DIAGNOSTICS = {'supported': 'checks passed: the guarantee holds for any distribution of results within the '
-                            'game\'s bound, given independent conversations and the conditional null (see drift)',
+                            'game\'s bound, given independent conversations and the conditional null (see drift); reading '
+                            'it as the better model also needs each name to have served one stable model',
                'unsupported': 'checks failed: deals are repeated across conversations, so they are not shown to be '
                               'independent',
                'unknown': 'checks incomplete: some could not be made'}
@@ -2274,6 +2288,8 @@ def publication(v: dict, design: dict | None, a=None, b=None, official_run: bool
                             f'answered), and the design\'s strict identity policy counts only attested players')
     else:
         status = 'decided' if counts else 'decided_not_counted'
+        if v.get('verdict') in ('a', 'b'):
+            out['interpretation'] = STABLE_CONDITION
     if counts and unattested:
         out.update(identity_qualified=True,
                    identity_qualifier=f'{", ".join(unattested)} unattested: the backend did not report which model '
@@ -2716,6 +2732,7 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
             beats = [(q, vmap[frozenset((lead, q))]) for q in order if q != lead]
             qualified = [x for _, x in beats if x.get('identity_qualified')]
             leader = {'player': lead, 'component': ci, 'over': second, 'basis': 'sequential verdicts',
+                      'interpretation': STABLE_CONDITION,
                       'margin_bb100': round(float(point[idx[lead]] - point[idx[second]]), 1), 'ci95': lci,
                       'ci_kind': CI_FIXED, 'identity_qualified': bool(qualified),
                       'unattested': sorted({p for x in qualified for p in x.get('unattested') or []}),
@@ -2751,13 +2768,17 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
             elo_basis = 'posterior' if sd_boot is None or sd_boot <= sd else 'bootstrap'
             sd = max(sd, sd_boot or 0.0)
             rank, rng_, tied = decided[p]
+            direct = [x['edge'] if x['a'] == p else -x['edge'] for x in mine
+                      if p in (x['a'], x['b']) and x.get('edge') is not None]
             players.append({
                 'player': p, 'identity': info(p)['identity'], 'kind': info(p)['kind'], 'component': ci,
                 'identity_status': _status_of(p, pairings, 'identity_status'),
                 'identity_match': _status_of(p, pairings, 'identity_match'),
                 'audit_status': _status_of(p, pairings, 'audit_status'),
-                'strength': round(float(point[i]), 1), 'strength_se': se, 'strength_ci95': sci, 'df': df,
-                'ci_basis': basis, 'ci_kind': CI_FIXED, 'position': pos, 'rank': rank, 'rank_kind': 'decided' if rank else 'descriptive',
+                'strength': round(float(point[i]), 1), 'strength_kind': STRENGTH_KIND, 'strength_se': se,
+                'strength_ci95': sci, 'df': df,
+                'observed_edge': round(sum(direct) / len(direct), 1) if direct else None,
+                'observed_opponents': len(direct), 'ci_basis': basis, 'ci_kind': CI_FIXED, 'position': pos, 'rank': rank, 'rank_kind': 'decided' if rank else 'descriptive',
                 'rank_range': rng_, 'rank_tied_with': tied, 'in_fit': True,
                 'identity_resolved': bool(info(p).get('identity_resolved', identity_resolved(info(p)['identity']))),
                 'net_bb': round(tot[p]['net_bb'], 1), 'hands': 2 * tot[p]['deals'], 'deals': tot[p]['deals'],
@@ -2789,7 +2810,8 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
             'identity_status': _status_of(p, pairings, 'identity_status'),
             'identity_match': _status_of(p, pairings, 'identity_match'),
             'audit_status': _status_of(p, pairings, 'audit_status'),
-            'strength': None, 'strength_se': None, 'strength_ci95': None, 'df': None, 'ci_basis': None,
+            'strength': None, 'strength_kind': STRENGTH_KIND, 'strength_se': None, 'strength_ci95': None, 'df': None,
+            'observed_edge': None, 'observed_opponents': 0, 'ci_basis': None,
             'ci_kind': CI_FIXED, 'position': None, 'rank': None, 'rank_kind': 'descriptive', 'rank_range': None, 'rank_tied_with': [],
             'in_fit': False, 'identity_resolved': bool(info(p).get('identity_resolved', identity_resolved(info(p)['identity']))),
             'net_bb': round(tot[p]['net_bb'], 1), 'hands': 2 * tot[p]['deals'], 'deals': tot[p]['deals'],
@@ -2827,8 +2849,10 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
             'label': ADAPTATION_LABEL if adaptation else None,
             'hands': 2 * len(raw), 'rejected': list(rejected), 'judge_fingerprint': judge_fingerprint(),
             'fit': {'method': 'least squares on distinct duplicate deals: each distinct deal counts once, so a '
-                              'pairing weighs as much as it has deals, and a player\'s strength is against the '
-                              'opponents it actually met, as often as it met them',
+                              'pairing weighs as much as it has deals; the strengths are centred (they sum to zero '
+                              'in each group) and only their differences mean anything: a minus b is the edge the '
+                              'fit predicts for a against b',
+                    'strength': STRENGTH_KIND, 'observed': OBSERVED_KIND,
                     'residual': 'per pairing: the observed edge minus the edge the strengths imply, with a '
                                 'bootstrap standard error; additivity "warning" when it is beyond 2 of them',
                     'primary': 'the direct pairwise results; strengths summarise them'},
@@ -2859,7 +2883,8 @@ def _headline(lead, front, margin, ci95, pairings, pooled, outside=None, leader=
     """One line per group, from that group's own data only."""
     if lead:
         text = (f'{lead} is the decided leader: it won its pairing against every other player in this group, each '
-                f'an official verdict of the assumption-free test whose evidence stands today and whose checks passed.')
+                f'an official verdict of the assumption-free test whose evidence stands today and whose checks passed. '
+                f'It is {STABLE_CONDITION}.')
         if leader and leader.get('identity_qualified'):
             text += (f' Identity qualified: {", ".join(leader["unattested"])} unattested (the backend did not report '
                      f'which model answered).')
@@ -3481,14 +3506,96 @@ def verified_quiz_file(path) -> dict | None:
     return _QUIZ[key]
 
 
+MIXED = 'mixed'
+MATCH_ONLY = ('system_prompt_sha1', 'horizon')   # protocol settings a match adds to the player's own
+
+
+def _one(values):
+    vals = {json.dumps(v, sort_keys=True, default=str) for v in values}
+    return None if not vals else json.loads(vals.pop()) if len(vals) == 1 else MIXED
+
+
+def player_provenance(root) -> dict:
+    """{player id: {'identity', 'settings', 'code', 'cli_version', 'cli_sha256'}} from the match configs under
+    root: the player's own effective settings (its protocol without what the match adds), the code that plays it
+    (every recorded implementation file but the judge), and its CLI's version and file. A value that differs
+    between matches is 'mixed'; one never recorded is None."""
+    from .history import match_identity
+    seen = defaultdict(lambda: defaultdict(list))
+    for cfg_path in sorted(Path(root).rglob('config.json')):
+        cfg = _json(cfg_path) or {}
+        names = cfg.get('players') or []
+        for pid, spec in (cfg.get('specs') or {}).items():
+            got = seen[pid]
+            got['identity'].append(_base_identity(match_identity(cfg, pid)))
+            proto = cfg.get('protocol')
+            proto = proto.get(pid) if isinstance(proto, dict) and 'fingerprint' not in proto else proto
+            st = proto.get('settings') if isinstance(proto, dict) else None
+            got['settings'].append({k: v for k, v in st.items() if k not in MATCH_ONLY} if isinstance(st, dict) else None)
+            files = ((cfg.get('implementation') or {}).get('files') or {}) if isinstance(cfg.get('implementation'), dict) else {}
+            got['code'].append({k: v for k, v in files.items() if not k.endswith('/ratings.py')} or None)
+            if 'bot' in spec:
+                continue
+            seat = names.index(pid) if pid in names else None
+            eff = cfg.get('effective') or []
+            exe = (eff[seat] or {}).get('exe') if seat is not None and seat < len(eff) and isinstance(eff[seat], dict) else None
+            got['cli_version'].append((cfg.get('cli_versions') or {}).get(exe) if exe else None)
+            got['cli_sha256'].append(((cfg.get('cli_artifacts') or {}).get(exe) or {}).get('sha256') if exe else None)
+    return {pid: {k: _one(got[k]) for k in ('identity', 'settings', 'code', 'cli_version', 'cli_sha256')}
+            for pid, got in seen.items()}
+
+
+def _base_identity(ident: str) -> str:
+    return re.split(r'[#~!@]', str(ident), maxsplit=1)[0]
+
+
+def quiz_link(x: dict, doc: dict, player: dict | str | None) -> dict:
+    """Whether a quiz score may stand for a tournament player of the same model and reasoning level: 'attached'
+    only when its answers are eligible (or a bot's) and the player's own settings, the code they share and the CLI
+    (version and file) are recorded on both sides and the same; else 'model-level' (a separate assessment of the
+    same model and level, shown apart under its own name), with `differences` saying what differs or is
+    unrecorded."""
+    prov = player if isinstance(player, dict) else {'identity': player}
+    if (x.get('eligibility') or {}).get('status') == 'bot':
+        return {'status': 'attached', 'differences': []}
+    diffs = []
+    if (x.get('eligibility') or {}).get('status') != 'eligible':
+        diffs.append('its answers are not eligible')
+    proto = x.get('protocol') if isinstance(x.get('protocol'), dict) else {}
+    mine = (proto.get('settings') or {}).get('player') if isinstance(proto.get('settings'), dict) else proto.get('player')
+    theirs = prov.get('settings')
+    if mine is None or theirs is None:
+        diffs.append('player settings not recorded on both sides')
+    elif theirs == MIXED or json.dumps(mine, sort_keys=True, default=str) != json.dumps(theirs, sort_keys=True, default=str):
+        diffs.append('different player settings')
+    impl = x.get('implementation') if isinstance(x.get('implementation'), dict) else doc.get('implementation')
+    mine = {k: v for k, v in ((impl or {}).get('files') or {}).items() if not k.endswith('/ratings.py')} if isinstance(impl, dict) else {}
+    theirs = prov.get('code')
+    if not mine or not theirs:
+        diffs.append('code not recorded on both sides')
+    elif theirs == MIXED or any(mine[k] != theirs[k] for k in set(mine) & set(theirs)) or not set(mine) & set(theirs):
+        diffs.append('different code')
+    cli = x.get('cli') if isinstance(x.get('cli'), dict) else {}
+    for key, have, want in (('CLI version', x.get('cli_version') or cli.get('version'), prov.get('cli_version')),
+                            ('CLI file', cli.get('sha256'), prov.get('cli_sha256'))):
+        if have is None or want is None:
+            diffs.append(f'{key} not recorded on both sides')
+        elif want == MIXED or have != want:
+            diffs.append(f'different {key}')
+    return {'status': 'model-level' if diffs else 'attached', 'differences': diffs}
+
+
 def fundamentals(root, players: dict | None = None) -> dict | None:
     """Poker fundamentals, reported apart from match results: the quiz scores (quiz.py) found in quiz.json at
     root or one folder below it, as the judge re-derives them (`verified_quiz`: every answer re-verified from its
     raw output and bound to the scored option; a fallback or an unverified answer is never correct; accuracy over
     every spot asked, valid-answer accuracy apart), per category, each with its provenance (quiz version and
     spots, protocol, implementation, CLI version), `eligibility` and `attestation` (the games' policy). A score is
-    attached to a run's player (`players`: {player id: identity}) only when it is eligible (or a bot's) and the
-    model and reasoning level are the same; otherwise it stays under its quiz name, unattached. Scores are
+    attached to a run's player (`players`: {player id: provenance, as `player_provenance` gives it, or a bare
+    identity}) only when `quiz_link` finds it compatible: eligible (or a bot's), the same model and reasoning
+    level, and the same player settings, code and CLI. A score of the same model and level that fails that check
+    stays under its quiz name as a separately identified model-level assessment (`link`: {'status':
+    'model-level', 'player', 'differences'}), never silently the tournament player's. Scores are
     descriptive: an interval only where a category's spots are an independent sample of a defined population
     (`sampling: 'independent'`), never for a fixed set or a sample kept by answer quotas."""
     from .history import identity as ident_of, _base
@@ -3496,7 +3603,8 @@ def fundamentals(root, players: dict | None = None) -> dict | None:
     paths = [p for p in [root / 'quiz.json', *sorted(root.glob('*/quiz.json'))] if p.exists()]
     if not paths:
         return None
-    by_base = {_base(i): p for p, i in (players or {}).items()}
+    provs = {p: v if isinstance(v, dict) else {'identity': _base(v)} for p, v in (players or {}).items()}
+    by_base = {_base(str(v.get('identity'))): p for p, v in provs.items() if v.get('identity') not in (None, MIXED)}
     out, versions = {}, set()
     for path in paths:
         doc = verified_quiz_file(path)
@@ -3508,10 +3616,13 @@ def fundamentals(root, players: dict | None = None) -> dict | None:
                 continue
             base = _base(ident_of(pid, x.get('spec') or {}))
             elig = x['eligibility']
-            attach = elig['status'] in ('eligible', 'bot') and base in by_base
-            name = by_base[base] if attach else pid
+            same = by_base.get(base)
+            link = quiz_link(x, doc, provs[same]) if same else {'status': 'none', 'differences': []}
+            attach = link['status'] == 'attached'
+            name = same if attach else pid
             out[name] = {'quiz_player': pid, 'identity': base, 'attached': attach,
-                         'attached_by': 'model and reasoning level' if attach else None,
+                         'attached_by': 'model, reasoning level, player settings, code and CLI' if attach else None,
+                         'link': {**link, 'player': same},
                          **{k: x.get(k) for k in ('answered', 'correct', 'accuracy', 'valid_answers', 'valid_correct',
                                                   'valid_accuracy', 'fallbacks', 'unverified_answers', 'ev_loss_bb')},
                          'scored_category': x['scored_category'], 'categories': x['categories'],
@@ -3574,6 +3685,7 @@ def ratings(root, boot=BOOT, seed=0, session=SESSION) -> dict:
     r = rate(deals, boot, seed, session, meta=meta, plan=plan, playing=playing,
              recorded=_json(root / 'decisions.json') or {}, eligibility=eligibility, rejected=rejected, registration=reg)
     from .stats import LABELS, POSITIONS
+    prov = player_provenance(root)
     audit = {p: {**(s.get('audit') or {}), 'identity': s.get('identity'), 'fallbacks': s.get('fallbacks'),
                  'retries': s.get('retries'), 'served_models': s.get('served_models')} for p, s in stats.items()}
     return {**r, 'stats': stats, 'stat_labels': LABELS, 'position_labels': POSITIONS, 'audit': audit,
@@ -3581,11 +3693,13 @@ def ratings(root, boot=BOOT, seed=0, session=SESSION) -> dict:
             'populations': {'verdicts and strengths': 'verified results: duplicate deals both plays committed, '
                                                      'validated as pairs and replayed from their seeds',
                             'stats': 'the same verified results (stats.population per player)'},
-            'fundamentals': fundamentals(root, {p: m['identity'] for p, m in meta.items()})}
+            'fundamentals': fundamentals(root, {p: {**prov.get(p, {}), 'identity': _base_identity(m['identity'])}
+                                                for p, m in meta.items()})}
 
 
 VERDICT_TEXT = {
-    'a': '{a} is better (decided)', 'b': '{b} is better (decided)',
+    'a': '{a} won the pairing (decided; ' + STABLE_CONDITION + ')',
+    'b': '{b} won the pairing (decided; ' + STABLE_CONDITION + ')',
     'even': 'even (decided): the edge is within ±{e} bb/100',
     'open': 'undecided so far',
     'exhausted': 'undecided after every planned look (not evidence that they are equal)',
@@ -3604,14 +3718,16 @@ def table(r, labels=None) -> str:
     """The descriptive standings, one block per group, after the group's own one-line summary."""
     labels = labels or {}
     name = lambda p: labels.get(p, p)
-    lines = [f'Standings (descriptive): strength = {r["objective"]} against the average opponent in its group, '
-             f'with a fixed-time descriptive 95% interval from a bootstrap that keeps shared cards and conversations '
-             f'together (not adjusted for when play stopped).']
+    lines = [f'Standings (descriptive): strength = centred fitted strength in {r["objective"]} (zero-sum in each '
+             f'group; the difference of two strengths is the edge the fit predicts between them, not anyone\'s '
+             f'winnings against an average opponent), with a fixed-time descriptive 95% interval from a bootstrap '
+             f'that keeps shared cards and conversations together (not adjusted for when play stopped); observed = '
+             f'observed opponent-weighted winnings, the mean of its direct edges, one per opponent met.']
     for g in r.get('groups', []):
         if len(r['groups']) > 1:
             lines.append(f'\nGroup {g["id"] + 1}')
         lines.append(f'{"#":>3} {"rank":>5}  {"player":30} {"strength":>8} {"95% interval":>14} {"basis":>13} '
-                     f'{"net bb":>8} {"hands":>6}  {"session Elo (95%)":>20} {"W-T-L":>7}')
+                     f'{"observed":>8} {"net bb":>8} {"hands":>6}  {"session Elo (95%)":>20} {"W-T-L":>7}')
         for p in r['players']:
             if p['component'] != g['id']:
                 continue
@@ -3619,7 +3735,9 @@ def table(r, labels=None) -> str:
             elo = f'{p["session_elo"]} ({p["session_elo_ci95"][0]}–{p["session_elo_ci95"][1]})'
             q = ' *' if p['quarantined'] else ''
             lines.append(f'{p["position"]:>3} {rk:>5}  {name(p["player"]) + q:30} {p["strength"]:>+8.1f} '
-                         f'{_iv(p["strength_ci95"]):>14} {p["ci_basis"] or "—":>13} {p["net_bb"]:>+8.1f} {p["hands"]:>6}  '
+                         f'{_iv(p["strength_ci95"]):>14} {p["ci_basis"] or "—":>13} '
+                         f'{"—" if p.get("observed_edge") is None else format(p["observed_edge"], "+.1f"):>8} '
+                         f'{p["net_bb"]:>+8.1f} {p["hands"]:>6}  '
                          f'{elo:>20} {p["session_w"]}-{p["session_t"]}-{p["session_l"]:<3}')
         lines.append(_named(g['headline'], name, g['players']))
     out = [p for p in r['players'] if p['component'] is None]
@@ -3743,8 +3861,8 @@ def verdicts(r, labels=None) -> str:
                  f'registered judge {reg.get("judge_fingerprint") or "?"}: an assumption-free betting test, at most '
                  f'{d["alpha"]:.0%} chance of any false verdict over {d["n_pairings"]} '
                  f'pairing{"s" if d["n_pairings"] != 1 else ""} for any distribution of results, given independent '
-                 f'conversations whose expected edge, given the ones before, is at most the null value; drift is '
-                 f'flagged per pairing):']
+                 f'conversations whose expected edge, given the ones before, is at most the null value; a winner is '
+                 f'{STABLE_CONDITION}; drift is flagged per pairing when detected):']
     for m in sorted(r['pairings'], key=lambda m: (order[m['verdict']], m['a'], m['b'])):
         a, b = name(m['a']), name(m['b'])
         head = f'  {a} vs {b}: '
@@ -3828,7 +3946,7 @@ def verdicts(r, labels=None) -> str:
     elif not r.get('pooled') and (d or {}).get('registered', True):
         lines.append('Decided leader: ' + ('; '.join(f'{name(x["player"])} (won its pairing against every other '
                                                     f'player of its group: official verdicts, evidence verified today, '
-                                                    f'checks passed'
+                                                    f'checks passed; {STABLE_CONDITION}'
                                                     + (f'; identity qualified: {", ".join(name(p) for p in x["unattested"])} '
                                                        f'unattested' if x.get('identity_qualified') else '') + ')'
                                                     for x in lead) if lead else 'none.'))
@@ -3865,6 +3983,10 @@ def fundamentals_text(f, labels=None) -> str:
                     and st == 'eligible' else ''))
         if st not in ('eligible', 'bot'):
             head += f'; {st}, not attached to a player ({"; ".join(x["eligibility"]["reasons"][:2])})'
+        link = x.get('link') or {}
+        if link.get('status') == 'model-level':
+            head += (f'; a separate model-level assessment of {name(link["player"])}\'s model and reasoning level, '
+                     f'not that tournament player ({", ".join(link["differences"])})')
         lines.append(head)
         for c, y in (x.get('categories') or {}).items():
             if c == x.get('scored_category'):

@@ -49,8 +49,10 @@ Code, Codex, Antigravity), so a tournament costs nothing beyond the plans you al
   the stacks bound (±10,000 bb/100 at 100 big blinds): with no edge, the chance of any false verdict in a
   tournament stays under 5% at every look, for any distribution of results, given independent conversations.
   A **decided** rank or leader is built from those verdicts alone, and not from one reached while the edge
-  drifted. Everything else is **descriptive**: a player's strength (its edge in bb/100 against the average
-  opponent of its group, from a least-squares fit over duplicate deals) and its fixed-time 95% interval, the
+  drifted. Everything else is **descriptive**: a player's centred fitted strength (bb/100 from a least-squares
+  fit over duplicate deals, zero-sum in each group: the difference of two strengths is the edge the fit predicts
+  between them, not anyone's winnings against an average opponent), its observed opponent-weighted winnings (the
+  mean of its direct edges, one per opponent) and its fixed-time 95% interval, the
   order by points, session Elo, and every adaptation-track number. [docs/methodology.md](docs/methodology.md) has the method, the assumptions, power, cost and the limits.
 
 ## Quick start
@@ -153,7 +155,12 @@ zero, yet a is rightly called at conversation 536 (with 3 pairings). So every ve
 half of its conversations against the second, Welch t, flagged at p < 1%), and a decided verdict it flags is
 **decided with drift** (`decision_status: decided_with_drift`): shown in plain words ("x ahead early, behind
 late"), but counted toward no rank or leader until a confirmation run on a stable model snapshot decides it. Drift
-after a pairing stops is never seen, so pin dated model snapshots. Each verdict reports those checks, its bettors'
+after a pairing stops is never seen, so pin dated model snapshots. **What a win says about the models.** The
+error bound is about the conditional null; reading a decided win as "the better model" needs, in addition, that
+each name served one stable model for the whole run, so that each conversation's expected edge stayed the same. A
+drift check that passes reads *no drift detected*: it is not evidence of a stable model (drift that reverses within
+each half, or comes after play stopped, is not seen). The viewer, the CLI summary and every decided verdict
+(`interpretation`) say so beside the winner. Each verdict reports those checks, its bettors'
 capital against the bar and its **official interval** (`ci_official`): the anytime-valid interval for the edge,
 at level 1 − alpha per pairing, valid whenever play stopped. Every other range (a pairing's t interval, strengths,
 the front runner's margin, session Elo) is marked `ci_kind: 'fixed-time descriptive'`: it ignores that play
@@ -281,9 +288,10 @@ stated-range decisions); `ratings` re-derives every answer itself (`ratings.veri
 against its raw output, the accepted reply replayed in the spot's engine position, the spot key and the CLI
 file checked, whatever the record's labels say), recounts the scores from those answers (a fallback or an answer
 it cannot re-derive is never correct, valid-answer accuracy apart), attaches a score to a run's player only
-with its provenance (quiz version, protocol, implementation, CLI version and file) and when its answers are
+with its provenance (quiz version, protocol, implementation, CLI version and file), when its answers are
 eligible under the same attestation policy as the games (attested, or unattested from a backend the policy
-allows, such as Codex; a mismatch never), and prints them as their own section, never mixed into the standings.
+allows, such as Codex; a mismatch never) and when the player's settings, code and CLI match the tournament
+player's (`ratings.quiz_link`; otherwise the score is shown apart as a model-level assessment, with what differs), and prints them as their own section, never mixed into the standings.
 The scores are descriptive counts: a category gets a binomial interval only if its spots were sampled
 independently from a defined population (`sampling: independent`), never for the fixed basics or spots kept by
 answer quotas.
@@ -414,8 +422,9 @@ registration says so with its reason): nothing in it is decided, and any sample-
   - **How this is judged**, folded: the test and its assumptions, the target edge ("Planned to detect a 50 bb/100
     edge: ~N deals per matchup; the matchups have M", or *retrospective*), power under the optimistic, moderate and
     pessimistic dependence assumptions, the words used on the page, and the ratings' notes. Caveats live here once.
-  - **Standings**, per group: strength in bb/100 against the average opponent with its descriptive range on a shared
-    axis. With a cohort picked, the deal count is the cohort's own ("150 duplicate deals in this group"), with the
+  - **Standings**, per group: the centred fitted strength in bb/100 (differences predict matchup edges) with its
+    descriptive range on a shared axis, and beside it the observed opponent-weighted winnings (the mean of the
+    player's direct edges, one per opponent). With a cohort picked, the deal count is the cohort's own ("150 duplicate deals in this group"), with the
     whole run's or archive's total beside it, labelled as such.
     A range that rests on blocks of deals inside single conversations is marked *within conversations* at the number
     (hatched on the axis): it leaves out how much fresh matches differ. The **decided order** comes first: decided

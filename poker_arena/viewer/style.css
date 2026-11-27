@@ -232,7 +232,7 @@ small { font-size: 11.5px; }
 .hero-body p b { color: var(--ink); }
 
 /* ---- standings list ------------------------------------------------------------------------------ */
-.board-list { --cols: 44px minmax(180px, 1.5fr) 92px minmax(160px, 1.6fr) 96px 120px; }
+.board-list { --cols: 44px minmax(180px, 1.5fr) 112px minmax(150px, 1.5fr) 92px 96px 120px; }
 .board-head, .brow { display: grid; grid-template-columns: var(--cols); align-items: center; column-gap: 16px; padding: 12px 18px; }
 .board-head { font-size: 10.5px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: rgba(var(--gold-rgb), .75); border-bottom: 1px solid var(--line); padding-top: 12px; padding-bottom: 10px; }
 .board-head [title] { cursor: help; }
@@ -559,7 +559,7 @@ details.split summary { cursor: pointer; padding: 10px 16px; font-weight: 600; c
 /* ---- round 4: provisional order, the matchup list by pairing → round → replicate, one replay timeline -- */
 .layout { display: grid; grid-template-columns: 290px minmax(0, 1fr); gap: 28px; align-items: start; }
 .mbody { min-width: 0; }
-.board-list.unranked { --cols: minmax(180px, 1.5fr) 92px minmax(160px, 1.6fr) 96px 120px; }
+.board-list.unranked { --cols: minmax(180px, 1.5fr) 112px minmax(150px, 1.5fr) 92px 96px 120px; }
 .rank.prov { color: var(--ink-3); opacity: .6; font-size: 16px; }
 @media (max-width: 980px) { .board-list.unranked { --cols: minmax(0, 1fr) 76px minmax(110px, 1fr); } }
 @media (max-width: 420px) { .board-list.unranked { --cols: minmax(0, 1fr) 64px; } }
@@ -819,6 +819,10 @@ nav a[hidden] { display: none; }
 .o-num.secondary { opacity: .72; }
 .o-num.secondary > b { font-size: 20px; }
 .o-fit-k { display: block; font-size: 10px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: #f5c36b; margin-bottom: 3px; }
+.o-num:not(.secondary) .o-fit-k { color: var(--ink-3); letter-spacing: .08em; }
+.o-obs { font-size: 11.5px; color: var(--ink-2); margin-top: 4px; cursor: help; }
+.o-obs b { font-weight: 700; }
+.brow .obs { font-weight: 650; cursor: help; }
 .o-direct { grid-area: direct; list-style: none; margin: 8px 0 2px; padding: 0; display: grid; gap: 4px; }
 .o-direct a { display: grid; grid-template-columns: auto auto auto minmax(0, 1fr) auto auto; align-items: center; gap: 8px; padding: 6px 10px;
   border-radius: 9px; background: rgba(0, 0, 0, .2); border: 1px solid var(--line-soft); font-size: 13.5px; }
@@ -1291,3 +1295,27 @@ details.fold[open] .fold-mark::before { content: "−"; }
 .verdict.model, .verdict.drift { white-space: normal; max-width: 100%; line-height: 1.35; }
 .vcell { min-width: 0; }
 .ci-line { display: block; white-space: normal; line-height: 1.35; }
+
+/* ---- round 9: the result and the matchups first on a phone, the method folded; names never cut ------ */
+.track-note > summary { display: none; }
+.track-note.adaptation[open] { display: flex; }
+@media (max-width: 860px) {
+  .prow > .duo-names, .prow.ref-row > .player, .prow > .edge { grid-column: 1 / -1; }
+  .prow > .edge { text-align: left; white-space: normal; }
+  .prow > .edge small { display: inline; margin-right: 6px; }
+  .prow > .edge > b { margin-right: 4px; }
+  .prow > .edge .ci-line { display: block; }
+  .prow .player .nm { white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
+  .o-obs { white-space: normal; max-width: 160px; margin-left: auto; }
+  .track-note > summary { display: list-item; cursor: pointer; font-weight: 650; color: var(--ink); font-size: 12.5px; }
+  .track-note[open] > summary { margin-bottom: 6px; }
+  .track-note.adaptation, .track-note.adaptation[open] { display: block; }
+  .track-note.adaptation .tn-k { display: block; margin-bottom: 6px; }
+}
+@media (max-width: 600px) {
+  .top-stack, .results-stack { display: flex; flex-direction: column; }
+  .top-stack > .outcomes { order: -1; margin-bottom: 14px; }
+  .results-stack > .rs-pairings { order: -1; }
+  .results-stack > .rs-plan { order: 2; margin-top: 4px; }
+  .intro .lede { font-size: 14px; }
+}

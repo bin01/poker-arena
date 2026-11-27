@@ -377,7 +377,7 @@ class TestFundamentals(unittest.TestCase):
         """R6-#4, #5, R7-#3, #5: scores are recounted from the answers as the judge re-derives them (a fallback
         never counts, even where folding was best; valid-answer accuracy apart), carry their provenance, attach to
         a run's player only when eligible, and are counts, not population intervals, unless sampled independently."""
-        from test_fundamentals import CALL, CALL_B, FOLD_B, SHOVE, answer, player, quiz_doc, reply
+        from test_fundamentals import CALL, CALL_B, FOLD_B, SHOVE, answer, player, quiz_doc, reply, tournament
         fold_b, call_b = FOLD_B, CALL_B
         miss = answer(fold_b, None, 'fold', text='no JSON here', error='Your reply was not a JSON object.')
         p = player([answer(SHOVE, 'call', 'call'), miss, answer(call_b, 'fold', 'fold'), answer(CALL, 'call', 'call')])
@@ -387,13 +387,12 @@ class TestFundamentals(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             (root / 'quiz.json').write_text(json.dumps(doc))
-            f = R.fundamentals(root, {'m1': 'claude:claude-x-1:high#abcd1234@ffff0000',
-                                      'm2': 'claude:claude-z-1:high#abcd1234@ffff0000'})
+            f = R.fundamentals(root, {'m1': tournament(), 'm2': tournament(identity='claude:claude-z-1:high')})
             bad = json.loads(json.dumps(doc))
             text = reply('fold')
             bad['players']['opus']['answers'][0]['calls'][0].update(output=text)
             (root / 'quiz.json').write_text(json.dumps(bad))
-            g = R.fundamentals(root, {'m1': 'claude:claude-x-1:high#abcd1234@ffff0000'})
+            g = R.fundamentals(root, {'m1': tournament()})
         self.assertEqual(f['label'], 'poker fundamentals')
         x = f['players']['m1']
         self.assertEqual((x['quiz_player'], x['attached'], x['correct'], x['answered'], x['fallbacks']), ('opus', True, 1, 3, 1))

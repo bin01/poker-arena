@@ -277,8 +277,9 @@ class HoldemHand(Episode):
         entry['pot'] = self.pot
         self.history.append(entry)
         self._emit('action', entry)
+        street = self.street
         self._advance(seat)
-        entry['to_act'] = None if self.done else self.to_act
+        entry['to_act'] = None if self.done or self.street != street else self.to_act
         return None
 
     # ---- flow --------------------------------------------------------------------------------
@@ -306,20 +307,20 @@ class HoldemHand(Episode):
                 return self._showdown()
             return self._runout()
         self.street += 1
-        self._deal_board()
         self.street_bet = [0] * self.n
         self.acted = [False] * self.n
         self.can_raise = [True] * self.n
         self.min_raise = self.bb
         self.to_act = self._next_active(self.button)  # first seat left of the button (heads-up: the big blind)
+        self._deal_board(self.to_act)
 
-    def _deal_board(self):
+    def _deal_board(self, to_act=None):
         count = {1: 3, 2: 4, 3: 5}[self.street]
         new = self.deck_board[len(self.board):count]
         self.board = self.deck_board[:count]
         self.made_by_street[STREETS[self.street]] = self.made_hands()
         self._emit('board', {'street': STREETS[self.street], 'cards': new, 'board': list(self.board),
-                             'omniscient': {'made_hand': self.made_by_street[STREETS[self.street]]}})
+                             'omniscient': {'made_hand': self.made_by_street[STREETS[self.street]]}, 'to_act': to_act})
 
     def _runout(self):
         if len(self._in_hand()) > 1:
@@ -529,6 +530,8 @@ def verify_hand(game: Holdem, seed, button, recorded_hand: dict, events: list | 
         want = {x: v for x, v in a.items() if x not in VERIFY_IGNORE}
         got = {x: v for x, v in _plain(ep.history[-1]).items()
                if x not in VERIFY_IGNORE and (x in want or x not in DERIVED)}
+        if got.get('to_act', 0) is None and not ep.done and want.get('to_act') == ep.to_act:
+            got['to_act'] = ep.to_act   # older logs named the next street's first actor on a street's closing action
         if got != want:
             diff = sorted(x for x in set(got) | set(want) if got.get(x) != want.get(x))
             errors.append(f'action {k}: recorded {", ".join(f"{x}={want.get(x)!r}" for x in diff)}; '
@@ -565,6 +568,10 @@ def _verify_events(ep: HoldemHand, evs: list) -> list[str]:
             g = {x: v for x, v in g.items() if x not in VERIFY_IGNORE}
             w = {x: v for x, v in w.items() if x not in VERIFY_IGNORE}
         w = {x: v for x, v in w.items() if x in g or x not in DERIVED}
+        nxt = engine[k + 1] if k + 1 < len(engine) else None
+        if (want['kind'] == 'action' and w.get('to_act', 0) is None and nxt and nxt['kind'] == 'board'
+                and g.get('to_act') is not None and g.get('to_act') == nxt['data'].get('to_act')):
+            w['to_act'] = g['to_act']
         if g != w:
             diff = sorted(x for x in set(g) | set(w) if g.get(x) != w.get(x))
             out.append(f'event {k} ({want["kind"]}): {", ".join(diff)} differ from the replay')

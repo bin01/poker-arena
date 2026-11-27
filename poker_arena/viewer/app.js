@@ -318,6 +318,8 @@ function intro(rt) {
 }
 
 const fmtStrength = v => v == null ? '–' : signed(v, 0);
+const STRENGTH_TIP = 'Centred fitted strength (bb/100): one least-squares fit over every deal, summing to zero in the group. The difference between two players\' strengths is the edge the fit predicts when they meet; it is not a player\'s winnings against an average opponent.';
+const OBSERVED_TIP = 'Observed opponent-weighted winnings (bb/100): the average of this player\'s direct matchup edges, one per opponent it met, each opponent weighted equally.';
 const ciText = ci => ci ? `${signed(ci[0], 0)} to ${signed(ci[1], 0)}` : '';
 const levelPct = x => `${Math.round(x * 1000) / 10}%`;
 // An ordinary interval, said as what it is: fixed-time and descriptive, never a 95% guarantee here.
@@ -327,7 +329,7 @@ const officialRange = (p, up = true) => {
   const o = Core.officialInterval(p);
   if (!o) return null;
   const ci = up ? [o.lo, o.hi] : [-o.hi, -o.lo];
-  return { ci, html: `<span class="ci-official" title="Anytime-valid: it holds at every check whenever play stops, at the level that controls the chance of any wrong verdict across the matchups${o.level ? ` (${levelPct(o.level)})` : ''}, if conversations are independent.">${ciText(ci)} <i>anytime-valid${o.level ? ` ${levelPct(o.level)}` : ''}</i></span>` };
+  return { ci, html: `<span class="ci-official" title="Anytime-valid: it holds at every check whenever play stops, at the level that controls the chance of any wrong verdict across the matchups${o.level ? ` (${levelPct(o.level)})` : ''}, if conversations are independent and the edge holds still.">${ciText(ci)} <i>anytime-valid${o.level ? ` ${levelPct(o.level)}` : ''}</i></span>` };
 };
 // A chip when a headline rests on a model whose identity its tool never confirmed.
 const identityChip = (rt, ids, given = false) => {
@@ -345,7 +347,7 @@ const basisTag = x => {
 const chip = (text, tone = '', tip = '') => `<span class="chip ${tone}" ${tip ? `title="${esc(tip)}"` : ''}>${text}</span>`;
 // What a verdict rests on, as two things kept apart: the method (which test) and the evidence (whether the checks it
 // needs hold here). A failed or unmade check stays visible whatever the method.
-const FREE_TIP = 'An anytime-valid test for bounded results: no assumption about the shape of the results, only that conversations (match pairs) are independent.';
+const FREE_TIP = 'An anytime-valid test for bounded results: no assumption about the shape of the results, only that conversations (match pairs) are independent. A win names the better model only if each name served one unchanged model for the whole run.';
 function assumeChip(a, { compact = false } = {}) {
   if (!a) return '';
   if (a.method === 'free') {
@@ -412,7 +414,7 @@ function outcomeRow(rt, g, multi, first = true) {
     kicker = '<span class="decided-badge">Decided</span>leader';
     tone = 'decided';
     why = `Decided: it beat ${others} under the planned test. ${g.leader_assumption === 'free'
-      ? 'The test assumes nothing about the shape of the results, only that conversations are independent.'
+      ? `The test assumes nothing about the shape of the results, only that conversations are independent. ${Core.STABLE_NOTE}`
       : g.leader_assumption === 'supported' ? 'The diagnostics passed; the distribution assumptions remain unverified.' : 'Whether the test\'s assumptions hold is not checked.'}`;
   } else if (descriptive) {
     kicker = misfit ? 'Ahead on points, head to head' : 'Ahead on points';
@@ -444,10 +446,11 @@ function outcomeRow(rt, g, multi, first = true) {
   if (wrong) facts.push(chip(`wrong model on ${plural(wrong, 'call')}`, 'bad', 'A backend reported a different model from the one asked for: see the audit.'));
   const card = g.leader && tone === 'decided' ? '<span class="mini-card" aria-hidden="true"><b>A</b><i>♠</i></span>'
     : '<span class="mini-card back" aria-hidden="true"></span>';
-  const strength = p ? `<b class="${g.leader ? '' : cls(p.strength)}">${fmtStrength(p.strength)}</b><small title="Big blinds won per 100 hands, against the average opponent in its group">bb/100</small>` : '';
+  const strength = p ? `<b class="${g.leader ? '' : cls(p.strength)}" title="${esc(STRENGTH_TIP)}">${fmtStrength(p.strength)}</b><small>bb/100</small>` : '';
+  const observed = p && p.observed_edge != null ? `<div class="o-obs" title="${esc(OBSERVED_TIP)}">observed <b class="${cls(p.observed_edge)}">${signed(p.observed_edge, 0)}</b> vs ${p.observed_opponents === 1 ? 'its opponent' : `${p.observed_opponents} opponents, averaged`}</div>` : '';
   const num = !p ? '' : misfit
-    ? `<div class="o-num secondary" title="One number per player does not describe these results: read the direct results"><span class="o-fit-k">Fitted strength, poor fit</span>${strength}</div>`
-    : `<div class="o-num">${strength}<div class="o-ci">${p.strength_ci95 ? `range ${descRange(p.strength_ci95, p)}` : 'no range yet'} ${basisTag(p)}</div></div>`;
+    ? `<div class="o-num secondary" title="One number per player does not describe these results: read the direct results"><span class="o-fit-k">Fitted strength, poor fit</span>${strength}${observed}</div>`
+    : `<div class="o-num"><span class="o-fit-k" title="${esc(STRENGTH_TIP)}">centred fitted strength</span>${strength}<div class="o-ci">${p.strength_ci95 ? `range ${descRange(p.strength_ci95, p)}` : 'no range yet'} ${basisTag(p)}</div>${observed}</div>`;
   const direct = misfit ? directResults(g) : '';
   return `<div class="outcome-row ${tone} ${misfit ? 'has-direct' : ''}">
     ${card}
@@ -518,7 +521,8 @@ function planPanel(rt) {
     const t = officialFree(rt);
     test = `Each matchup is checked after every ${d.round_deals} deals, at most ${plural(d.max_rounds, 'time')}${d.min_conversations ? `, never before ${plural(d.min_conversations, 'independent conversation')} (match pairs)` : ''}.
     The <b>official verdict</b> comes from an anytime-valid sequential test for bounded results${t.name ? ` (${esc(t.name)})` : ''}: at every check, the chance of any wrong verdict across all
-    ${plural(d.n_pairings || rt.pairings.length, 'matchup')} is at most ${Math.round((d.alpha || 0.05) * 100)}%, assuming only that conversations are independent, and nothing about the shape of the results${t.bound != null ? `; each conversation's result is bounded by ±${approx(t.bound)} bb/100` : ''}.
+    ${plural(d.n_pairings || rt.pairings.length, 'matchup')} is at most ${Math.round((d.alpha || 0.05) * 100)}%, assuming that conversations are independent and that with no edge each one's expected edge, given the ones before, is zero or less, and nothing about the shape of the results${t.bound != null ? `; each conversation's result is bounded by ±${approx(t.bound)} bb/100` : ''}.
+    A win says which model is better only if each name served one unchanged model for the whole run (pin dated model snapshots where the provider offers them). The drift check compares early and late conversations: when it finds nothing, that reads <b>no drift detected</b>, not proof that the models held still.
     The earlier <b>model-based</b> test (whose error rate rests on distribution assumptions) is still shown beside a verdict, labelled secondary; it never decides.`;
   }
   else if (d.round_deals) test = `Each matchup is checked after every ${d.round_deals} deals, at most ${plural(d.max_rounds, 'time')}${d.min_conversations ? `, never before ${plural(d.min_conversations, 'independent conversation')} (match pairs)` : ''}.
@@ -531,7 +535,7 @@ function planPanel(rt) {
     : rt.track === 'adaptation' ? 'Adaptation track · model-based test · exploratory, not official'
     : v ? 'Test plan void: described, never decided'
     : rt.unregistered ? 'No recorded test plan: described, never decided'
-    : d.round_deals && officialFree(rt) ? `Assumption-free sequential test · ${Math.round((d.alpha || 0.05) * 100)}% error bound if conversations are independent`
+    : d.round_deals && officialFree(rt) ? `Assumption-free sequential test · ${Math.round((d.alpha || 0.05) * 100)}% error bound if conversations are independent and each model stays the same`
     : d.round_deals ? `Planned sequential test · ${Math.round((d.alpha || 0.05) * 100)}% error bound under stated assumptions` : 'How results are decided';
   const notes = (rt.notes || []).map(n => `<li>${esc(n)}</li>`).join('');
   return `<details class="plan-panel" ${open ? 'open' : ''}><summary><span class="pp-title">How this is judged</span><span class="pp-sum">${summary}</span></summary>
@@ -540,10 +544,12 @@ function planPanel(rt) {
       ${target}
       ${populationLine(rt) ? `<p class="pop-line">${populationLine(rt)}</p>` : ''}
       <dl>
-        <dt>Decided</dt><dd>A result of the planned test above. Only these carry the badge.</dd>
+        <dt>Decided</dt><dd>A result of the planned test above. Only these carry the badge. A decided win names the better model only if each name served one unchanged model for the whole run (its expected edge stayed the same); the drift check below can catch a change, but finding none does not prove there was none.</dd>
         <dt>Ahead on points</dt><dd>Everything else: the current estimate, recomputed as hands finish. It shows who leads, not who is better.</dd>
-        <dt>Strength</dt><dd>bb/100: big blinds won per 100 hands against the average opponent in its group, from one least-squares fit over every deal
-          (matchups with more deals weigh more); <b>0</b> is average. Where a matchup disagrees with what the strengths predict, the matchup's own result is the evidence.</dd>
+        <dt>Fitted strength</dt><dd>Centred fitted strength, in bb/100, from one least-squares fit over every deal (matchups with more deals weigh more).
+          The strengths sum to zero in each group, so only differences mean anything: the gap between two players is the edge the fit predicts when they meet.
+          It is not a player's winnings against an average opponent. Where a matchup disagrees with what the strengths predict, the matchup's own result is the evidence.</dd>
+        <dt>Observed</dt><dd>Observed opponent-weighted winnings: the average of a player's direct matchup edges in bb/100, one per opponent it met, each opponent weighted equally.</dd>
         <dt>Ranges</dt><dd>An official matchup's first range is the test's <b>anytime-valid</b> interval: it holds whenever play stops, so it is the one to read.
           Every other range (strengths, the reference, ordinary matchup ranges) is <b>fixed-time, descriptive</b>: computed as if the number of deals had been fixed,
           while play stops on the results and the front runner is picked by them, so it carries no 95% guarantee.
@@ -661,14 +667,14 @@ function trackNote(rt) {
   const set = trackSet(state.run);
   if (rt.track === 'adaptation') {
     const d = rt.design || {};
-    return `<div class="track-note adaptation" role="note"><span class="tn-k">${chip('adaptation · exploratory · not official', 'warn')}</span>
+    return `<details class="track-note adaptation" role="note" ${phone() ? '' : 'open'}><summary>Exploratory track: models remember the session; nothing here is official</summary><span class="tn-k">${chip('adaptation · exploratory · not official', 'warn')}</span>
       <p>Here the same players keep one conversation for ${d.round_deals ? plural(d.round_deals, 'deal') : 'many deals'}, so a model remembers earlier hands and can adapt to its opponent.
       Its readings come from a <b>model-based</b> test, which assumes the results follow a family of shapes it was calibrated for; its error rate is not established here, so every result is <b>exploratory</b>: a lead to look into, not a finding.
-      Nothing here is official: it never ranks anyone or names a leader. ${set.some(r => r.track === 'official') ? `The <a href="${runLink(siblingTrack(state.run, 'official').run)}"><u>official standings</u></a> use a fresh conversation for every deal and a test that assumes nothing about the shape of the results.` : ''}</p></div>`;
+      Nothing here is official: it never ranks anyone or names a leader. ${set.some(r => r.track === 'official') ? `The <a href="${runLink(siblingTrack(state.run, 'official').run)}"><u>official standings</u></a> use a fresh conversation for every deal and a test that assumes nothing about the shape of the results (it needs independent conversations and models that stay the same).` : ''}</p></details>`;
   }
   if (set.length < 2) return '';
-  return `<div class="track-note" role="note"><p>Two tracks, same players and cards. <b>Official</b>: a fresh conversation for every deal, judged by a test that assumes nothing about the shape of the results; only it decides ranks and leaders.
-    <b>Adaptation</b>: long conversations, so models remember and adapt to the opponent; read by a model-based test, exploratory and never official.</p></div>`;
+  return `<details class="track-note" role="note" ${phone() ? '' : 'open'}><summary>Official track: decides ranks · the adaptation track is exploratory</summary><p>Two tracks, same players and cards. <b>Official</b>: a fresh conversation for every deal, judged by a test that assumes nothing about the shape of the results (it needs independent conversations and models that stay the same); only it decides ranks and leaders.
+    <b>Adaptation</b>: long conversations, so models remember and adapt to the opponent; read by a model-based test, exploratory and never official.</p></details>`;
 }
 // On the official page: the adaptation track's own standings, compact and clearly not official.
 function adaptationTeaser(rt) {
@@ -691,7 +697,7 @@ function adaptationTeaser(rt) {
   const ps = at.players.filter(p => p.in_fit).sort((x, y) => (y.strength ?? -1e9) - (x.strength ?? -1e9));
   const mbl = (at.groups || []).map(g => g.model_based_leader).filter(Boolean);
   const rows = ps.map((p, i) => `<div class="ad-row"><span class="pos-n">${i + 1}</span>${player(p.player, '', { details: false })}
-    <b class="${cls(p.strength)}">${fmtStrength(p.strength)}<small> bb/100</small></b><small class="soft">${p.strength_ci95 ? ciText(p.strength_ci95) : ''}</small></div>`).join('');
+    <b class="${cls(p.strength)}" title="${esc(STRENGTH_TIP)}">${fmtStrength(p.strength)}<small> bb/100</small></b><small class="soft">${p.strength_ci95 ? ciText(p.strength_ci95) : ''}</small></div>`).join('');
   const called = at.pairings.filter(x => ['a', 'b', 'even'].includes(x.verdict)).map(x => {
     const s = verdictSides(x);
     return `<li>${s ? `${plain(s.winner)} ahead of ${plain(s.loser)}` : `${plain(x.a)} and ${plain(x.b)} close`} <span class="soft">(${signed(Math.abs(x.edge ?? 0), 0)} bb/100)</span></li>`;
@@ -741,21 +747,21 @@ async function renderBoard(query) {
   const cohort = all.length > 1 ? all.find(c => c.key === query?.get('c')) || all[0] : null;
   const view = cohort ? cohortView(rt, cohort) : rt;
   rt.track = raw.track || r?.track || 'official';
-  let html = runHead(r, rt) + trackBar(state.run) + staleNote(raw) + trackNote(rt) + intro(view) + (cohort ? cohortBar(all, cohort) : '');
+  let html = runHead(r, rt) + trackBar(state.run) + staleNote(raw) + '<div class="top-stack">' + trackNote(rt) + intro(view) + (cohort ? cohortBar(all, cohort) : '');
   const waiting = cohort && cohort !== all[0] ? [] : rt.roster.filter(x => !rt.players.some(p => p.player === x.player));
   if (!rt.players.length) {
     html += `<div class="card-box empty"><div class="big-suits">♠ ♥ ♦ ♣</div><h2>The cards are in the air</h2>
       <p>A deal counts once both of its plays are finished. ${state.index.some(m => m.started) ? `Watch the first ones on the <a href="${runLink(state.run, '/m')}"><u>games</u></a> page.` : ''}</p>
       ${waiting.length ? `<div class="waiting-list">${waiting.map(x => player(x.player, `<div class="small soft">${x.status === 'playing' ? 'playing its first deals' : 'waiting to play'}</div>`)).join('')}</div>` : ''}</div>`;
-    $app.innerHTML = html + planPanel(rt);
+    $app.innerHTML = html + '</div>' + planPanel(rt);
     bindBoard();
     return;
   }
-  html += outcomes(view);
+  html += outcomes(view) + '</div>';
   html += referenceSection(view, rt);
-  html += `<div class="under-outcome">${planPanel(rt)}</div>`;
-  html += standings(view, waiting);
-  html += pairingsSection(view);
+  html += `<div class="results-stack"><div class="under-outcome rs-plan">${planPanel(rt)}</div>`;
+  html += `<div class="rs-standings">${standings(view, waiting)}</div>`;
+  html += `<div class="rs-pairings">${pairingsSection(view)}</div></div>`;
   html += adaptationTeaser(rt);
   if (r?.quiz) html += '<div class="quiz-slot"></div>';
   html += `<div class="deep-head"><span>More detail</span><small>the full grid, play style and audit, folded away</small></div>`;
@@ -930,11 +936,11 @@ function standings(rt, waiting) {
       : ` · ${plural(rt.deals, 'duplicate deal')}`;
     out += section(title, `${aside}${multi ? '' : count}${misfit}`,
       `${control}<div class="board-list ${ranked ? '' : 'unranked'}"><div class="board-head">${ranked ? '<span title="Decided rank"><span class="hide-xs">Rank</span><span class="show-xs">#</span></span>' : ''}<span>${ranked ? 'Player' : 'Player, by points'}</span>
-         <span class="r" title="Big blinds won per 100 hands against the average opponent in this group">Strength</span>
+         <span class="r" title="${esc(STRENGTH_TIP)}">Fitted strength</span>
          <span class="axis-head"><span>${signed(-ax.lim, 0)}</span><span>0</span><span>${signed(ax.lim, 0)}</span></span>
-         <span class="r hide-sm">Net</span><span class="r hide-sm" title="Share of 10-deal sessions won (secondary; not used to rank)">Sessions</span></div>
+         <span class="r hide-sm" title="${esc(OBSERVED_TIP)}">Observed</span><span class="r hide-sm">Net</span><span class="r hide-sm" title="Share of 10-deal sessions won (secondary; not used to rank)">Sessions</span></div>
        ${rows}${extra}</div>`,
-      points && ranked ? 'Sorted by fitted strength, which describes results and decides nothing: a numeral is a rank the matchups decided.' : '');
+      `${points && ranked ? 'Sorted by fitted strength, which describes results and decides nothing: a numeral is a rank the matchups decided. ' : ''}Fitted strengths are centred: the difference of two predicts their matchup edge. Observed is what each won: the average of its matchup edges, one per opponent.`);
   });
   if (!out && waiting.length) out = section('Standings', '', `<div class="board-list unranked">${waitingRows(waiting, false)}</div>`);
   const out_ = rt.players.filter(p => !p.in_fit);
@@ -942,7 +948,7 @@ function standings(rt, waiting) {
     out += section(rt.cohort?.kind === 'history' ? 'Earlier variants' : 'Not in the standings', 'played, but left out of the fit', `<div class="board-list unranked left-out">${out_.map(p => `<div class="brow quarantined">
       ${player(p.player, `<div class="small soft why-out">${esc(p.unrated_reason || p.quarantine_reason || 'none of its opponents is rated')}</div>`)}
       <span class="r strength soft">${p.hands ? `<small>${plural(p.hands, 'hand')}</small>` : ''}</span><span class="axis"></span>
-      <span class="r hide-sm soft">${p.net_bb != null ? signed(p.net_bb, 0) + ' bb' : ''}</span><span class="hide-sm"></span></div>`).join('')}</div>`,
+      <span class="hide-sm"></span><span class="r hide-sm soft">${p.net_bb != null ? signed(p.net_bb, 0) + ' bb' : ''}</span><span class="hide-sm"></span></div>`).join('')}</div>`,
       'Left out when its exact model or reasoning level is unknown (its results could mix more than one model), or when it only met players who are left out.');
   }
   return out;
@@ -968,7 +974,8 @@ function standingRow(rt, g, p, ax, ranked, inBlock = false) {
   const idf = identityFlag(rt, p);
   if (idf) notes.push(idf);
   if (!inBlock && tied.length && tied.length < g.members.length - 1) notes.push(`<span class="small soft">difference with ${tied.map(plain).join(', ')} unresolved</span>`);
-  const mob = `<div class="mob-line small soft">${p.net_bb != null ? `<span class="${cls(p.net_bb)}">${signed(p.net_bb, 0)} bb</span> · ` : ''}${plural(p.hands || 0, 'hand')}</div>`;
+  const obs = p.observed_edge != null ? signed(p.observed_edge, 0) : null;
+  const mob = `<div class="mob-line small soft">${obs != null ? `<span class="${cls(p.observed_edge)}" title="${esc(OBSERVED_TIP)}">${obs} observed</span> · ` : ''}${p.net_bb != null ? `<span class="${cls(p.net_bb)}">${signed(p.net_bb, 0)} bb</span> · ` : ''}${plural(p.hands || 0, 'hand')}</div>`;
   const leader = g.leader === p.player;
   const b = Core.basisOf(p);
   const whisker = `<div class="whisker ${b ? b.key : ''}" title="${ci ? `Range ${ciText(ci)} bb/100, ${esc(Core.ciKind(p))}${b ? `, ${b.short}` : ''}` : 'no range yet: too few deals'}">
@@ -982,6 +989,7 @@ function standingRow(rt, g, p, ax, ranked, inBlock = false) {
     ${player(p.player, `${notes.length ? `<div class="row-notes">${notes.join(' ')}</div>` : ''}${mob}`)}
     <span class="r strength"><b>${fmtStrength(p.strength)}</b>${ci ? `<small title="${esc(Core.DESCRIPTIVE_TIP)}${b ? ' ' + esc(b.long) : ''}">±${half}${b && b.key !== 'across' ? `<i class="basis-mark ${b.key}">${b.key === 'within' ? ' within conv.' : ' partly within'}</i>` : ''}</small>` : '<small>no range yet</small>'}</span>
     <span class="axis">${whisker}</span>
+    <span class="r hide-sm obs" title="${esc(OBSERVED_TIP)}">${obs != null ? `<span class="${cls(p.observed_edge)}">${obs}</span><small>vs ${plural(p.observed_opponents || 0, 'opponent')}</small>` : '<small>–</small>'}</span>
     <span class="r hide-sm"><span class="${cls(p.net_bb)}">${p.net_bb != null ? signed(p.net_bb, 0) + ' bb' : ''}</span><small>${plural(p.hands || 0, 'hand')}</small></span>
     <span class="r hide-sm sess">${elo}</span></div>`;
 }
@@ -989,7 +997,7 @@ function standingRow(rt, g, p, ax, ranked, inBlock = false) {
 function waitingRows(waiting, ranked) {
   return waiting.map(x => `<div class="brow waiting">${ranked ? '<span class="rank">·</span>' : ''}
     ${player(x.player, `<div class="small soft">${x.status === 'playing' ? 'playing its first deals' : x.status === 'done' ? 'no finished deals' : 'waiting to play'}</div>`)}
-    <span class="r strength soft">–</span><span class="axis"></span><span class="hide-sm"></span><span class="hide-sm"></span></div>`).join('');
+    <span class="r strength soft">–</span><span class="axis"></span><span class="hide-sm"></span><span class="hide-sm"></span><span class="hide-sm"></span></div>`).join('');
 }
 
 function matchupId(p) {
@@ -1010,7 +1018,7 @@ function verdictCell(p, v, { compact = false } = {}) {
   if (v.decided || (p.assumption && p.assumption.status === 'unsupported' && p.assumption.method === 'free')) bits.push(assumeChip(p.assumption, { compact }));
   const drift = p.drift && (typeof p.drift === 'string' ? { status: p.drift } : p.drift);
   if (v.drift) bits.push(chip('needs confirmation', 'warn', v.long));
-  else if (drift && /drift/.test(drift.status || '')) bits.push(chip('drift detected', 'warn', drift.meaning || 'The edge changed between early and late conversations: the verdict means a player was ahead for part of the run.'));
+  else if (drift && /^drift detected/.test(drift.status || '')) bits.push(chip('drift detected', 'warn', drift.meaning || 'The edge changed between early and late conversations: the verdict means a player was ahead for part of the run.'));
   if (p.identity_qualified && !Object.values(p.attestation || {}).some(at => ['unattested', 'mismatch'].includes(at && (typeof at === 'string' ? at : at.status))))
     bits.push(chip('model unconfirmed', 'quiet', 'A player\'s tool never reported which model answered, so this result is qualified: only the configured name is known.'));
   for (const [pl, at] of Object.entries(p.attestation || {})) {
@@ -1063,7 +1071,7 @@ function pairingsSection(rt) {
       ${noLine}${fitLine}</div>`;
   }).join('');
   return section('Matchups', 'who beats whom: the direct evidence, in bb/100 over duplicate deals', `<div class="pair-list">${rows}</div>`,
-    `${descriptive ? 'Ahead on points only: no verdict here is a decision.' : rt.track === 'adaptation' ? 'Readings here are the model-based test\'s: they stop play on this track, but they are exploratory and none is official. Hover one for what it rests on.' : 'Decided results are the planned test\'s; the rest is ahead on points. Hover a verdict for what it rests on.'}
+    `${descriptive ? 'Ahead on points only: no verdict here is a decision.' : rt.track === 'adaptation' ? 'Readings here are the model-based test\'s: they stop play on this track, but they are exploratory and none is official. Hover one for what it rests on.' : 'Decided results are the planned test\'s, and name the better model only if each name served one unchanged model for the whole run; the rest is ahead on points. Hover a verdict for what it rests on.'}
      ${official ? 'The first range is the official test\'s anytime-valid interval, which holds whenever play stops; the ordinary range under it is fixed-time and descriptive.' : 'Ranges are fixed-time and descriptive: play stops on the results, so they carry no 95% guarantee.'}`);
 }
 
@@ -1178,8 +1186,13 @@ const provChip = x => {
   const at = x.attestation && (typeof x.attestation === 'string' ? { status: x.attestation } : x.attestation);
   const att = at && (at.status === 'unattested' || at.status === 'mismatch')
     ? chip(at.status === 'mismatch' ? 'wrong model' : 'unattested', at.status === 'mismatch' ? 'bad' : 'quiet', `${at.meaning || ''}${at.policy ? ` (${at.policy})` : ''}`) : '';
-  return chip(word, tone, tip + (more ? ` (${more})` : '')) + att;
+  return chip(word, tone, tip + (more ? ` (${more})` : '')) + att + linkChip(x);
 };
+// A quiz score of the same model and reasoning level as a tournament player, but not shown to be the same player
+// (settings, code or CLI differ or were not recorded): a separate, model-level assessment, never the player's own.
+const modelLevel = x => !!(x.link && x.link.status === 'model-level');
+const linkTip = x => `A separate model-level assessment: the same model and reasoning level as ${x.link.player ? plain(x.link.player) : 'a tournament player'}, but not shown to be the same player (${(x.link.differences || []).join('; ') || 'provenance differs'}), so it is not that player's score.`;
+const linkChip = x => modelLevel(x) ? chip('separate quiz run', 'warn', linkTip(x)) : '';
 
 const quizStore = new Map();
 async function loadQuiz() {
@@ -1193,11 +1206,12 @@ async function loadQuiz() {
 // The standings page's pointer to the quiz, filled in after the standings are on screen: each model's score
 // on the scored category, and on the harder ones, each with its own denominator.
 const catTitle = (q, c) => (q.category_info[c] && q.category_info[c].title) || catWord(c);
-function scoreText(q, x) {
+function scoreText(q, x, quiet = false) {
   const flag = x.provenance?.status === 'unrecorded' ? '<span class="soft"> (unverified)</span>' : x.provenance?.status === 'ineligible' ? '<span class="neg"> ineligible</span>' : '';
   const head = `${x.correct ?? '–'}/${x.total ?? '–'}${q.scored_category ? ` ${esc(catTitle(q, q.scored_category).toLowerCase())}` : ''}`;
   const more = x.others && x.others.total ? ` · ${x.others.correct}/${x.others.total} harder` : '';
-  return `<b>${plain(x.player)}</b> ${head}${more}${x.fallbacks ? ` (${plural(x.fallbacks, 'fallback')})` : ''}${flag}`;
+  const sep = modelLevel(x) && !quiet ? `<span class="soft" title="${esc(linkTip(x))}"> (model-level, separate run)</span>` : '';
+  return `<b>${plain(x.player)}</b> ${head}${more}${x.fallbacks ? ` (${plural(x.fallbacks, 'fallback')})` : ''}${flag}${sep}`;
 }
 async function fillQuizTeaser(run) {
   let q;
@@ -1209,7 +1223,7 @@ async function fillQuizTeaser(run) {
   const ref = q.players.find(x => x.reference);
   const ceiling = models.length > 1 && models.filter(x => x.correct === x.total).length >= 2 && !models.some(x => x.others);
   slot.outerHTML = `<a class="quiz-teaser card-box" href="${quizLink()}"><span class="qt-k">Poker fundamentals</span>
-    <span class="qt-body">A separate quiz of ${plural(q.spots.length, 'spot')}${q.categories.length > 1 ? ` in ${plural(q.categories.length, 'category', 'categories')}` : ''} with worked-out answers: ${models.map(x => scoreText(q, x)).join(' · ')}${ref ? ` · ${scoreText(q, ref)} (reference)` : ''}${ceiling ? '<span class="soft"> · several perfect scores: these spots are too easy to separate these models</span>' : ''}</span>
+    <span class="qt-body">${models.some(modelLevel) ? 'Model-level, run apart from these tournament players: ' : ''}A separate quiz of ${plural(q.spots.length, 'spot')}${q.categories.length > 1 ? ` in ${plural(q.categories.length, 'category', 'categories')}` : ''} with worked-out answers: ${models.map(x => scoreText(q, x, models.every(modelLevel))).join(' · ')}${ref ? ` · ${scoreText(q, ref)} (reference)` : ''}${ceiling ? '<span class="soft"> · several perfect scores: these spots are too easy to separate these models</span>' : ''}</span>
     <span class="al-go">See every spot ›</span></a>`;
 }
 

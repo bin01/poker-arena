@@ -717,8 +717,30 @@ def quiz(root: Path, run):
                 kinds[pid] = 'bot' if 'bot' in known[pid] else 'model'
     except Exception:
         pass
+    data = {**data, 'players': _quiz_links(base, data)}
     return {**data, 'spots': _with_questions(data), 'labels': {**labels, **(data.get('labels') or {})},
             'kinds': {**kinds, **(data.get('kinds') or {})}}
+
+
+def _quiz_links(base: Path, data: dict) -> dict:
+    """Each quiz player with `link`: whether its score may stand for the run's tournament player of the same model
+    and reasoning level (ratings.quiz_link), or is a separate model-level assessment, and what differs."""
+    from .history import identity as ident_of
+    from .ratings import MIXED, _base_identity, player_provenance, quiz_link
+    players = data.get('players') or {}
+    if not isinstance(players, dict):
+        return players
+    prov = player_provenance(base)
+    by_base = {v['identity']: p for p, v in prov.items() if v.get('identity') not in (None, MIXED)}
+    out = {}
+    for pid, x in players.items():
+        if not isinstance(x, dict):
+            out[pid] = x
+            continue
+        same = by_base.get(_base_identity(ident_of(pid, x.get('spec') or {})))
+        link = quiz_link(x, data, prov[same]) if same else {'status': 'none', 'differences': []}
+        out[pid] = {**x, 'link': {**link, 'player': same}}
+    return out
 
 
 def _with_questions(data: dict) -> list:

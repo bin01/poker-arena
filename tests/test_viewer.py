@@ -989,7 +989,7 @@ class TestViewerLogic(unittest.TestCase):
         hand[11]['data'].update(to_act=None)
         r = self.run_js(f'const s = PokerTable.steps({json.dumps(hand)}); return [s.steps.map(x => x.toAct), s.log[1].facing,'
                         ' s.steps[0].seats[0].made, s.steps[3].seats[0].made];')
-        self.assertEqual(r[0], [0, 1, 1, 1, 0, 1, None, None])
+        self.assertEqual(r[0], [0, 1, None, 1, 0, 1, None, None])   # the call closes preflop: nobody acts until the flop
         self.assertEqual(r[1], {'toCall': 1, 'pot': 3, 'odds': 0.25, 'closes': False})   # a preflop limp: more betting follows
         self.assertEqual(r[2:], ['ace high (recorded)', 'a pair of aces (recorded)'])
 

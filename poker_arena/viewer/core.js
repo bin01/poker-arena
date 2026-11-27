@@ -48,10 +48,12 @@
   // `decided_with_drift` status when they give it, else from a decided verdict with drift detected beside it.
   const driftOf = p => { const d = p && p.drift; return !d ? null : typeof d === 'string' ? { status: d } : d; };
   const DRIFT_STATUS = 'decided_with_drift';
+  // What a decided win says about the models: only as much as the names stayed the same models throughout.
+  const STABLE_NOTE = 'It shows the better model only if each name served one unchanged model for the whole run, so that its expected edge stayed the same; a drift check that finds nothing does not prove that.';
   function driftQualified(p) {
     if (!p || p.track === 'adaptation') return false;
     if ([p.verdict, p.decision_status, p.verdict_status, p.status, p.standing].includes(DRIFT_STATUS)) return true;
-    return DECIDED.includes(p.verdict) && /drift detected/.test((driftOf(p) || {}).status || '');
+    return DECIDED.includes(p.verdict) && /^drift detected/.test((driftOf(p) || {}).status || '');
   }
   const countsForLeader = p => !driftQualified(p) && !idWithheld(p) && p.counts_toward_leader !== false;
   const idWithheld = p => !!p && p.decision_status === 'decided_identity_unattested';
@@ -67,6 +69,7 @@
     const out = isContract(r) ? fromContract(r) : fromLegacy(r);
     const minConv = r.min_conversations ?? (r.design && r.design.min_conversations);
     if (minConv != null) out.pairings = out.pairings.map(p => ({ min_conversations: minConv, ...p }));
+    out.players = out.players.map(p => p.observed_edge !== undefined || !p.in_fit ? p : { ...p, ...observedOf(p.player, out.pairings) });
     const byId = Object.fromEntries(out.players.map(p => [p.player, p]));
     out.pairings = out.pairings.map(p => ({ ...p, design_ref: r.design || null, assumption: assumptionsOf(p, r.design), fit: fitOf(p, byId) }));
     const unregistered = !pooled && isUnregistered(r.design);
@@ -82,6 +85,13 @@
     out.groups = groupsOf(out, r.groups, descriptive);
     if (descriptive) out.groups.forEach(g => { g.leader = null; });
     return out;
+  }
+
+  // Observed opponent-weighted winnings: the mean of a player's direct edges, one per opponent, each weighted equally.
+  function observedOf(player, pairings) {
+    const edges = (pairings || []).filter(x => (x.a === player || x.b === player) && x.edge != null)
+      .map(x => x.a === player ? x.edge : -x.edge);
+    return { observed_edge: edges.length ? Math.round(edges.reduce((s, e) => s + e, 0) / edges.length * 10) / 10 : null, observed_opponents: edges.length };
   }
 
   function fromContract(r) {
@@ -350,7 +360,7 @@
         : mv === 'exhausted' ? 'No winner' : mv === 'early' ? 'Too early' : 'Undecided' };
     const sec = secondary ? ` The model-based test (secondary, never decides) says: ${secondary.short.toLowerCase()}.` : '';
     const out = as.method === 'free' && as.status === 'free'
-      ? ` The test makes no assumption about the shape of the results: its error rate holds at every check if conversations are independent and the edge stays the same over the run (no drift).${sec}`
+      ? ` The test makes no assumption about the shape of the results: its error rate holds at every check if conversations are independent and each one's expected edge, given the ones before, is at most the tested value.${sec}`
       : as.method === 'free' && as.status === 'unsupported'
       ? ` The test makes no assumption about the shape of the results, but a check it needs failed here (${as.failed.join(', ') || 'see the checks'}), so its error rate is not established.${sec}`
       : as.method === 'free' && as.status === 'incomplete'
@@ -381,7 +391,7 @@
     }
     switch (p.verdict) {
       case 'a': case 'b':
-        return { tone: 'won', decided: true, qualifier, secondary, short: `${name(sides.winner)} wins`, long: `Decided${looks}: ${name(sides.winner)} beats ${name(sides.loser)}; the edge cleared the sequential test's bar.${out}` };
+        return { tone: 'won', decided: true, qualifier, secondary, short: `${name(sides.winner)} wins`, long: `Decided${looks}: ${name(sides.winner)} beats ${name(sides.loser)}; the edge cleared the sequential test's bar.${out} ${STABLE_NOTE}` };
       case 'even':
         return { tone: 'even', decided: true, qualifier, secondary, short: 'Even', long: `Decided${looks}: within ±${band} bb/100 of each other.${out}` };
       case 'exhausted':
@@ -731,7 +741,7 @@
       checked: !c.length || c.some(x => x.status === 'verified') };
   }
 
-  return { dealSequence, sequenceSwings, sequenceTotals, standingBlocks, cohorts, cohortName, protocolOf, populationOf, testOf, isFallback, provenanceOf, quizOf, firstDifference, bigSwings, IDENTITY, esc, MINUS, signed, plural, trim, approx, nameParts, family, isContract, normalize, verdict, verdictSides, powerLine, correction, actText,
+  return { STABLE_NOTE, dealSequence, sequenceSwings, sequenceTotals, standingBlocks, cohorts, cohortName, protocolOf, populationOf, testOf, isFallback, provenanceOf, quizOf, firstDifference, bigSwings, IDENTITY, esc, MINUS, signed, plural, trim, approx, nameParts, family, isContract, normalize, verdict, verdictSides, powerLine, correction, actText,
     isDecided, decidedLeader, driftQualified, countsForLeader, driftWords, officialInterval, ciKind, DESCRIPTIVE_TIP, spotPrompt, spotTitle, handCode, playerId, rateOf, targetEdge, isUnregistered, scenarios, conversationsShort,
     assumptionsOf, ineligible, sourceOf, basisOf, fitOf, identityOf, ASSUME };
 });

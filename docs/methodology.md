@@ -78,6 +78,13 @@ refresh, would answer differently at a different moment, and are never called a 
 
 ## The guarantee, and what it needs
 
+**In short.** The error bound below is a statement about the conditional null, under independent conversations.
+Reading a decided win as *the better model* needs one more condition the data cannot fully check: that each name
+served one stable model for the whole run, so that each conversation's expected edge stayed the same. The drift
+diagnostic can reveal a violation, but a passed check is reported as **no drift detected**, never as evidence of
+stability; dated model snapshots should be pinned where the provider offers them. Every decided win carries this
+condition (`interpretation`, `ratings.STABLE_CONDITION`) in the viewer, the CLI summary and the record.
+
 With no edge between two players, the official test calls a winner for that pairing with chance at most
 `alpha_pairing = alpha / n_pairings`, so that over the tournament the chance of any false verdict is at most
 `alpha` (5% by default; Bonferroni, which needs no independence between pairings). The same bound holds for a
@@ -130,12 +137,13 @@ question asked); the levers that remain are the number of deals per conversation
 cheaper in deals), the stacks (the bound is proportional to them), the target edge and alpha.
 
 **Drift.** `drift` compares the pairing's conversations in play order, the first half against the second (Welch
-t, two-sided): `{status: 'stable' | 'drift detected' | 'unknown' (fewer than 4 conversations), early, late,
+t, two-sided): `{status: 'no drift detected' | 'drift detected' | 'unknown' (fewer than 4 conversations), early, late,
 difference, p, conversations, alpha, meaning}`, flagged at p < `DRIFT_ALPHA` = 1% (about 1 false flag in 100
 steady pairings; seeded check in `tests/test_calibration.py`, `TestDrift`). It is reported beside the verdict
 and printed with it ("drift detected: ..."); it does not change the verdict, whose guarantee holds for the
 conditional null either way, but it changes what the verdict means. It is a diagnostic: it can miss drift that
-reverses within each half, and a steady pairing is flagged about 1% of the time.
+reverses within each half, and a steady pairing is flagged about 1% of the time. So a pass is reported as *no
+drift detected*, not as *stable*: absence of a detected change is not evidence that the model held still.
 
 **Drift withholds the result (round 8).** "Ahead for part of the run" is too weak a claim for a standings
 table, so a decided verdict whose drift diagnostic says *drift detected* gets `decision_status` and `standing`
@@ -527,9 +535,14 @@ judge (with its own registered design and planner), still never official.
 
 ## Strength (descriptive)
 
-Each player gets a strength in bb/100 from a least-squares fit over all observations, `x(a vs b) ≈ s_a − s_b`,
-with the strengths summing to zero within each group of connected players: the edge against the average
-opponent of the group. The fit assumes edges add up across players, which poker's rock-paper-scissors effects can
+Each player gets a **centred fitted strength** in bb/100 from a least-squares fit over all observations,
+`x(a vs b) ≈ s_a − s_b`, with the strengths summing to zero within each group of connected players
+(`strength_kind`). Only differences mean anything: s_a − s_b is the edge the fit predicts for a against b. A
+strength is *not* a player's winnings against its average opponent: with three players whose direct edges are
++103 and +80 for the top one, its strength is +61 while its direct edges average +91, because centring spreads
+the other two players' edge between them. That observed quantity is reported beside it as **observed
+opponent-weighted winnings** (`observed_edge`: the mean of a player's direct edges, one per opponent it met,
+each opponent weighted equally; `observed_opponents` counts them). The fit assumes edges add up across players, which poker's rock-paper-scissors effects can
 break; when every pairing is the only link between its players the assumption cannot be checked, and the notes
 say so. The per-pairing edges never depend on it, and they stay the primary evidence.
 
@@ -648,7 +661,7 @@ Independent confirmation needs a new run with its own design.
 
 ## How good at poker: the reference bot and the quiz
 
-Every number above is **peer-relative**: a strength is bb/100 against the average opponent a player met, and a
+Every number above is **peer-relative**: a strength is a centred fitted edge among the players met, and a
 verdict compares two players. That says which model wins, not how good any of them is at poker. Nothing here yet
 measures that in absolute terms: there is no solver- or expert-labelled calibration set and no strong,
 reproducible opponent benchmark, so results are described as **peer-relative winnings** and **fundamentals
@@ -691,8 +704,13 @@ competence**, never as poker strength. Two things narrow the gap, both reported 
   as the games (`ratings.attestation`: attested; unattested only from a backend the quiz's or the default
   `allow_unattested` names, so unattested Codex is eligible and shown as unattested; a mismatch never);
   `unverified` when no answers are kept. The served quiz (`ratings.verified_quiz_file`, cached) is that
-  representation, with the raw payloads left out. A score is attached to a run's player (same model and
-  reasoning level) only when it is eligible; otherwise it stays under its quiz name.
+  representation, with the raw payloads left out. A score is attached to a run's player only when it is eligible
+  and compatible (`ratings.quiz_link`): the same model and reasoning level, and the same player settings (the
+  player's own protocol settings, without what a match adds), the same code they share (every recorded
+  implementation file but the judge) and the same CLI version and file, each recorded on both sides. A score of
+  the same model and level that fails that check is never silently the tournament player's: it stays under its
+  quiz name as a separately identified **model-level assessment** (`link: {status: 'model-level', player,
+  differences}`), and the viewer and the CLI say so with what differs.
 
   **Scores are descriptive.** A binomial interval needs spots drawn independently from a defined population. The
   basics are a fixed, hand-picked set, and generated spots kept by answer quotas (no answer best in more than
