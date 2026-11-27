@@ -1,0 +1,104 @@
+{
+  "game": "holdem",
+  "game_config": {},
+  "players_file": "players.toml",
+  "players": [
+    "claude-opus",
+    "claude-sonnet",
+    "codex-gpt",
+    "gemini-pro",
+    "rule",
+    "station",
+    "random"
+  ],
+  "matchups": [
+    [
+      "claude-opus",
+      "claude-sonnet"
+    ],
+    [
+      "claude-opus",
+      "codex-gpt"
+    ],
+    [
+      "claude-opus",
+      "gemini-pro"
+    ],
+    [
+      "claude-opus",
+      "rule"
+    ],
+    [
+      "claude-opus",
+      "station"
+    ],
+    [
+      "claude-opus",
+      "random"
+    ],
+    [
+      "claude-sonnet",
+      "codex-gpt"
+    ],
+    [
+      "claude-sonnet",
+      "gemini-pro"
+    ],
+    [
+      "claude-sonnet",
+      "rule"
+    ],
+    [
+      "claude-sonnet",
+      "station"
+    ],
+    [
+      "claude-sonnet",
+      "random"
+    ],
+    [
+      "codex-gpt",
+      "gemini-pro"
+    ],
+    [
+      "codex-gpt",
+      "rule"
+    ],
+    [
+      "codex-gpt",
+      "station"
+    ],
+    [
+      "codex-gpt",
+      "random"
+    ],
+    [
+      "gemini-pro",
+      "rule"
+    ],
+    [
+      "gemini-pro",
+      "station"
+    ],
+    [
+      "gemini-pro",
+      "random"
+    ],
+    [
+      "rule",
+      "station"
+    ],
+    [
+      "rule",
+      "random"
+    ],
+    [
+      "station",
+      "random"
+    ]
+  ],
+  "deals": 50,
+  "seed": 1000,
+  "out": "runs/pilot",
+  "concurrency": 2
+}

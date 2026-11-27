@@ -1,0 +1,45 @@
+# Who can play. Each entry is a model (a `backend`) or a baseline bot (`bot`).
+# Subscription backends use the official CLIs, signed in with your own plan:
+#   claude  -> Claude Code (`claude login`), Claude Pro/Max
+#   codex   -> Codex CLI (`codex login`), ChatGPT Plus/Pro
+#   gemini  -> Gemini CLI (sign in on first run)
+#   command -> any CLI that reads a prompt on stdin, e.g. pi or ollama
+# Optional keys for any model: extra_args (list), timeout (seconds per call), rate_limit_wait (seconds
+# to wait when the plan's usage limit is hit), max_wait (total seconds to keep waiting).
+# Check them with: python -m poker_arena doctor
+
+[players.claude-opus]
+backend = "claude"
+model = "opus"
+
+[players.claude-sonnet]
+backend = "claude"
+model = "sonnet"
+
+[players.codex-gpt]
+backend = "codex"
+# model = "gpt-6.1-sol"   # leave unset to use your Codex default
+effort = "high"
+
+[players.gemini-pro]
+backend = "gemini"
+# model = "gemini-3-pro"  # leave unset to use the CLI's default
+
+# [players.pi-default]
+# backend = "command"
+# command = ["pi", "-p"]
+
+# [players.llama-local]
+# backend = "openai_compat"
+# base_url = "http://localhost:11434/v1"
+# model = "llama3.3"
+
+# Baseline bots: free, instant, and they anchor the scale.
+[players.random]
+bot = "random"
+
+[players.station]
+bot = "station"   # always checks or calls
+
+[players.rule]
+bot = "rule"      # equity vs pot odds, value bets, never bluffs
