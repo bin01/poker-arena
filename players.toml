@@ -29,6 +29,11 @@ backend = "codex"
 model = "gpt-6-luna"
 effort = "high"       # model_reasoning_effort
 
+[players.gpt-6-2-sol-high]
+backend = "codex"
+model = "gpt-6.2-sol"
+effort = "high"
+
 [players.gemini-4-neon-high]
 backend = "agy"
 effort = "high"       # agy --effort; this model is also the "-high" variant (see `agy models`)
