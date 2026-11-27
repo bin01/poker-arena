@@ -303,3 +303,39 @@ Round 5 report: `/private/tmp/claude-501/-Users-snehal-Code-poker-arena/7391e5d9
 - **Viewer (B):** cache signature includes .json run files (R5-#10); "untestable" fit shown as insufficient evidence
   (R5-#11); when additivity fails, the hero leads with direct matchup results (R5-#12); mobile fixes (R5-#13); playback
   speed control, pause on "why?", jump to divergent decisions and big swings (R5-#14).
+
+---
+
+# Round 6 → 7
+
+Round 6 report: `/private/tmp/claude-501/-Users-snehal-Code-poker-arena/7391e5d9-a258-4fd4-b230-fb0d350c6f8f/scratchpad/review/r6-report.md`
+(ux=7 gameplay=8 evals=5 judges=6 overall=6). Issues R6-#n. Same tracks and file ownership.
+
+## Contract additions
+- **Assumption-free official verdicts (A):** the official verdict comes from an anytime-valid sequential test for
+  bounded outcomes (e.g. a betting / hedged-capital confidence sequence in the style of Waudby-Smith & Ramdas) applied to
+  conversation means, which are bounded by the stacks (state the bound exactly). Valid under independence of
+  conversations only, with no distribution-shape assumption, at every look. Bonferroni over pairings. The current
+  t/sign-flip gate becomes a secondary, clearly labelled "model-based" verdict (or is dropped). Reproduce the reviewer's
+  rare-loss counterexample (seed 4901) as a regression: false-verdict rate ≤ alpha. Recompute power, deals needed and
+  default budgets for the new test by simulation, and report the cost vs the old gate (R6-#1).
+- **Identity (C):** every answering model in a Claude stream (each assistant message's model) is checked; mixed or
+  conflicting models → `identity_match: 'mismatch'`; init model is supplementary (R6-#2).
+- **Linked audit (C, A):** every decision gets a `decision_id`; every call attempt, raw output row and the executed
+  action carry it; accepted audit status is derived from those attempts and verified against the raw backend evidence;
+  the judged evidence hash covers hands, events, calls and raw records (R6-#3).
+- **Quiz provenance (C, A, B):** quiz answers keep raw output, identity_match, audit, protocol, implementation and CLI
+  versions; scores attach only with provenance and eligibility status; fallbacks never count as correct and valid-answer
+  accuracy is reported separately (R6-#4, #5). Harder, separately scored categories (closer EV gaps, multi-street lines,
+  range inference from described action, sizing choices among 3+ options) with generated variants; no population-style
+  intervals unless the sampling population is defined (R6-#9).
+- **CLI pinning during a run (C):** re-check the resolved executable path, version and file digest before each launch;
+  a change mid-run is recorded and voids registration (R6-#6).
+- **Shared committed reader (A, B):** one reader distinguishes verified committed hands from provisional live events;
+  stats and replay say which population they cover; rejected hands never enter style totals (R6-#10).
+- **Reference characterisation (A, B):** state the reference bot's measured limits (its results against each baseline,
+  and that it is a heuristic, not a solver); show model-vs-reference prominently (R6-#8).
+- **Viewer (B):** decided order primary in standings, unresolved grouped (R6-#7); serve cached ratings immediately and
+  refresh in the background, never block navigation/replay on ratings (R6-#11); all-runs view leads with the current
+  model cohort, groups named by participants, cohort selector (R6-#12); mobile replay: compact sticky controls, current
+  action and price beside the table, synchronized two-play comparison, larger explanatory text (R6-#13).
