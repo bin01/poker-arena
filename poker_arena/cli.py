@@ -75,6 +75,12 @@ def cmd_view(args):
     serve(args.root, args.port, args.host, players_file=args.players)
 
 
+def cmd_luck(args):
+    """How much expected-value scoring lowers the spread of results, measured on games already played."""
+    from .luck import measure, report
+    print(report(measure(args.root, sims=args.sims)))
+
+
 def cmd_history(args):
     """Update the history database from the runs under root, and print the all-time leaderboard."""
     from . import history
@@ -220,6 +226,11 @@ def main(argv=None):
     p.add_argument('--host', default='127.0.0.1')
     p.add_argument('--players', default='players.toml', help='for display names (default: players.toml here)')
     p.set_defaults(fn=cmd_view)
+
+    p = sub.add_parser('luck', help='measure how much expected-value scoring cuts the deals needed, on games already played')
+    p.add_argument('root', nargs='?', default='runs')
+    p.add_argument('--sims', type=int, default=20_000, help='Monte Carlo runouts for hands all in before the flop')
+    p.set_defaults(fn=cmd_luck)
 
     p = sub.add_parser('history', help='update the history database (runs/arena.db) and print the all-time leaderboard')
     p.add_argument('root', nargs='?', default='runs')

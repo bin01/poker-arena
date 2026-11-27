@@ -101,6 +101,15 @@ python -m poker_arena view runs/pilot                                 # follows 
 `tournament` resumes: rerun the same command after a crash or a stop, and each match continues after its last
 finished hand. Write your own plan with `python -m poker_arena plan A B C --deals 50 --out runs/mine --write plans/mine.json`.
 
+### Less luck per deal
+
+`python -m poker_arena luck runs/<run>` measures, on games already played, how much scoring hands by expected
+value would cut the deals needed. A hand whose betting closed before the river (usually an all-in) is worth
+`equity x pot - chips put in` at that moment, whatever the turn and river bring; that is unbiased and removes the
+luck of the runout. Because both plays of a deal share the same runout, raw chips already cancel part of that luck,
+so the measurement also fits the best mix of the two (`chips - c x luck`, unbiased for any fixed c). Fit c on past
+runs and fix it before a new run, so the new run's scoring is decided in advance.
+
 ### How many deals it takes
 
 Even with duplicate deals, one deal swings a lot: in the first model runs, the result per deal had a spread of
