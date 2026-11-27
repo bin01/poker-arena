@@ -213,3 +213,16 @@ class TestOpaqueQuizIds(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestStandingOrderAroundCycles(unittest.TestCase):
+    def test_a_cycle_in_the_middle_sits_between_its_decided_neighbours(self):
+        import json, subprocess
+        js = """
+const C=require('./poker_arena/viewer/core.js');
+const ps=[{player:'a',rank_kind:'decided',rank:1,strength:3},{player:'e',rank_kind:'decided',rank:5,strength:-3},
+{player:'b',rank_range:[2,4],rank_cycle:['c','d'],strength:1},{player:'c',rank_range:[2,4],rank_cycle:['b','d'],strength:0},
+{player:'d',rank_range:[2,4],rank_cycle:['b','c'],strength:-1}];
+console.log(JSON.stringify(C.standingBlocks(ps).map(b=>b.players.map(p=>p.player).join(''))));"""
+        out = subprocess.run(['node', '-e', js], capture_output=True, text=True, check=True).stdout
+        self.assertEqual(json.loads(out), ['a', 'bcd', 'e'])

@@ -513,9 +513,10 @@
       if (!open.has(k)) open.set(k, { kind: cyc ? 'cycle' : 'unresolved', range: r, players: [] });
       open.get(k).players.push(p);
     }
-    const rest = [...open.values()].sort((x, y) => (x.range ? x.range[0] : 1e9) - (y.range ? y.range[0] : 1e9));
+    const rest = [...open.values()];
     rest.forEach(b => { b.players = byStrength(b.players); });
-    return blocks.concat(rest);
+    const top = b => b.kind === 'decided' ? b.rank : b.range ? b.range[0] : 1e9;
+    return blocks.concat(rest).map((b, i) => [b, i]).sort((x, y) => top(x[0]) - top(y[0]) || x[1] - y[1]).map(x => x[0]);
   }
 
   // The decided results among the players of a cycle, e.g. [{winner: 'b', loser: 'a'}, ...]: why none is ranked.
