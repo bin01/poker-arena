@@ -320,7 +320,7 @@ and the viewer shows (nothing else builds one):
 | `power_at_max` | | the moderate scenario's power |
 | `power_by_edge` | | power at 20, 50 and 100 bb/100, moderate dependence |
 | `power_basis` | | says in words what the power numbers are |
-| `leader_chances` | | for a full round robin: the chance that the true best player is named the decided leader, per edge scenario |
+| `leader_chances` | | for a full round robin: the chance that the true best player is named the decided leader, per edge scenario, taking pairings as independent (an approximation: pairings share deals, so the joint chance can be lower) |
 | `deals_needed`, `conversations_needed` | | per pairing, for 80% power under the moderate scenario (None: out of reach of 200 rounds) |
 | `deals_planned`, `max_deals` | | the deals per pairing the design allows |
 | `allow_unattested` | `['codex']` | backends whose players may be eligible without attesting the model that answered |

@@ -34,7 +34,7 @@ def _power_table(d, lengths=False) -> str:
         out.append('  assumed dependence, by edge: ' + ', '.join(f'{e} bb/100 {_pct(p)}' for e, p in d['power_by_edge'].items()))
     for x in d.get('leader_chances') or []:
         out.append(f'  decided leader is the true best player {_pct(x["p_leader"])} if '
-                   f'{LEADER_SCENARIO[x["scenario"]].format(e=x["edge_bb100"])} (pairings taken as independent)')
+                   f'{LEADER_SCENARIO[x["scenario"]].format(e=x["edge_bb100"])} (an independence scenario: pairings share deals, so the real chance can be lower)')
     if lengths:
         out.append('Deals per pairing the official test needs for 80% at the target, by conversation length (the bound '
                    'of the stacks, not the spread, sets the number of conversations, so short conversations cost far '

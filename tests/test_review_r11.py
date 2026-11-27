@@ -226,3 +226,14 @@ const ps=[{player:'a',rank_kind:'decided',rank:1,strength:3},{player:'e',rank_ki
 console.log(JSON.stringify(C.standingBlocks(ps).map(b=>b.players.map(p=>p.player).join(''))));"""
         out = subprocess.run(['node', '-e', js], capture_output=True, text=True, check=True).stdout
         self.assertEqual(json.loads(out), ['a', 'bcd', 'e'])
+
+
+class TestRound12Fixes(unittest.TestCase):
+    def test_street_comparison_counts_amounts(self):
+        src = open('poker_arena/viewer/app.js').read()
+        self.assertIn("${e.seat}:${e.action}:${e.amount ?? ''}", src)
+
+    def test_leader_chances_are_labelled_independence_scenarios(self):
+        from poker_arena import ratings
+        self.assertIn('not a', ratings.leader_chances.__doc__)
+        self.assertNotIn('at or above that product', ratings.leader_chances.__doc__)

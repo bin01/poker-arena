@@ -1742,9 +1742,10 @@ def leader_chances(design: dict, players: int, icc=None, ar1=None) -> list[dict]
     leader (a counting win over every other player), by edge scenario: 'one best' (it is better than each
     other player by the target edge, the rest equal), 'one best by twice the target', and 'ladder'
     (strengths evenly spaced, the target edge apart). Each of the leader's pairings is simulated through the
-    official test (`procedure`) and treated as independent of the others. Pairings that share cards are
-    positively correlated, which keeps the joint chance at or above that product (tests/test_calibration.py);
-    anything that lowers a single pairing's power (a noisier game than planned) lowers it as a power."""
+    official test (`procedure`) and the pairings are taken as independent: an independence scenario, not a
+    bound. Pairings share deals, and their joint chance can fall below the product of their powers (a review probe
+    found 63.6% joint against a 66.9% product), so read these as approximate; anything that lowers a single
+    pairing's power lowers them too."""
     T = float(design.get('target_edge_bb100') or TARGET_EDGE)
     if players < 2:
         return []
@@ -3898,7 +3899,7 @@ def design_line(d) -> str:
         n = (1 + math.isqrt(1 + 8 * d['n_pairings'])) // 2
         head += (f' Chance of naming the true best of the {n} players the decided leader, assumed dependence: '
                  + ', '.join(f'{_pct(x["p_leader"])} if {LEADER_SCENARIO[x["scenario"]].format(e=x["edge_bb100"])}'
-                             for x in lead) + '.')
+                             for x in lead) + ' (pairings taken as independent; they share deals, so the real chance can be lower).')
     if d.get('underpowered'):
         why = 'a budget of ' + f'{d["budget_deals"]:,} deals' if d.get('max_rounds_basis') == 'budget' else 'its max_rounds'
         need = f'about {d["deals_needed"]:,}' if d.get('deals_needed') else \

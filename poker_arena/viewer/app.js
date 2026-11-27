@@ -1779,7 +1779,7 @@ async function matchBody(cur, params, rt, P) {
   const body = `${scorebar}${controls}${sync}
     <div class="pair ${state.mind ? 'show-mind' : ''}" data-show="${state.showPlay}">${plays.map(p => playPanel(p, cur, bb)).join('')}</div>
     ${nav}${about}
-    <p class="omni small soft">Hand names under each seat use both players' cards, which the players themselves never see.</p>
+    <p class="omni small soft">The viewer shows both players' private cards; each model saw only its own. A seat's hand name uses its own cards and the board.</p>
     ${comparePanel(plays, cur, bb)}`;
   const after = () => {
     const mbody = $app.querySelector('.mbody');
@@ -1874,7 +1874,7 @@ function comparePanel(plays, cur, bb) {
   const rows = ['preflop', 'flop', 'turn', 'river'].map(st => {
     const acts = plays.map(p => p.log.filter(e => e.kind === 'action' && e.street === st));
     if (acts.every(a => !a.length)) return '';
-    const sig = (p, a) => a.map(e => `${e.seat}:${e.action}`).join(' ');
+    const sig = (p, a) => a.map(e => `${e.seat}:${e.action}:${e.amount ?? ''}`).join(' ');
     const same = sig(plays[0], acts[0]) === sig(plays[1], acts[1]);
     const cells = plays.map((p, j) => `<div class="cmp-cell" data-play="${j}">${acts[j].map(e => `<span class="ca" data-step="${e.step}">${monogram(who(p, e.seat), 'xs')}<span class="verb ${e.action}">${VERB[e.action] || esc(e.action)}${['call', 'bet', 'raise'].includes(e.action) ? ' ' + fmt(e.amount) : ''}</span></span>`).join('') || '<span class="soft small">no action</span>'}</div>`).join('');
     return `<div class="cmp-row" data-seg="${st}"><div class="cmp-st">${st[0].toUpperCase() + st.slice(1)}<span class="cmp-tag ${same ? 'same' : 'diff'}">${same ? 'same choices' : 'differs'}</span></div>${cells}</div>`;
