@@ -26,6 +26,7 @@
 
   // A hand's events -> {steps: [snapshot], log: [entry]}. Step 0 is the blinds posted; every action,
   // new street, showdown and the result is a step. An entry's `step` is the snapshot it produces.
+  // A snapshot's `actor` is who just acted (its last action); `toAct` is whose turn it is now, or null.
   function steps(events) {
     const evs = events || [];
     const start = evs.find(e => e.kind === 'hand_start');
@@ -64,7 +65,7 @@
         s.last = x.action;
         const t = thoughts[x.seat] || null;
         delete thoughts[x.seat];
-        log.push({ kind: 'action', step: snap(x.action, { lastAmount: x.amount }), seat: x.seat, street, action: x.action,
+        log.push({ kind: 'action', step: snap(x.action, { lastAmount: x.amount, recordedToAct: x.to_act }), seat: x.seat, street, action: x.action,
           amount: x.amount, all_in: !!x.all_in, say: x.say || '', note: x.note || null, thought: t, pot: x.pot });
       } else if (e.kind === 'board') {
         sweep();
@@ -91,6 +92,13 @@
           winners, pot: x.pot, showdown: !!x.showdown, net: x.net || [] });
       }
     }
+    // who acts next: the recorded `to_act` when the log has it, else the seat of the next action
+    out.forEach((st, k) => {
+      const at = log.findIndex(e => e.step > k);
+      const next = at < 0 ? null : log[at];
+      st.toAct = st.done ? null : st.recordedToAct ?? (next && next.kind === 'action' ? next.seat : null);
+      delete st.recordedToAct;
+    });
     return { steps: out, log, n, button: d.button };
   }
 
@@ -105,7 +113,7 @@
         <span class="seat-badge">${s.badge || ''}<span class="dealer" title="Dealer button">D</span></span>
         <div class="who"><div class="name">${s.name}${s.effort ? `<span class="effort">${s.effort}</span>` : ''}</div>
           <div class="sub"><span class="stack-amt"></span><span class="seat-act"></span><span class="seat-net"></span></div></div>
-        <span class="hole"></span></div>`;
+        <span class="hole"></span><span class="turn">to act</span></div>`;
     const top = seats.map((s, i) => i ? seat(s, i) : '').join('');
     return `<div class="ptable n${n} ${opts.compact ? 'compact' : ''}">
       <div class="seats-top">${top}</div>
@@ -113,6 +121,7 @@
         <div class="wagers">${seats.map((_, i) => i ? wager(i, where) : '').join('')}</div>
         <div class="board">${cards([], 5)}</div>
         <div class="pot-line"><span class="pot-chips"></span><span><span class="step-label"></span>Pot <b class="pot-amt">0</b></span></div>
+        <div class="to-act-line" aria-live="polite"></div>
         <div class="wagers">${wager(0, where)}</div>
       </div></div>
       <div class="seats-bottom">${seat(seats[0], 0)}</div></div>`;
@@ -122,13 +131,14 @@
 
   // Update a table made by `html` to a snapshot. `fmt` formats chips (e.g. as big blinds);
   // `hidden` lists seats whose cards stay face down until shown at showdown.
-  function show(el, snap, { fmt = String, hidden = [], prev = null } = {}) {
+  function show(el, snap, { fmt = String, hidden = [], prev = null, names = [] } = {}) {
     if (!el || !snap) return;
     const t = el.querySelector('.ptable') || el;
     snap.seats.forEach((s, i) => {
       const seat = t.querySelector(`.seat[data-seat="${i}"]`);
       if (!seat) return;
-      seat.classList.toggle('actor', snap.actor === i);
+      seat.classList.toggle('to-act', snap.toAct === i);
+      seat.classList.toggle('last-actor', snap.actor === i && snap.toAct !== i);
       seat.classList.toggle('folded', s.folded);
       seat.classList.toggle('winner', snap.done && s.won);
       seat.classList.toggle('button', snap.button === i);
@@ -165,6 +175,8 @@
     if (pc.dataset.n !== String(chips)) { pc.dataset.n = chips; pc.innerHTML = `<span class="stack">${Array.from({ length: chips }, (_, k) => `<i style="--k:${k}"></i>`).join('')}</span>`; }
     const street = snap.done ? '' : STREET_NAMES[snap.street] || '';
     t.querySelector('.step-label').textContent = street ? street + ' · ' : '';
+    const turn = t.querySelector('.to-act-line');
+    if (turn) turn.textContent = snap.toAct != null && names[snap.toAct] ? `${names[snap.toAct]} to act` : '';
   }
 
   return { steps, html, show, card, cards, SUIT };

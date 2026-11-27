@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from poker_arena.backends import Backend, Reply, make_backend
+from poker_arena.backends import CODEX_NO_TOOLS, Backend, BackendError, Reply, make_backend
 
 # A stand-in `agy` that checks the argument layout and answers like `agy --output-format json`.
 FAKE_AGY = r'''#!/usr/bin/env python3
@@ -81,6 +81,129 @@ class TestAuditAndRebuild(unittest.TestCase):
         self.assertEqual(r.meta['rebuilt_from_turns'], 1)
         self.assertFalse(lost.rebuilding)
         self.assertEqual(lost.turns[-1][0], 'turn two')                       # the record keeps the real turn
+
+
+# A stand-in `codex exec --json`: logs its argv, runs a "shell command" when the prompt asks for one.
+FAKE_CODEX = r'''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ['ARGV_LOG'], 'a') as f:
+    f.write(json.dumps(args) + '\n')
+prompt = sys.stdin.read()
+emit = lambda **e: print(json.dumps(e))
+emit(type='thread.started', thread_id='th-1')
+emit(type='item.completed', item={'id': 'item_0', 'type': 'error', 'message': 'config warning'})
+emit(type='turn.started')
+if 'TOOL' in prompt:
+    emit(type='item.started', item={'id': 'item_1', 'type': 'command_execution', 'command': 'ls -la'})
+    emit(type='item.completed', item={'id': 'item_1', 'type': 'command_execution', 'command': 'ls -la'})
+    emit(type='item.completed', item={'id': 'item_2', 'type': 'web_search', 'query': 'gto charts'})
+emit(type='item.completed', item={'id': 'item_3', 'type': 'reasoning', 'text': 'think'})
+emit(type='item.completed', item={'id': 'item_4', 'type': 'agent_message', 'text': '{"action": "check"}'})
+emit(type='turn.completed', usage={'input_tokens': 3})
+'''
+
+FAKE_CLAUDE = r'''#!/usr/bin/env python3
+import json, sys
+sys.stdin.read()
+print(json.dumps({'type': 'system', 'session_id': 'c-1'}))
+print(json.dumps({'type': 'assistant', 'message': {'content': [{'type': 'thinking', 'thinking': 'hmm'},
+      {'type': 'tool_use', 'name': 'Bash', 'input': {'command': 'ls'}}]}}))
+print(json.dumps({'type': 'result', 'result': '{"action": "fold"}', 'session_id': 'c-1', 'usage': {}}))
+'''
+
+
+class OnPath(unittest.TestCase):
+    def install(self, name, script):
+        d = tempfile.mkdtemp()
+        exe = Path(d) / name
+        exe.write_text(script)
+        exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
+        old = os.environ['PATH']
+        os.environ['PATH'] = d + os.pathsep + old
+        self.addCleanup(os.environ.__setitem__, 'PATH', old)
+        return Path(d)
+
+
+class TestToolUse(OnPath):
+    def test_codex_flags_and_tool_items(self):
+        d = self.install('codex', FAKE_CODEX)
+        os.environ['ARGV_LOG'] = str(d / 'argv.jsonl')
+        self.addCleanup(os.environ.pop, 'ARGV_LOG', None)
+        be = make_backend('codex', 'SYS', model='gpt-x', retries=0)
+        r1 = asyncio.run(be.send('a plain turn'))
+        r2 = asyncio.run(be.send('TOOL please'))
+        argv = [json.loads(l) for l in (d / 'argv.jsonl').read_text().splitlines()]
+        for a in argv:
+            joined = ' '.join(a)
+            self.assertIn(' '.join(CODEX_NO_TOOLS), joined)
+            self.assertIn('--ignore-user-config', a)
+            self.assertIn('--ignore-rules', a)
+        self.assertEqual(argv[0][:4], ['exec', '--sandbox', 'read-only', '--json'])
+        self.assertEqual(argv[1][:5], ['exec', 'resume', 'th-1', '-c', 'sandbox_mode="read-only"'])
+        self.assertNotIn('tool_use', r1.meta)
+        self.assertEqual(r2.meta['tool_use'], [{'type': 'command_execution', 'name': 'ls -la'},
+                                               {'type': 'web_search', 'name': 'gto charts'}])
+        self.assertEqual((r2.meta['session_before'], r2.meta['session_after']), ('th-1', 'th-1'))
+        p = be.protocol()
+        self.assertTrue(p['isolate'])
+        self.assertIn('--disable shell_tool', p['tool_policy']['restriction'])
+        self.assertNotIn('timeout', p)
+
+    def test_claude_tool_use_blocks(self):
+        self.install('claude', FAKE_CLAUDE)
+        r = asyncio.run(make_backend('claude', 'SYS', retries=0).send('hi'))
+        self.assertEqual(r.meta['tool_use'], [{'type': 'tool_use', 'name': 'Bash', 'input': '{"command": "ls"}'}])
+        self.assertEqual(r.thinking, 'hmm')
+
+    def test_agy_tool_calls_from_this_turn_only(self):
+        brain = Path(tempfile.mkdtemp())
+        logs = brain / 'conv-1' / '.system_generated' / 'logs'
+        logs.mkdir(parents=True)
+        rows = [{'type': 'USER_INPUT'}, {'type': 'PLANNER_RESPONSE', 'tool_calls': [{'name': 'run_command', 'args': {}}]},
+                {'type': 'USER_INPUT'}, {'type': 'PLANNER_RESPONSE', 'thinking': 't', 'model': 'g-1',
+                                         'tool_calls': [{'name': 'search_web', 'args': {'query': 'x'}}]},
+                {'type': 'PLANNER_RESPONSE', 'content': 'done', 'model': 'g-1'}]
+        (logs / 'transcript.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+        be = make_backend('agy', 'SYS')
+        be.session, be.BRAIN = 'conv-1', str(brain)
+        thinking, model, tools = be._transcript()
+        self.assertEqual((thinking, model), ('t', 'g-1'))
+        self.assertEqual([t['name'] for t in tools], ['search_web'])
+
+
+class TestAttempts(unittest.TestCase):
+    def test_a_timeout_keeps_what_was_printed(self):
+        class Slow(Backend):
+            stateful = True
+
+            async def _call(self, text):
+                return Reply(await self.run(['sh', '-c', 'echo partial; echo oops >&2; sleep 30']))
+        be = Slow('SYS', timeout=0.5, retries=0)
+        be.session = 'old'
+        be.turns = [['t1', 'r1']]
+        with self.assertRaises(BackendError) as cm:
+            asyncio.run(be.send('hi'))
+        fa = cm.exception.meta['failed_attempts'][0]
+        self.assertEqual(fa['raw']['stdout'], 'partial\n')
+        self.assertEqual(fa['raw']['stderr'], 'oops\n')
+        self.assertTrue(fa['raw']['timed_out'])
+        self.assertTrue(fa['rebuilt'])                                         # it may have stored the turn
+        self.assertEqual(fa['session_before'], 'old')
+        self.assertEqual((be.session, be.rebuilding), (None, True))
+
+    def test_a_cli_that_never_started_is_not_rebuilt(self):
+        class Missing(Backend):
+            stateful = True
+
+            async def _call(self, text):
+                return Reply(await self.run(['definitely-not-a-cli-xyz']))
+        be = Missing('SYS', retries=0)
+        be.session = 'kept'
+        with self.assertRaises(BackendError) as cm:
+            asyncio.run(be.send('hi'))
+        self.assertNotIn('rebuilt', cm.exception.meta['failed_attempts'][0])
+        self.assertEqual(be.session, 'kept')
 
 
 if __name__ == '__main__':

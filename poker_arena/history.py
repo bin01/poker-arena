@@ -4,15 +4,19 @@ The match folders stay the record of what happened; the database is an index of 
 `sync` reads every match under a root into `arena.db` there (only folders that changed since the last
 sync) and never removes anything, so a run whose folder is deleted keeps its place in the history.
 
-The all-time leaderboard rates a player by what it is, not by its id in one run's players.toml: its model
-and reasoning level (`claude:claude-sonnet-5-5:high`), or its bot and settings (`bot:rule:sims=200`).
-Two ids with the same model and level pool their results; the same model at another level is a different
-player. A player whose model was not recorded, or was recorded only as a bare alias (`sonnet`), is
-quarantined: listed, but its deals are left out of the all-time fit, because two runs of it may not be the
-same model. Only deals played under the same game settings pool (blinds and stacks change what bb/100 means),
-so runs under other settings are listed as left out. Runs from different code versions do pool, and the
-result says so when they differ. Every run starts from the same seeds, so the same pair often replays the
-same deal: each deal row keeps its seed and fingerprint, and the rating averages repeats into one observation.
+The all-time leaderboard rates a player by what it is, not by its id in one run's players.toml: its model,
+reasoning level and protocol (`claude:claude-sonnet-5-5:high#1a2b3c4d`, the protocol being the fingerprint of
+every setting that changes play, as the runner records it), or its bot and settings (`bot:rule:sims=200`).
+Only identical protocols pool: the same model with other instructions, isolation, tool policy or retry
+policy is another player, and so is a player from before protocols were recorded. A player whose model was
+not recorded, or only as a bare alias (`sonnet`), and a player for whom a different model answered than the
+one configured (in that run), is quarantined: listed, but left out of the all-time fit. Only deals played
+under the same game settings pool (blinds and stacks change what bb/100 means); runs under other settings
+are listed as left out. The same pair often replays the same deal in several runs: each deal row keeps its
+seed and fingerprint, and the rating averages repeats into one observation.
+
+All-time standings are descriptive only. Runs had different designs and stopped pairings at different
+times, so pooling them is not any run's preregistered test: no all-time verdict, rank or leader is decided.
 
 Tables:
     matches   one row per match folder: run, matchup, seat order, game settings, code version, progress
@@ -32,7 +36,7 @@ from pathlib import Path
 
 from .stats import add, summarize, tally
 
-SCHEMA = 2
+SCHEMA = 3
 DB_NAME = 'arena.db'
 ALL = '*'   # the run name the viewer uses for the all-time leaderboard
 
@@ -53,15 +57,17 @@ CREATE TABLE IF NOT EXISTS tallies (
 """
 
 
-def identity(pid: str, spec: dict) -> str:
-    """What a player is, whatever its id: backend, model and reasoning level, or bot and settings."""
+def identity(pid: str, spec: dict, protocol: str | None = None) -> str:
+    """What a player is, whatever its id: backend, model, reasoning level and the first 8 characters of its
+    protocol fingerprint when one was recorded, or bot and settings."""
     if 'bot' in spec:
         extra = ''.join(f':{k}={spec[k]}' for k in sorted(spec) if k not in ('bot', 'label'))
         return f'bot:{spec["bot"]}{extra}'
     backend = spec.get('backend', 'unknown')
+    tag = f'#{protocol[:8]}' if protocol else ''
     if spec.get('model'):
-        return f'{backend}:{spec["model"]}:{spec.get("effort") or "default"}'
-    return f'{backend}:{pid}'   # a CLI or command without a model setting: only its id says what it is
+        return f'{backend}:{spec["model"]}:{spec.get("effort") or "default"}{tag}'
+    return f'{backend}:{pid}{tag}'   # a CLI or command without a model setting: only its id says what it is
 
 
 def game_key(game: dict) -> str:
@@ -77,6 +83,10 @@ def connect(db) -> sqlite3.Connection:
         with con:
             con.execute('ALTER TABLE deals ADD COLUMN seed INTEGER')
             con.execute('ALTER TABLE deals ADD COLUMN fp TEXT')
+            con.execute("UPDATE matches SET stamp = ''")
+    row = con.execute("SELECT v FROM meta WHERE k = 'schema'").fetchone()
+    if row and int(row[0]) < 3:   # schema 2: identities gain the protocol, so read every folder again
+        with con:
             con.execute("UPDATE matches SET stamp = ''")
     with con:
         con.execute("INSERT OR REPLACE INTO meta VALUES ('schema', ?)", (str(SCHEMA),))
@@ -118,6 +128,7 @@ def _run_of(root: Path, mdir: Path) -> str:
 
 def sync(root, db=None) -> dict:
     """Bring the database up to date with every match under root. Returns counts of what changed."""
+    from .ratings import protocol_of
     from .server import display_name
     root = Path(root).resolve()
     con = connect(db or root / DB_NAME)
@@ -144,7 +155,7 @@ def sync(root, db=None) -> dict:
                 con.execute('DELETE FROM tallies WHERE match_id = ?', (mid,))
                 con.execute('DELETE FROM deals WHERE run = ? AND matchup = ?', (run, mdir.name))
             pids, specs = cfg.get('players', []), cfg.get('specs', {})
-            ids = [identity(p, specs.get(p, {})) for p in pids]
+            ids = [identity(p, specs.get(p, {}), protocol_of(cfg, p)) for p in pids]
             hands = _lines(_read(d / 'hands.jsonl'))
             gk = game_key(cfg.get('game', {}))
             con.execute('INSERT OR REPLACE INTO matches VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', (
@@ -177,11 +188,11 @@ def _sync_deals(con, mdir: Path, run: str, gk) -> int:
         cfg = json.loads(_read(a_dir / 'config.json'))
     except ValueError:
         return 0
-    from .ratings import fingerprint
+    from .ratings import fingerprint, protocol_of
     players = cfg.get('players') or ['?', '?']
     a, b = players[:2]
     specs = cfg.get('specs', {})
-    ids = [identity(a, specs.get(a, {})), identity(b, specs.get(b, {}))]
+    ids = [identity(p, specs.get(p, {}), protocol_of(cfg, p)) for p in (a, b)]
     game = cfg.get('game', {})
     bb = game.get('big_unit') or game.get('bb') or 1
     seeds = cfg.get('seeds', [])
@@ -201,22 +212,40 @@ def current_labels(players_file='players.toml') -> dict:
     """{identity: label} for the players in the current players.toml that set a label."""
     try:
         from .runner import load_players
-        return {identity(p, s): s['label'] for p, s in load_players(players_file).items() if s.get('label')}
+        return {_base(identity(p, s)): s['label'] for p, s in load_players(players_file).items() if s.get('label')}
     except Exception:
         return {}
 
 
+def _base(ident: str) -> str:
+    return ident.split('!served=', 1)[0].split('#', 1)[0]
+
+
 def all_time(db, boot=200, players_file='players.toml', seed=0) -> dict:
-    """The leaderboard over every run in the database, one player per model and reasoning level."""
-    from .ratings import BLOCK, quarantine_reason, rate
+    """The leaderboard over every run in the database, one player per model, reasoning level and protocol.
+    Descriptive only: no verdict, rank or leader here is a test result."""
+    from .ratings import quarantine_reason, identity_resolved, rate, served_mismatch
     con = connect(db)
-    rows = con.execute('SELECT run, matchup, deal, a_identity, b_identity, net_a, bb, game_key, fp FROM deals').fetchall()
+    rows = con.execute('SELECT run, matchup, deal, a_identity, b_identity, net_a, bb, game_key, fp, seed FROM deals').fetchall()
     matches = con.execute('SELECT run, game_key, code_version, started, hands_done, finished, identities '
                           'FROM matches').fetchall()
     people = con.execute('SELECT run, pid, identity, label, kind, spec FROM players').fetchall()
-    tallies = con.execute('SELECT t.identity, t.counts, t.served, m.game_key, m.identities FROM tallies t '
+    tallies = con.execute('SELECT m.run, t.identity, t.counts, t.served, m.game_key, m.identities, m.players FROM tallies t '
                           'JOIN matches m ON m.id = t.match_id').fetchall()
     con.close()
+
+    # a model that answered for a player in a run, other than the one configured: that run's deals of it are
+    # quarantined under their own identity
+    served = defaultdict(set)
+    for run, ident, _, sv, *_ in tallies:
+        served[(run, ident)] |= set(json.loads(sv or '[]'))
+    swap = {}
+    for (run, ident), models in served.items():
+        parts = _base(ident).split(':')
+        wrong = served_mismatch(parts[1], models) if len(parts) >= 3 and parts[0] != 'bot' else []
+        if wrong:
+            swap[(run, ident)] = f'{ident}!served={",".join(wrong)}'
+    rename = lambda run, ident: swap.get((run, ident), ident)
 
     # the settings most deals were played under; deals under other settings are listed, not pooled
     per_key = defaultdict(int)
@@ -227,22 +256,23 @@ def all_time(db, boot=200, players_file='players.toml', seed=0) -> dict:
     playing = set()
     for run, gk, cv, started, _, finished, idents in matches:
         if not finished:
-            playing |= set(json.loads(idents or '[]'))
+            playing |= {rename(run, i) for i in json.loads(idents or '[]')}
         x = runs[run]
         x['code_versions'].add(cv)
         x['game_keys'].add(gk)
         if started and (x['started'] is None or started < x['started']):
             x['started'] = started
     deals = []
-    for run, mu, k, a, b, net, bb, gk, fp in rows:
+    for run, mu, k, a, b, net, bb, gk, fp, sd in rows:
         if gk != main:
             continue
-        if a == b:   # two ids for the same model and level: no information about how good it is
+        a, b = rename(run, a), rename(run, b)
+        if a == b:   # two ids for the same model, level and protocol: no information about how good it is
             runs[run]['self_play'] += 1
             continue
         runs[run]['deals'] += 1
         deals.append({'a': a, 'b': b, 'matchup': mu if run == '.' else f'{run}/{mu}', 'deal': k, 'net_a': net, 'bb': bb,
-                      'fp': fp, 'order': runs[run]['started'] or 0})
+                      'fp': fp, 'seed': sd, 'order': runs[run]['started'] or 0})
 
     # names: a label from the current players.toml, else the newest one recorded, else one made from the spec
     newest = {}
@@ -250,35 +280,44 @@ def all_time(db, boot=200, players_file='players.toml', seed=0) -> dict:
     order = sorted(people, key=lambda p: runs[p[0]]['started'] or 0)
     from .server import display_name
     for run, pid, ident, lab, kind, spec in order:
+        ident = rename(run, ident)
         try:
             newest[ident] = display_name(pid, json.loads(spec))   # today's naming, not the one stored at sync time
         except (TypeError, ValueError):
             newest[ident] = lab
         kinds[ident] = kind
         pids[ident].add(pid)
-    labels = {**newest, **{k: v for k, v in current_labels(players_file).items() if k in newest}}
+    current = current_labels(players_file)
+    labels = {**newest, **{k: current[_base(k)] for k in newest if _base(k) in current}}
     _disambiguate(labels)
 
     meta = {i: {'identity': i, 'kind': kinds.get(i) or ('bot' if i.startswith('bot:') else 'model'),
-                'quarantine_reason': quarantine_reason(i)} for i in {p for d in deals for p in (d['a'], d['b'])}}
+                'quarantine_reason': quarantine_reason(i), 'identity_resolved': identity_resolved(i)}
+            for i in {p for d in deals for p in (d['a'], d['b'])}}
     left = [run for run, x in runs.items() if x['game_keys'] and main not in x['game_keys']]
     notes = [f'Left out (other game settings): {", ".join(sorted(left))}.'] if left else []
     if sum(1 for d in deals if d['fp'] is None):
         notes.append('Some deals have no recorded seed (their folders were deleted before seeds were indexed), so '
                      'repeats among them cannot be detected.')
-    r = rate(deals, boot=boot, seed=seed, meta=meta, pooled=True, notes=notes, playing=playing,
-             design={'alpha': 0.05, 'round_deals': None, 'max_rounds': 1, 'block': BLOCK, 'pooled': True})
+    if any('#' not in i for i, m in meta.items() if m['kind'] == 'model'):
+        notes.append('Players from runs before protocols were recorded are kept apart from later runs of the same '
+                     'model and level (their settings cannot be compared).')
+    r = rate(deals, boot=boot, seed=seed, meta=meta, pooled=True, notes=notes, playing=playing)
 
-    stats, served = defaultdict(dict), defaultdict(set)
-    for ident, counts, sv, gk, seats in tallies:
-        if gk == main and len(set(json.loads(seats))) > 1:   # as in the rating: no self-play
-            add(stats[ident], json.loads(counts))
-            served[ident] |= set(json.loads(sv))
-    r['stats'] = {i: summarize(s, served[i]) for i, s in stats.items()}
+    stats, servedp = defaultdict(dict), defaultdict(set)
+    for run, ident, counts, sv, gk, seats, pl in tallies:
+        idents = json.loads(seats or '[]')
+        if gk == main and len(set(idents)) > 1:   # as in the rating: no self-play
+            ids = dict(zip(json.loads(pl or '[]'), idents))
+            add(stats[rename(run, ident)], _by_identity(json.loads(counts), {p: rename(run, i) for p, i in ids.items()}))
+            servedp[rename(run, ident)] |= set(json.loads(sv))
+    r['stats'] = {i: summarize(s, servedp[i]) for i, s in stats.items()}
 
     included = [run for run, x in runs.items() if x['deals']]
     left_out = [{'run': run, 'reason': 'other game settings'} for run, x in runs.items()
                 if x['game_keys'] and main not in x['game_keys']]
+    left_out += [{'run': run, 'player': ident, 'reason': f'answered by {swap[(run, ident)].split("=", 1)[1]}'}
+                 for run, ident in sorted(swap)]
     versions = sorted({v for run in included for v in runs[run]['code_versions'] if v})
     if len(versions) > 1:
         r['notes'].insert(0, f'Pooled across {len(versions)} code versions.')
@@ -300,20 +339,39 @@ def all_time(db, boot=200, players_file='players.toml', seed=0) -> dict:
     return r
 
 
+def _by_identity(counts: dict, ids: dict) -> dict:
+    """A tally's per-opponent keys (vs:<player id>:...) renamed to the opponent's identity."""
+    out = {}
+    for k, v in counts.items():
+        if k.startswith('vs:'):
+            pid, rest = k[3:].rsplit(':', 1)
+            k = f'vs:{ids.get(pid, pid)}:{rest}'
+        out[k] = v
+    return out
+
+
 def _disambiguate(labels: dict):
     """Identities that would show the same name get what tells them apart: the backend of a model (one
-    model through two CLIs), the settings of a bot, else the whole identity."""
-    def tell(ident):
-        parts = ident.split(':')
+    model through two CLIs), else its protocol (or the model that answered), the settings of a bot, else the
+    whole identity."""
+    def backend(ident):
+        parts = _base(ident).split(':')
         return ':'.join(parts[2:]) or 'default' if parts[0] == 'bot' else parts[0]
+
+    def protocol(ident):
+        if '!served=' in ident:
+            return 'answered by ' + ident.split('!served=', 1)[1]
+        return f'protocol {ident.split("#", 1)[1][:8]}' if '#' in ident else 'protocol not recorded'
     by = defaultdict(list)
     for ident, lab in labels.items():
         by[lab].append(ident)
     for lab, idents in by.items():
         if len(idents) > 1:
-            unique = len({tell(i) for i in idents}) == len(idents)
+            for tell in (backend, protocol, lambda i: i):
+                if len({tell(i) for i in idents}) == len(idents):
+                    break
             for ident in idents:
-                labels[ident] = f'{lab} ({tell(ident) if unique else ident})'
+                labels[ident] = f'{lab} ({tell(ident)})'
 
 
 def table(r) -> str:

@@ -5,22 +5,26 @@ matches on the same deals with the seats swapped: in hand k each player gets, in
 cards against the other player, so the luck of the deal cancels.
 
 A match directory holds:
-    config.json       the manifest (game, players by seat, specs, seeds, deal fingerprints, system prompts)
-                      and the audit (code version, CLI versions, effective settings per seat, round/replicate)
+    config.json       the manifest (game, players by seat, specs, seeds, deal fingerprints, system prompts,
+                      each player's protocol) and the audit (code version, CLI versions, effective settings
+                      per seat, round/replicate)
     events.jsonl      every event, with which seats could see it (the viewer reads this); `thought` events
                       carry requested / executed / correction for every decision
-    calls.jsonl       every model call: prompt, reply, reasoning, usage, latency, command line, errors, and
-                      the failed tries and rate-limit waits before it
-    raw.jsonl         the CLI's raw output for every call
+    calls.jsonl       every model call: prompt, reply, reasoning, usage, latency, command line, CLI session
+                      before and after, tools used, errors, and the failed tries and rate-limit waits before it
+    raw.jsonl         the CLI's raw output (exit status, stdout, stderr) for every call and every failed try
     hands.jsonl       one line per finished hand: cards, board, actions, net result per seat, seed, fingerprint
-    state.json        what a stopped match needs to resume (finished hands, notes, CLI sessions, past resumes)
+    state.json        the checkpoint: hands_committed, notes, CLI sessions and turns, bot random states, resumes
     interrupted.jsonl rows of hands a stopped run had started; they are replayed from scratch
     result.json       written when the match finishes
 
-Rerunning a stopped match resumes after its last finished hand, only with the recorded settings. If the
-stopped run was inside a hand, every CLI conversation is rebuilt from the committed turns, so no seat
-remembers a hand that the record dropped. A tournament directory also holds plan.json (the plan and the
-players' specs, which a rerun must match) and decisions.json (every look of the sequential design).
+A hand is committed when its row is in hands.jsonl and state.json (written whole, then renamed into place)
+says hands_committed includes it. Rerunning a stopped match first cuts every log back to the committed hands
+(rows past them go to interrupted.jsonl), then resumes, only with the recorded settings. If the stopped run
+was inside a hand, every CLI conversation is rebuilt from the committed turns, so no seat remembers a hand
+that the record dropped. A tournament directory also holds plan.json (the plan and the players' specs, which
+a rerun must match), decisions.json (every look of the sequential design) and tournament.json (whether the
+runner is running, finished or stopped, and where each pairing stands).
 """
 from __future__ import annotations
 import asyncio
@@ -28,6 +32,7 @@ import copy
 import hashlib
 import itertools
 import json
+import os
 import time
 import tomllib
 from pathlib import Path
@@ -75,6 +80,56 @@ def _append(path: Path, obj):
         f.write(json.dumps(obj, default=str) + '\n')
 
 
+def _write(path: Path, obj, indent=None):
+    """Write a JSON file whole: a temp file, flushed to disk, renamed over the old one."""
+    tmp = path.with_name(path.name + '.tmp')
+    with tmp.open('w') as f:
+        f.write(json.dumps(obj, indent=indent, default=str))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _sync(path: Path):
+    if path.exists():
+        with path.open('a') as f:
+            os.fsync(f.fileno())
+
+
+LOGS = ('hands.jsonl', 'events.jsonl', 'calls.jsonl', 'raw.jsonl')
+
+
+def _reconcile(out: Path, done: int, resume: int) -> tuple[dict, dict]:
+    """Cut every log back to the first `done` hands. Rows of later hands move to interrupted.jsonl; lines a
+    kill left half-written are dropped. Returns ({file: rows moved}, {file: torn lines})."""
+    moved, torn = {}, {}
+    for fname in LOGS:
+        path = out / fname
+        if not path.exists():
+            continue
+        keep, late, bad = [], [], 0
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                bad += 1
+                continue
+            (keep if r.get('episode', r.get('hand', 0)) < done else late).append(r)
+        for r in late:
+            _append(out / 'interrupted.jsonl', {'file': fname, 'after_hand': done, 'resume': resume, **r})
+        if late or bad:
+            tmp = path.with_name(fname + '.tmp')
+            tmp.write_text(''.join(json.dumps(r, default=str) + '\n' for r in keep))
+            os.replace(tmp, path)
+        if late:
+            moved[fname] = len(late)
+        if bad:
+            torn[fname] = bad
+    return moved, torn
+
+
 def _read_jsonl(path: Path):
     if not path.exists():
         return []
@@ -99,13 +154,30 @@ def _same(x):
     return json.loads(json.dumps(x, default=str))
 
 
+def protocol(game, pid: str, spec: dict, seats: int = 2) -> dict:
+    """What a player's results depend on, the same in every seat, match and run: the effective settings that
+    change play (backend, model, effort, isolation, instructions, tool policy, extra args, retries, fixes,
+    thinking display ... or a bot's settings) and the sha1 of the game's system prompt with the names and the
+    number of hands left out. `fingerprint` is the sha1 of the settings."""
+    template = game.system_prompt('{player}', ['{player}'] + ['{opponent}'] * (seats - 1), '{hands}')
+    agent = make_agent(pid, spec)
+    agent.start(template, game.response_schema())
+    settings = agent.protocol()
+    if agent.kind == 'model':
+        settings['system_prompt_sha1'] = hashlib.sha1(template.encode()).hexdigest()[:12]
+    settings = _same(settings)
+    return {'fingerprint': hashlib.sha1(json.dumps(settings, sort_keys=True).encode()).hexdigest()[:16],
+            'settings': settings}
+
+
 def match_manifest(game, seat_players: list[tuple[str, dict]], seeds: list[int]) -> dict:
     """What defines a match: resuming it with anything different would be another experiment."""
-    names = NAMES[:len(seat_players)]
+    names, n = NAMES[:len(seat_players)], len(seat_players)
     return _same({'game': game.describe(), 'players': [p for p, _ in seat_players], 'names': names, 'seeds': list(seeds),
-                  'deal_fingerprints': [game.deal_fingerprint(s, k % len(seat_players)) for k, s in enumerate(seeds)],
+                  'deal_fingerprints': [game.deal_fingerprint(s, k % n) for k, s in enumerate(seeds)],
                   'specs': {p: _public(s) for p, s in seat_players},
-                  'system_prompts': [game.system_prompt(names[i], names, len(seeds)) for i in range(len(seat_players))]})
+                  'system_prompts': [game.system_prompt(names[i], names, len(seeds)) for i in range(n)],
+                  'protocol': {p: protocol(game, p, s, n) for p, s in seat_players}})
 
 
 def manifest_diff(stored: dict, fresh: dict) -> list[str]:
@@ -124,7 +196,8 @@ def _thought_fields(d, last, err) -> dict:
     elif d.errors:
         requested = d.errors[0]['requested']
         reason = ' Then: '.join([d.errors[0]['error']] + ([last['correction']['reason']] if last.get('correction') else []))
-        correction = {'kind': 'retry', 'reason': f'asked again {len(d.errors)}x: {reason}'}
+        kind = 'tool_use' if any(e.get('kind') == 'tool_use' for e in d.errors) else 'retry'
+        correction = {'kind': kind, 'reason': f'asked again {len(d.errors)}x: {reason}'}
     elif last.get('correction'):
         requested, correction = last['requested'], last['correction']
     else:
@@ -161,35 +234,29 @@ async def run_match(game, seat_players: list[tuple[str, dict]], seeds: list[int]
     if stored is None:
         config = {**fresh, **(meta or {}), 'code_version': code_version(), 'cli_versions': versions,
                   'effective': [_same(a.describe()) for a in agents], 'started': round(time.time())}
-        (out / 'config.json').write_text(json.dumps(config, indent=2))
+        _write(out / 'config.json', config, indent=2)
     system_sha = [hashlib.sha1(p.encode()).hexdigest()[:12] for p in fresh['system_prompts']]
 
     state = json.loads((out / 'state.json').read_text()) if (out / 'state.json').exists() else {}
-    done = state.get('hands', 0)
+    done = state.get('hands_committed', state.get('hands', 0))
     pending = state.get('pending', [''] * n)
     resumes = state.get('resumes', [])
     for a, st in zip(agents, state.get('agents', [])):
         a.restore(st)
     # rows of a hand the stopped run had started: moved to interrupted.jsonl, so the logs match what is
     # replayed, and the CLI conversations (which may still hold those turns) are rebuilt from the committed ones
-    dropped = {}
-    for fname in ('events.jsonl', 'calls.jsonl', 'raw.jsonl'):
-        rows = _read_jsonl(out / fname)
-        keep = [r for r in rows if r.get('episode', r.get('hand', 0)) < done]
-        if len(keep) < len(rows):
-            dropped[fname] = len(rows) - len(keep)
-            for r in rows:
-                if r.get('episode', r.get('hand', 0)) >= done:
-                    _append(out / 'interrupted.jsonl', {'file': fname, 'after_hand': done, 'resume': len(resumes) + 1, **r})
-            (out / fname).write_text(''.join(json.dumps(r, default=str) + '\n' for r in keep))
+    dropped, torn = _reconcile(out, done, len(resumes) + 1)
+    if len(_read_jsonl(out / 'hands.jsonl')) != done:
+        raise RuntimeError(f'{out}: state.json commits {done} hands but hands.jsonl holds '
+                           f'{len(_read_jsonl(out / "hands.jsonl"))}; the record is damaged')
     rebuilt = []
     for i, a in enumerate(agents):
         if a.kind == 'model' and (dropped or a.backend.rebuilding):
             a.backend.rebuild()
             rebuilt.append(i)
-    if done or dropped:
+    if done or dropped or torn:
         resumes.append({'t': round(time.time()), 'after_hand': done, 'code_version': code_version(),
-                        'cli_versions': versions, 'dropped_rows': dropped, 'rebuilt_seats': rebuilt})
+                        'cli_versions': versions, 'dropped_rows': dropped, 'torn_lines': torn, 'rebuilt_seats': rebuilt})
         log(f'{out}: resuming after hand {done}' + (f'; dropped an interrupted hand, rebuilt seats {rebuilt}'
                                                     if dropped else ''))
     totals = [0] * n
@@ -219,6 +286,16 @@ async def run_match(game, seat_players: list[tuple[str, dict]], seeds: list[int]
             for c in calls:
                 c = dict(c)
                 raw = c.pop('raw', None)
+                tries = []
+                for j, f in enumerate(c.get('failed_attempts') or []):
+                    f = dict(f)
+                    f_raw = f.pop('raw', None)
+                    if f_raw:
+                        _append(out / 'raw.jsonl', {'hand': k, 'seat': seat, 'attempt': c.get('attempt'),
+                                                    'failed_try': j, **f_raw})
+                    tries.append(f)
+                if tries:
+                    c['failed_attempts'] = tries
                 _append(out / 'calls.jsonl', {'hand': k, 'seat': seat, 'player': ids[seat],
                                               'system_sha1': system_sha[seat], **c})
                 if raw:
@@ -260,17 +337,20 @@ async def run_match(game, seat_players: list[tuple[str, dict]], seeds: list[int]
         summary = {**ep.summary(), 'seed': seeds[k], 'fingerprint': fresh['deal_fingerprints'][k],
                    't': round(time.time(), 1)}  # when it finished: the viewer's progress and ETA
         totals = [t + x for t, x in zip(totals, ep.payoffs)]
+        # the commit: the hand's rows reach the disk, then the checkpoint that counts them replaces the old one
         _append(out / 'hands.jsonl', summary)
-        state = {'hands': k + 1, 'pending': pending, 'agents': [a.state() for a in agents], 'fallbacks': fallbacks,
-                 'resumes': resumes}
-        (out / 'state.json').write_text(json.dumps(state, default=str))
+        for fname in LOGS:
+            _sync(out / fname)
+        state = {'hands_committed': k + 1, 'hands': k + 1, 'pending': pending, 'agents': [a.state() for a in agents],
+                 'fallbacks': fallbacks, 'resumes': resumes}
+        _write(out / 'state.json', state)
         log(f'{out.name} hand {k + 1}/{len(seeds)}: ' + ', '.join(f'{ids[i]} {ep.payoffs[i]:+d}' for i in range(n))
             + ' | total ' + ', '.join(f'{ids[i]} {totals[i]:+d}' for i in range(n)))
 
     result = {'players': ids, 'names': names, 'hands': len(seeds), 'net': totals,
               'bb_per_100': [round(t / game.big_unit / len(seeds) * 100, 1) for t in totals],
               'fallbacks': fallbacks, 'resumes': len(resumes), 'seconds': round(time.time() - started, 1)}
-    (out / 'result.json').write_text(json.dumps(result, indent=2))
+    _write(out / 'result.json', result, indent=2)
     return result
 
 
@@ -281,15 +361,17 @@ def matchup_name(a, b, round_=1, replicate=1):
 
 
 async def run_duplicate(game, a: tuple[str, dict], b: tuple[str, dict], seeds, out: Path, *, sems=(), log=print,
-                        round_=1, replicate=1):
+                        round_=1, replicate=1, on_start=None):
     """Both matches of a duplicate pair; they share deals and run at the same time (each holding `sems`,
-    the concurrency slots of the CLIs it uses, while it plays)."""
+    the concurrency slots of the CLIs it uses, while it plays; `on_start()` is called once one holds them)."""
     out = Path(out) / matchup_name(a[0], b[0], round_, replicate)
     meta = {'pairing': [a[0], b[0]], 'round': round_, 'replicate': replicate}
 
     async def one(order, label, s):
         for sem in sems:
             await sem.acquire()
+        if on_start:
+            on_start()
         try:
             return await run_match(game, order, seeds, out / label, log=log, agent_seed=s,
                                    meta={**meta, 'order': label})
@@ -314,19 +396,23 @@ def make_plan(player_ids, deals=50, seed=1000, out='runs/pilot', game='holdem', 
 
 
 def plan_design(plan: dict) -> dict | None:
-    """The plan's sequential design; an older plan's `until_decided` (a cap in deals) becomes max_rounds.
-    None: one round and no stopping rule."""
+    """The plan's sequential design, as `ratings.normalize_design` fills it in (replicates included), so the
+    runner's stopping rule and the ratings' verdicts use the same one. None: one round and no stopping rule."""
+    from . import ratings
+    if hasattr(ratings, 'normalize_design'):
+        return ratings.normalize_design(plan)
+    reps = {'replicates': plan.get('replicates') or 1}
     if plan.get('design'):
-        return {**DESIGN, 'round_deals': plan['deals'], **plan['design']}
+        return {**DESIGN, 'round_deals': plan['deals'], **plan['design'], **reps}
     if plan.get('until_decided'):
-        return {**DESIGN, 'round_deals': plan['deals'], 'max_rounds': max(1, plan['until_decided'] // plan['deals'])}
+        return {**DESIGN, 'round_deals': plan['deals'], 'max_rounds': max(1, plan['until_decided'] // plan['deals']),
+                **reps}
     return None
 
 
 def round_seeds(plan: dict, round_: int, replicate: int) -> list[int]:
     """Every pairing plays the same deals in the same round and replicate; no deal repeats within a plan."""
-    design, reps = plan_design(plan), plan.get('replicates', 1)
-    size = design['round_deals'] if design else plan['deals']
+    reps, size = plan.get('replicates', 1), plan['deals']
     start = plan['seed'] + ((round_ - 1) * reps + replicate - 1) * size
     return list(range(start, start + size))
 
@@ -356,7 +442,47 @@ def _record_decision(out: Path, a, b, v: dict):
     allv = json.loads(path.read_text()) if path.exists() else {}
     looks = allv.setdefault(matchup_name(a, b), [])
     looks[v['looks_used'] - 1:] = [{'t': round(time.time()), **v}]
-    path.write_text(json.dumps(allv, indent=2, default=str))
+    _write(path, allv, indent=2)
+
+
+TERMINAL = {'a': 'decided', 'b': 'decided', 'even': 'decided'}
+
+
+class Lifecycle:
+    """<out>/tournament.json: whether the runner is running, finished or stopped, the round being played, and
+    each pairing's status ('waiting' for its turn or its next round, 'playing', 'decided', 'exhausted'), with
+    its latest verdict and looks used. Pairings this invocation doesn't run keep their recorded state."""
+
+    def __init__(self, out: Path, plan: dict, rounds: int):
+        self.path, self.rounds = out / 'tournament.json', rounds
+        old = json.loads(self.path.read_text()) if self.path.exists() else {}
+        recorded = json.loads((out / 'decisions.json').read_text()) if (out / 'decisions.json').exists() else {}
+        self.doc = {'status': 'running', 'round': old.get('round', 0), 'pairings': {}, 'pid': os.getpid(),
+                    'started': round(time.time()), 'updated': None}
+        for a, b in plan['matchups']:
+            looks = recorded.get(matchup_name(a, b)) or []
+            last = looks[-1] if looks else {}
+            status = TERMINAL.get(last.get('verdict')) or (
+                'exhausted' if last and last.get('looks_used', 0) >= rounds else 'waiting')
+            self.doc['pairings'][f'{a}|{b}'] = {'status': status, 'verdict': last.get('verdict'),
+                                                'looks_used': last.get('looks_used', 0),
+                                                'round': last.get('looks_used', 0)}
+        self.write()
+
+    def write(self):
+        self.doc['updated'] = round(time.time(), 1)
+        _write(self.path, self.doc, indent=2)
+
+    def pairing(self, a, b, **kw):
+        self.doc['pairings'][f'{a}|{b}'].update(kw)
+        if kw.get('round'):
+            self.doc['round'] = max(self.doc['round'], kw['round'])
+        self.write()
+
+    def end(self, status=None):
+        done = all(p['status'] in ('decided', 'exhausted') for p in self.doc['pairings'].values())
+        self.doc['status'] = status or ('finished' if done else 'stopped')
+        self.write()
 
 
 async def run_plan(plan: dict, *, only=None, concurrency=None, log=print):
@@ -372,7 +498,7 @@ async def run_plan(plan: dict, *, only=None, concurrency=None, log=print):
     players = load_players(plan.get('players_file', 'players.toml'), effort=plan.get('effort'))
     design, reps = plan_design(plan), plan.get('replicates', 1)
     rounds = design['max_rounds'] if design else 1
-    cfg = {'hands_per_match': design['round_deals'] if design else plan['deals'], **plan.get('game_config', {})}
+    cfg = {'hands_per_match': plan['deals'], **plan.get('game_config', {})}
     game = get_game(plan.get('game', 'holdem'))(cfg)
     limit = concurrency or plan.get('concurrency', 2)
     out = Path(plan['out'])
@@ -409,31 +535,43 @@ async def run_plan(plan: dict, *, only=None, concurrency=None, log=print):
     out.mkdir(parents=True, exist_ok=True)
     from .server import display_name
     labels = {pid: display_name(pid, spec) for pid, spec in players.items() if pid in plan['players']}
-    (out / 'plan.json').write_text(json.dumps({**plan, **manifest, 'labels': labels, 'code_version': code_version(),
-                                               'created': (stored or {}).get('created') or round(time.time())},
-                                              indent=2))  # for the viewer, and the manifest a rerun must match
+    _write(out / 'plan.json', {**plan, **manifest, 'labels': labels, 'code_version': code_version(),
+                               'created': (stored or {}).get('created') or round(time.time())},
+           indent=2)  # for the viewer, and the manifest a rerun must match
+    life = Lifecycle(out, plan, rounds)
     sems = {}
     tasks = []
 
     async def pairing(a, b, mine):
         folders = []
-        for r in range(1, rounds + 1):
-            names = [matchup_name(a, b, r, j) for j in range(1, reps + 1)]
-            res = await asyncio.gather(*[
-                run_duplicate(game, (a, players[a]), (b, players[b]), round_seeds(plan, r, j), out, sems=mine,
-                              log=log, round_=r, replicate=j) for j in range(1, reps + 1)])
-            folders += names
-            if not design:
-                return res
-            from . import ratings
-            xs, groups = _pair_xs(out, folders, a, game.big_unit)
-            v = ratings.decide(xs, design, len(plan['matchups']), r, groups=groups)
-            _record_decision(out, a, b, v)
-            if v['verdict'] in ('a', 'b', 'even') or r >= rounds:
-                who = {'a': f'{a} is ahead', 'b': f'{b} is ahead', 'even': 'even'}.get(v['verdict'], v['verdict'])
-                log(f'{a} vs {b}: {who} after {r} of {rounds} rounds ({v.get("deals")} deals, '
-                    f'{a} {v.get("edge") if v.get("edge") is not None else "?"} bb/100)')
-                return v
+        try:
+            for r in range(1, rounds + 1):
+                names = [matchup_name(a, b, r, j) for j in range(1, reps + 1)]
+                life.pairing(a, b, status='waiting')
+                res = await asyncio.gather(*[
+                    run_duplicate(game, (a, players[a]), (b, players[b]), round_seeds(plan, r, j), out, sems=mine,
+                                  log=log, round_=r, replicate=j,
+                                  on_start=lambda r=r: life.pairing(a, b, status='playing', round=r))
+                    for j in range(1, reps + 1)])
+                folders += names
+                if not design:
+                    life.pairing(a, b, status='exhausted', looks_used=1)
+                    return res
+                from . import ratings
+                xs, groups = _pair_xs(out, folders, a, game.big_unit)
+                v = ratings.decide(xs, design, len(plan['matchups']), r, groups=groups)
+                _record_decision(out, a, b, v)
+                final = v['verdict'] in TERMINAL or r >= rounds
+                life.pairing(a, b, verdict=v['verdict'], looks_used=v['looks_used'],
+                             status=TERMINAL.get(v['verdict']) or ('exhausted' if final else 'waiting'))
+                if final:
+                    who = {'a': f'decided: {a} is better', 'b': f'decided: {b} is better', 'even': 'decided: even (within the equivalence margin)', 'exhausted': 'undecided, every planned look used'}.get(v['verdict'], v['verdict'])
+                    log(f'{a} vs {b}: {who} after {r} of {rounds} rounds ({v.get("deals")} deals, '
+                        f'{a} {v.get("edge") if v.get("edge") is not None else "?"} bb/100)')
+                    return v
+        except Exception as e:
+            life.pairing(a, b, status='waiting', error=repr(e)[:500])
+            raise
 
     for a, b in plan['matchups']:
         if only and matchup_name(a, b) not in only and a not in only and b not in only:
@@ -441,8 +579,13 @@ async def run_plan(plan: dict, *, only=None, concurrency=None, log=print):
         kinds = sorted({players[p]['backend'] for p in (a, b) if not is_bot(players[p])})  # sorted: no deadlock
         mine = [sems.setdefault(k, asyncio.Semaphore(limit)) for k in kinds]
         tasks.append(pairing(a, b, mine))
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    try:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    except BaseException:
+        life.end('stopped')
+        raise
     for r in results:
         if isinstance(r, Exception):
             log(f'matchup failed (rerun the same command to resume): {r!r}')
+    life.end()
     return results

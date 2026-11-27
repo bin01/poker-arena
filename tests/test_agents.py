@@ -70,7 +70,7 @@ class TestModelPipeline(unittest.TestCase):
             # resume: drop the result and the last two hands, rerun, get the same number of hands
             (m / 'result.json').unlink()
             st = json.loads((m / 'state.json').read_text())
-            st['hands'] = 4
+            st['hands'] = st['hands_committed'] = 4
             (m / 'state.json').write_text(json.dumps(st))
             lines = (m / 'hands.jsonl').read_text().splitlines()[:4]
             (m / 'hands.jsonl').write_text('\n'.join(lines) + '\n')

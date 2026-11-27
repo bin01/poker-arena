@@ -6,8 +6,11 @@ request prompt, and answers with the game's JSON (reasoning, action, amount, say
 can't be parsed or played (the game's `apply` returns an error, which includes strategically different
 actions it won't convert) is sent back with the error; after `max_fixes` tries the seat takes the game's
 fallback (check or fold). Every attempt is kept in `Decision.calls`, every refusal in `Decision.errors`.
+A reply from a turn that ran (or tried) a tool is never used: the turn is taken back, the CLI conversation is
+rebuilt without it, and the seat is asked again (an error of kind `tool_use`).
 
-Bots read the request's structured data and never talk. They cost nothing and anchor the ratings.
+Bots read the request's structured data and never talk. They cost nothing and anchor the ratings; their
+random state is saved with the match, so a resumed match plays exactly as an uninterrupted one.
 """
 from __future__ import annotations
 import json
@@ -28,7 +31,7 @@ class Decision:
     raw: str = ''
     calls: list = field(default_factory=list)   # one entry per model call made for this decision
     fallback: bool = False
-    errors: list = field(default_factory=list)  # [{requested: {action, amount} | None, error}] per refused reply
+    errors: list = field(default_factory=list)  # [{requested: {action, amount} | None, error, kind}] per refused reply
 
 
 def parse_json(text: str) -> dict | None:
@@ -78,6 +81,10 @@ class Agent:
         """The settings this seat actually plays with, defaults included, for the match's config."""
         return dict(self.spec)
 
+    def protocol(self) -> dict:
+        """The settings a player's results depend on, the same in every seat (no seat seeds, no seat names)."""
+        return {k: v for k, v in self.describe().items() if k != 'seed'}
+
     async def act(self, text: str, request, validate) -> Decision:
         raise NotImplementedError
 
@@ -105,6 +112,10 @@ class ModelAgent(Agent):
         return {'backend': self.backend_kind, 'max_fixes': self.max_fixes, 'max_say_words': self.max_say_words,
                 'max_notes_words': self.max_notes_words, **(self.backend.describe() if self.backend else self.backend_kw)}
 
+    def protocol(self):
+        return {'backend': self.backend_kind, 'max_fixes': self.max_fixes, 'max_say_words': self.max_say_words,
+                'max_notes_words': self.max_notes_words, **self.backend.protocol()}
+
     def state(self):
         return {'notes': self.notes, 'backend': self.backend.state() if self.backend else {}}
 
@@ -120,7 +131,7 @@ class ModelAgent(Agent):
 
     async def act(self, text, request, validate) -> Decision:
         """`validate(action) -> error or None` checks an action without playing it."""
-        message = text
+        message = base = text   # base: the message without a tool-use notice
         calls, errors = [], []
         for attempt in range(self.max_fixes + 1):
             try:
@@ -130,9 +141,20 @@ class ModelAgent(Agent):
                               'backend_failed': True, **getattr(e, 'meta', {})})
                 e.calls = calls
                 raise
-            obj = parse_json(reply.text)
             calls.append({'prompt': message, 'output': reply.text, 'thinking': reply.thinking, 'usage': reply.usage,
                           'latency': reply.latency, 'attempt': attempt, **reply.meta})
+            if reply.meta.get('tool_use'):
+                used = ', '.join(sorted({str(t.get('name') or t.get('type')) for t in reply.meta['tool_use']}))
+                error = f'Your reply used a tool ({used}). Tools are not allowed in this match.'
+                calls[-1].update(error=error, rejected='tool_use')
+                obj = parse_json(reply.text)
+                errors.append({'requested': None if obj is None else
+                               {'action': json_safe(obj.get('action')), 'amount': json_safe(obj.get('amount'))},
+                               'error': error, 'kind': 'tool_use'})
+                self.backend.forget_last()   # the model never saw that turn happen; nor does the record
+                message = f'{error} Decide from the information given here, without any tools.\n\n{base}'
+                continue
+            obj = parse_json(reply.text)
             if obj is None:
                 error = 'Your reply was not a JSON object.'
             else:
@@ -145,15 +167,31 @@ class ModelAgent(Agent):
             calls[-1]['error'] = error
             errors.append({'requested': None if obj is None else
                            {'action': json_safe(obj.get('action')), 'amount': json_safe(obj.get('amount'))},
-                           'error': error})
-            message = (f'That reply could not be played: {error}\nReply again with only the JSON object.\n\n'
-                       f'{request.prompt}')
+                           'error': error, 'kind': 'invalid'})
+            message = base = (f'That reply could not be played: {error}\nReply again with only the JSON object.\n\n'
+                              f'{request.prompt}')
         return Decision({}, '', '', calls[-1]['output'] if calls else '', calls, fallback=True, errors=errors)
 
 
 # ---- baseline bots ------------------------------------------------------------------------------
 
-class RandomBot(Agent):
+class SeededBot(Agent):
+    """A bot with its own random generator, saved and restored with the match."""
+    kind = 'bot'
+    rng: random.Random
+
+    def state(self):
+        v, internal, gauss = self.rng.getstate()
+        return {'notes': self.notes, 'rng': [v, list(internal), gauss]}
+
+    def restore(self, st):
+        super().restore(st)
+        if st.get('rng'):
+            v, internal, gauss = st['rng']
+            self.rng.setstate((v, tuple(internal), gauss))
+
+
+class RandomBot(SeededBot):
     """Picks a legal action uniformly (never folds when it can check); raises to a random legal size."""
     kind = 'bot'
 
@@ -181,7 +219,7 @@ class CallingStation(Agent):
         return Decision({'action': 'check' if 'check' in request.legal else 'call'}, 'always call')
 
 
-class RuleBot(Agent):
+class RuleBot(SeededBot):
     """A simple equity player: Monte Carlo equity against one random hand, compared with pot odds.
     Value-bets strong hands (about 3/4 pot), calls when the price is right, otherwise checks or folds.
     It does not bluff and does not adapt to its opponent."""

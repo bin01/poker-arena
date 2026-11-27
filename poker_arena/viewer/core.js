@@ -38,29 +38,52 @@
     return !!r && ('objective' in r || 'pairings' in r || (r.players || []).some(p => 'strength' in p));
   }
 
-  function normalize(r) {
+  const DECIDED = ['a', 'b', 'even'];
+  const isDecided = p => !!p && DECIDED.includes(p.verdict);
+  const playerId = x => x == null ? null : typeof x === 'object' ? x.player : x;
+
+  // `pooled`: an all-runs view, which is descriptive only: no pairing verdict there is a decision.
+  function normalize(r, { pooled = false } = {}) {
     r = r || {};
-    if (isContract(r)) {
-      const players = (r.players || []).map(p => ({ rank_tied_with: [], quarantined: false, ...p }));
-      const names = players.map(p => p.player);
-      const leaders = (Array.isArray(r.leaders) ? r.leaders : r.leader == null ? [] : Array.isArray(r.leader) ? r.leader : [r.leader]).filter(Boolean);
-      return {
-        ...r, contract: true, players, leaders,
-        components: r.components && r.components.length ? r.components : names.length ? [names] : [],
-        pairings: r.pairings || [], roster: r.roster || [], notes: r.notes || [],
-        hands: r.hands ?? players.reduce((s, p) => s + (p.hands || 0), 0) / 2,
-      };
+    const out = isContract(r) ? fromContract(r) : fromLegacy(r);
+    if (pooled) {
+      out.pairings = out.pairings.map(p => ({ ...p, verdict_recorded: p.verdict, verdict: 'descriptive' }));
+      out.leaders = [];
+      out.players = out.players.map(p => ({ ...p, rank_kind: 'descriptive' }));
     }
+    out.pooled = pooled;
+    out.groups = groupsOf(out, r.groups, pooled);
+    return out;
+  }
+
+  function fromContract(r) {
+    const players = (r.players || []).map(p => ({
+      rank_tied_with: [], quarantined: false, ...p,
+      identity_resolved: p.identity_resolved ?? !p.quarantined,
+      in_fit: p.in_fit ?? p.strength != null,
+      rank_kind: p.rank_kind || 'descriptive',
+    }));
+    const names = players.map(p => p.player);
+    const leaders = (Array.isArray(r.leaders) ? r.leaders : r.leader == null ? [] : Array.isArray(r.leader) ? r.leader : [r.leader]).filter(Boolean);
+    return {
+      ...r, contract: true, players, leaders,
+      components: r.components && r.components.length ? r.components : names.length ? [names] : [],
+      pairings: r.pairings || [], roster: r.roster || [], notes: r.notes || [],
+      hands: r.hands ?? players.reduce((s, p) => s + (p.hands || 0), 0) / 2,
+    };
+  }
+
+  function fromLegacy(r) {
     const legacy = r.players || [];
     const names = legacy.map(p => p.player);
     const players = legacy.map(p => ({
       player: p.player, kind: (r.kinds || {})[p.player], component: 0,
       strength: p.bb_per_100 ?? null, strength_ci95: p.bb_per_100_ci95 || null,
-      rank: null, rank_tied_with: names.filter(n => n !== p.player),
+      rank: null, rank_kind: 'descriptive', rank_tied_with: names.filter(n => n !== p.player),
       net_bb: p.net_bb, hands: p.hands, deals: Math.round((p.hands || 0) / 2),
       session_elo: p.elo ?? null, session_elo_ci95: p.elo90 || null, sessions: p.sessions,
       session_w: p.session_wins, session_t: p.session_ties, session_l: p.session_losses,
-      quarantined: false, quarantine_reason: null,
+      quarantined: false, quarantine_reason: null, in_fit: p.bb_per_100 != null, identity_resolved: true,
     })).sort((x, y) => (y.strength ?? -1e9) - (x.strength ?? -1e9));
     const pairings = (r.matchups || []).map(m => {
       const edge = m.a_bb_per_100 ?? 0;
@@ -78,6 +101,32 @@
     };
   }
 
+  // A leader is inferential: a decided win over every other player of its group. Without the ratings'
+  // own groups, they are rebuilt from the components and the pairings' verdicts.
+  function decidedLeader(members, pairings) {
+    if (members.length < 2) return null;
+    return members.find(p => members.every(q => q === p || pairings.some(x =>
+      ((x.a === p && x.b === q && x.verdict === 'a') || (x.a === q && x.b === p && x.verdict === 'b'))))) || null;
+  }
+
+  function groupsOf(rt, given, pooled) {
+    const fit = new Set(rt.players.filter(p => p.in_fit).map(p => p.player));
+    const byId = Object.fromEntries(rt.players.map(p => [p.player, p]));
+    const own = Array.isArray(given) && given.length;
+    const list = own ? given.map((g, i) => ({ ...g, id: g.id ?? i, players: g.players || rt.components[i] || [] }))
+      : rt.components.map((c, i) => ({ id: i, players: c }));
+    return list.map((g, i) => {
+      const members = g.players.filter(p => fit.has(p));
+      const ranked = members.map(p => byId[p]).filter(p => p && p.strength != null).sort((x, y) => y.strength - x.strength);
+      const pairings = rt.pairings.filter(p => g.players.includes(p.a) && g.players.includes(p.b));
+      const leader = pooled ? null : own ? playerId(g.leader) : decidedLeader(members, pairings);
+      const front = playerId(g.front_runner) || (ranked[0] && ranked[0].player) || null;
+      const margin = g.front_runner_margin ?? (ranked.length > 1 ? ranked[0].strength - ranked[1].strength : null);
+      return { ...g, index: i, members, ranked: ranked.map(p => p.player), pairings,
+        leader: leader && members.includes(leader) ? leader : null, front_runner: front, front_runner_margin: margin };
+    });
+  }
+
   // Which side a verdict favours, as {winner, loser} or null.
   function verdictSides(p) {
     if (p.verdict === 'a') return { winner: p.a, loser: p.b };
@@ -85,23 +134,28 @@
     return null;
   }
 
-  // A verdict in words: {tone, short, long}. `name` turns a player id into display text.
+  // A verdict in words: {tone, short, long, decided}. `name` turns a player id into display text.
+  // Only a/b/even come from the sequential procedure; everything else is described, not decided.
   function verdict(p, name = x => x) {
     const sides = verdictSides(p);
-    const looks = p.looks_planned && p.looks_used ? ` after ${p.looks_used} of ${p.looks_planned} checks` : '';
+    const looks = p.looks_planned && p.looks_used ? ` after ${p.looks_used} of ${p.looks_planned} planned checks` : '';
     const band = p.equiv_bb100 ?? 15;
     const ahead = (p.edge ?? 0) >= 0 ? p.a : p.b;
+    const behind = ahead === p.a ? p.b : p.a;
+    const level = !p.edge;
     switch (p.verdict) {
       case 'a': case 'b':
-        return { tone: 'won', short: `${name(sides.winner)} wins`, long: `${name(sides.winner)} is better than ${name(sides.loser)}${looks}: the edge cleared the bar for calling it.` };
+        return { tone: 'won', decided: true, short: `${name(sides.winner)} wins`, long: `Decided${looks}: ${name(sides.winner)} beats ${name(sides.loser)}; the edge cleared the sequential test's bar.` };
       case 'even':
-        return { tone: 'even', short: 'Even', long: `Within ±${band} bb/100 of each other${looks}: as good as each other at this sample.` };
+        return { tone: 'even', decided: true, short: 'Even', long: `Decided${looks}: within ±${band} bb/100 of each other.` };
       case 'exhausted':
-        return { tone: 'open', short: 'No winner', long: `Every planned check is used and neither is clearly better. ${name(ahead)} is ahead on points only.` };
+        return { tone: 'open', decided: false, short: 'No winner', long: `Every planned check is used and the difference is unresolved.${level ? '' : ` ${name(ahead)} is ahead on points only.`}` };
       case 'early':
-        return { tone: 'early', short: 'Too early', long: `Too few deals to judge${p.deals ? ` (${p.deals} so far)` : ''}.` };
+        return { tone: 'early', decided: false, short: 'Too early', long: `Too few deals to judge${p.deals ? ` (${p.deals} so far)` : ''}.` };
+      case 'descriptive':
+        return { tone: 'open', decided: false, short: level ? 'Level on points' : 'Ahead on points', long: `Pooled across runs, so descriptive only: no test decides it here.${level ? '' : ` ${name(ahead)} is ahead of ${name(behind)} on points.`}` };
       default:
-        return { tone: 'open', short: 'Undecided', long: `${name(ahead)} is ahead, but not by enough to call it yet${looks}.` };
+        return { tone: 'open', decided: false, short: 'Undecided', long: `Not decided yet${looks}.${level ? '' : ` ${name(ahead)} is ahead on points.`}` };
     }
   }
 
@@ -137,5 +191,34 @@
     return null;
   }
 
-  return { esc, MINUS, signed, plural, trim, approx, nameParts, family, isContract, normalize, verdict, verdictSides, powerLine, correction, actText };
+  // A rate as {x, n, of}: the stats' own counts when given, else rebuilt from the rate and its base.
+  function rateOf(s, k) {
+    s = s || {};
+    const v = s[k];
+    const c = v && typeof v === 'object' ? v : (s.counts || {})[k];
+    if (c && typeof c === 'object') return { x: c.of ? c.n / c.of : null, n: c.n ?? null, of: c.of ?? null };
+    if (v == null) return { x: null, n: null, of: null };
+    const of = { vpip: s.hands, pfr: s.hands, wtsd: v && s.showdowns != null ? Math.round(s.showdowns / v) : null,
+      wsd: s.showdowns, talk: s.decisions }[k] ?? null;
+    const n = k === 'wsd' && s.won_sd != null ? s.won_sd : k === 'wtsd' && s.showdowns != null ? s.showdowns
+      : of != null ? Math.round(v * of) : null;
+    return { x: v, n, of };
+  }
+
+  // The preregistered target edge and how far some pairings are from it:
+  // {target, need, planned (from the design, or from the spread seen so far), have: [min, max]} or null.
+  function targetEdge(design, pairings) {
+    const have = pairings.map(p => p.deals || 0);
+    const range = have.length ? [Math.min(...have), Math.max(...have)] : [0, 0];
+    if (design && design.target_edge_bb100 && (design.deals_needed || design.deals_planned)) {
+      return { target: design.target_edge_bb100, need: design.deals_needed || design.deals_planned, allowed: design.max_deals || null,
+               power: design.power_at_max ?? null, planned: true, have: range };
+    }
+    const need = pairings.map(p => p.power?.deals_for_80pct?.['50']).filter(x => x != null);
+    if (!need.length) return null;
+    return { target: 50, need: Math.max(...need), planned: false, have: range };
+  }
+
+  return { esc, MINUS, signed, plural, trim, approx, nameParts, family, isContract, normalize, verdict, verdictSides, powerLine, correction, actText,
+    isDecided, decidedLeader, playerId, rateOf, targetEdge };
 });

@@ -105,6 +105,37 @@ class TestViewerData(unittest.TestCase):
             m = json.loads((data / f"match-{server.key('pilot/fake__vs__rule/a-first')}.json").read_text())
             self.assertEqual(m['config']['specs']['fake'], {'label': 'Fake Model 1'})  # no commands or paths
 
+    def test_lifecycle(self):
+        run = self.runs / 'pilot'
+        t = run / 'tournament.json'
+        recorded = t.read_text() if t.exists() else None
+        try:
+            if recorded is not None:
+                t.unlink()
+            life = server.lifecycle(self.runs, 'pilot', server.index(self.runs, 'pilot'))
+            self.assertEqual(life['status'], 'running')              # from the plan: station-vs-random has not played
+            self.assertEqual(life['pairings']['station|random']['status'], 'waiting')
+            self.assertIn(life['pairings']['fake|rule']['status'], ('decided', 'exhausted'))
+            t.write_text(json.dumps({'status': 'stopped', 'round': 1, 'pairings': {}, 'updated': 1}))
+            r = server.runs(self.runs)[0]
+            self.assertEqual((r['status'], r['finished']), ('stopped', False))   # the runner's own file wins
+        finally:
+            t.unlink(missing_ok=True)
+            if recorded is not None:
+                t.write_text(recorded)
+
+    def test_lifecycle_waits_for_planned_rounds(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d).resolve()
+            (root / 'r').mkdir()
+            (root / 'r' / 'plan.json').write_text(json.dumps({'matchups': [['a', 'b']], 'deals': 10, 'design': {'max_rounds': 3}}))
+            ms = [{'a': 'a', 'b': 'b', 'started': True, 'finished': True, 'live': False, 'round': 1}]
+            (root / 'r' / 'decisions.json').write_text(json.dumps({'a__vs__b': [{'verdict': 'open', 'looks_used': 1}]}))
+            self.assertEqual(server.lifecycle(root, 'r', ms)['status'], 'running')   # between rounds, not finished
+            (root / 'r' / 'decisions.json').write_text(json.dumps({'a__vs__b': [{'verdict': 'b', 'looks_used': 1}]}))
+            life = server.lifecycle(root, 'r', ms)
+            self.assertEqual((life['status'], life['pairings']['a|b']['status']), ('finished', 'decided'))
+
     def test_key_matches_the_app(self):
         self.assertEqual(server.key('pilot/a__vs__b-1/a-first'), 'pilot~2Fa__vs__b-1~2Fa-first')
         self.assertEqual(server.key('.'), '~2E')
@@ -324,6 +355,53 @@ class TestViewerLogic(unittest.TestCase):
                         ' return ["b", "even", "exhausted", "open"].map(v => Core.verdict({...p, verdict: v}).short);')
         self.assertEqual(r, ['b wins', 'Even', 'No winner', 'Undecided'])
 
+    def test_groups_leader_is_inferential(self):
+        r = self.run_js(f'const r = Core.normalize({json.dumps(CONTRACT)});'
+                        ' return r.groups.map(g => [g.leader, g.front_runner, g.members]);')
+        self.assertEqual(r, [['a', 'a', ['a', 'b']], [None, 'c', ['c', 'd']]])   # d: identity unresolved, still in the fit
+        r = self.run_js(f'const c = {json.dumps(CONTRACT)}; c.pairings[0].verdict = "open";'
+                        ' return Core.normalize(c).groups[0].leader;')
+        self.assertIsNone(r)                                    # a descriptive lead is never a leader
+
+    def test_contract_groups_and_flags(self):
+        r = self.run_js(f'const c = {json.dumps(CONTRACT)}; c.groups = [{{id: 0, players: ["a", "b"], leader: null,'
+                        ' front_runner: {player: "a"}, front_runner_margin: 80}, {id: 1, players: ["c", "d"], leader: null, front_runner: "c"}];'
+                        ' c.players[3] = {...c.players[3], in_fit: false, identity_resolved: false}; c.players[0].rank_kind = "decided";'
+                        ' const r = Core.normalize(c); return [r.groups.map(g => [g.leader, g.front_runner, g.members]),'
+                        ' r.players.map(p => [p.rank_kind, p.in_fit, p.identity_resolved])];')
+        self.assertEqual(r[0], [[None, 'a', ['a', 'b']], [None, 'c', ['c']]])
+        self.assertEqual(r[1], [['decided', True, True], ['descriptive', True, True], ['descriptive', True, True], ['descriptive', False, False]])
+
+    def test_pooled_is_descriptive(self):
+        r = self.run_js(f'const r = Core.normalize({json.dumps(CONTRACT)}, {{pooled: true}});'
+                        ' return [r.leaders, r.groups.map(g => g.leader), r.pairings.map(p => Core.verdict(p).short),'
+                        ' r.pairings.map(p => Core.verdict(p).decided)];')
+        self.assertEqual(r, [[], [None, None], ['Ahead on points', 'Ahead on points'], [False, False]])
+
+    def test_honest_words(self):
+        r = self.run_js('const p = {a: "a", b: "b", edge: 0, looks_used: 3, looks_planned: 6};'
+                        ' return [Core.verdict({...p, verdict: "a"}), Core.verdict({...p, verdict: "exhausted"}).long,'
+                        ' Core.verdict({...p, verdict: "open", edge: 5}).long];')
+        self.assertTrue(r[0]['decided'])
+        self.assertIn('Decided after 3 of 6', r[0]['long'])
+        self.assertIn('unresolved', r[1])
+        self.assertIn('a is ahead on points', r[2])
+        for text in (r[1], r[2], r[0]['long']):
+            self.assertNotIn('at least', text)
+
+    def test_rates_and_target(self):
+        r = self.run_js('return [Core.rateOf({vpip: {n: 30, of: 40}}, "vpip"), Core.rateOf({hands: 10, vpip: 0.5}, "vpip"),'
+                        ' Core.rateOf({showdowns: 4, won_sd: 1, wsd: 0.25}, "wsd"), Core.rateOf({counts: {pfr: {n: 2, of: 8}}, pfr: 0.25}, "pfr"),'
+                        ' Core.targetEdge({target_edge_bb100: 50, deals_planned: 600}, [{deals: 50}, {deals: 100}]),'
+                        ' Core.targetEdge({}, [{deals: 40, power: {deals_for_80pct: {"50": 700}}}]), Core.targetEdge({}, [])];')
+        self.assertEqual(r[0], {'x': 0.75, 'n': 30, 'of': 40})
+        self.assertEqual(r[1], {'x': 0.5, 'n': 5, 'of': 10})
+        self.assertEqual(r[2], {'x': 0.25, 'n': 1, 'of': 4})
+        self.assertEqual(r[3], {'x': 0.25, 'n': 2, 'of': 8})
+        self.assertEqual(r[4], {'target': 50, 'need': 600, 'allowed': None, 'power': None, 'planned': True, 'have': [50, 100]})
+        self.assertEqual(r[5], {'target': 50, 'need': 700, 'planned': False, 'have': [40, 40]})
+        self.assertIsNone(r[6])
+
     def test_corrections(self):
         r = self.run_js('const f = c => c + " chips"; return ['
                         ' Core.correction({requested: {action: "raise", amount: 5.5}, executed: {action: "raise", amount: 6},'
@@ -360,6 +438,8 @@ class TestViewerLogic(unittest.TestCase):
         self.assertTrue(end['done'])
         self.assertEqual([s['won'] for s in end['seats']], [True, False])
         self.assertEqual([s['stack'] for s in end['seats']], [206, 194])
+        self.assertEqual([st['toAct'] for st in steps], [0, 1, None, 1, 0, 1, None, None])   # whose turn, not who just acted
+        self.assertEqual([st['actor'] for st in steps[:3]], [None, 0, 1])
         acts = [e for e in log if e['kind'] == 'action']
         self.assertEqual(acts[0]['thought']['correction']['kind'], 'sizing')
         self.assertTrue(acts[-1]['thought']['fallback'])

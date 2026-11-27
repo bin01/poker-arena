@@ -23,34 +23,50 @@ def cmd_play(args):
 
 
 def cmd_plan(args):
-    design = {k: v for k, v in (('alpha', args.alpha), ('max_rounds', args.max_rounds), ('block', args.block)) if v is not None}
+    from .ratings import design_line, normalize_design
+    design = {k: v for k, v in (('alpha', args.alpha), ('max_rounds', args.max_rounds), ('block', args.block),
+                                ('target_edge_bb100', args.target_edge)) if v is not None}
     plan = make_plan(args.players_list, deals=args.deals, seed=args.seed, out=args.out, players_file=args.players,
                      concurrency=args.concurrency, design=design, replicates=args.replicates)
     text = json.dumps(plan, indent=2)
     if args.write:
         Path(args.write).write_text(text + '\n')
-        d, n = plan['design'], len(plan['matchups'])
-        per_round = 2 * n * args.deals * plan['replicates']
+        d, n = normalize_design(plan), len(plan['matchups'])
+        per_round = 2 * n * args.deals * d['replicates']
         print(f'wrote {args.write}: {n} pairings, {per_round} hands per round, at most {d["max_rounds"]} rounds '
-              f'({per_round * d["max_rounds"]} hands); a pairing stops once decided (alpha {d["alpha"]} over all pairings)')
+              f'({per_round * d["max_rounds"]} hands); a pairing stops once decided (at most {d["alpha"]:.0%} chance '
+              f'of any false verdict over all pairings)')
+        print(design_line(d))
+        if d['power_at_max'] < 0.8:
+            print(f'To reach 80% power at the target, allow about {d["deals_needed"]:,} deals per pairing, e.g. '
+                  f'--max-rounds {-(-d["deals_needed"] // (args.deals * d["replicates"]))} with --replicates {d["replicates"]}.')
+        try:
+            specs = load_players(args.players)
+        except (OSError, ValueError):
+            specs = {}
+        if not any('bot' in specs.get(p, {}) for p in args.players_list):
+            print('No reference bot in the plan: the models\' strengths will only compare them with each other.')
     else:
         print(text)
 
 
 def cmd_tournament(args):
+    from .ratings import normalize_design
     plan = json.loads(Path(args.plan).read_text())
     if args.effort:
         plan['effort'] = args.effort
     if args.until_decided:
         plan['until_decided'] = args.until_decided
     if args.dry_run:
-        from .runner import plan_design
-        d = plan_design(plan)
-        reps = plan.get('replicates', 1)
+        d = normalize_design(plan)
+        reps = d['replicates'] if d else plan.get('replicates', 1)
         for a, b in plan['matchups']:
             more = (f', in rounds; stops once decided, at most {d["max_rounds"]} rounds '
-                    f'({d["max_rounds"] * plan["deals"]} deals)') if d else ''
+                    f'({d["max_deals"]} deals)') if d else ''
             print(f'{a} vs {b}: {reps} x 2 x {plan["deals"]} hands per round -> {plan["out"]}/{a}__vs__{b}{more}')
+        if d:
+            from .ratings import design_line
+            print(design_line(d))
         return
     asyncio.run(run_plan(plan, only=args.only, concurrency=args.concurrency))
     from .ratings import ratings, summary
@@ -66,8 +82,9 @@ def cmd_ratings(args):
         print('No finished duplicate deals yet.')
         return
     print(summary(r))
-    print(f'\n{r["deals"]} duplicate deals ({r["hands"]} hands), {r["observations"]} distinct. Strength and verdicts: '
-          f'{r["objective"]}; session Elo: share of {r["session_deals"]}-deal sessions won (secondary).')
+    print(f'\n{r["deals"]} duplicate deals ({r["hands"]} hands), {r["observations"]} distinct. Verdicts: the '
+          f'preregistered sequential test on {r["objective"]}; strengths: descriptive; session Elo: share of '
+          f'{r["session_deals"]}-deal sessions won (secondary, descriptive).')
 
 
 def cmd_view(args):
@@ -90,7 +107,8 @@ def cmd_history(args):
         return
     print(history.table(r))
     print(f'\n{r["deals"]:,} duplicate deals from {len(r["runs"])} runs ({r["observations"]:,} distinct), '
-          f'one player per model and reasoning level.')
+          f'one player per model, reasoning level and protocol. Descriptive only: pooled runs are no one\'s '
+          f'preregistered test.')
     if len(r['code_versions']) > 1:
         print(f'Code versions: {", ".join(r["code_versions"])}')
 
@@ -193,8 +211,11 @@ def main(argv=None):
     p.add_argument('--write', help='file to write the plan to (default: print it)')
     p.add_argument('--max-rounds', type=int, help='rounds of --deals a pairing may play before it stops undecided (default 6)')
     p.add_argument('--alpha', type=float, help='chance of naming any false winner across the whole tournament (default 0.05)')
-    p.add_argument('--block', type=int, help='deals per block in the uncertainty estimate (default 10)')
-    p.add_argument('--replicates', type=int, default=1, help='independent duplicate pairs per pairing per round, each with fresh memories')
+    p.add_argument('--block', type=int, help='deals per block in the within-conversation intervals (default 10)')
+    p.add_argument('--replicates', type=int, default=2,
+                   help='independent duplicate pairs (conversations) per pairing per round, each with fresh memories '
+                        '(default 2: a verdict needs at least 2 conversations)')
+    p.add_argument('--target-edge', type=float, help='the edge in bb/100 the plan is powered to detect (default 50)')
     p.set_defaults(fn=cmd_plan)
 
     p = sub.add_parser('tournament', help='run (or resume) every matchup of a plan')
@@ -208,8 +229,8 @@ def main(argv=None):
                         'or at MAX_DEALS deals')
     p.set_defaults(fn=cmd_tournament)
 
-    p = sub.add_parser('ratings', help='strength (bb/100), verdicts per pairing and session Elo from every finished '
-                                       'duplicate deal under a folder')
+    p = sub.add_parser('ratings', help='verdicts per pairing (the sequential test), descriptive strengths (bb/100) and '
+                                       'session Elo from every finished duplicate deal under a folder')
     p.add_argument('root', nargs='?', default='runs')
     p.add_argument('--boot', type=int, default=300, help='bootstrap resamples (default 300)')
     p.add_argument('--json', help='also write the ratings as JSON')

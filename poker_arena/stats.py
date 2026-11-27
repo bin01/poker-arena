@@ -10,6 +10,11 @@ Style (standard poker tracking definitions, per hand dealt):
            counted separately as a showdown tie (sd_ties)
     talk   share of its decisions that came with table talk
 
+These are tendencies, not measures of quality: no value of them is good or bad in itself. Every rate comes
+with its counts (`counts`: {rate: {n, of}}) and is broken down by opponent (`by_opponent`) and by position
+(`by_position`: button, which posts the small blind heads-up, or big blind), since pooling over opponents and
+seats can hide what a player does against whom.
+
 Operations (model players):
     decisions, calls (including retries), retries, fallbacks (a seat that never gave a playable answer and
     was checked or folded for), mean and slowest call time, tokens in and out where the CLI reports them,
@@ -49,27 +54,27 @@ def tally(d: Path) -> tuple[dict, dict]:
         acts = h.get('actions', [])
         contenders = {int(k) for k in (h.get('best') or {})}
         for seat, p in enumerate(players):
-            s = c[p]
-            s['hands'] += 1
             mine = [a for a in acts if a['seat'] == seat]
             pre = [a for a in mine if a['street'] == 'preflop']
             post = [a for a in mine if a['street'] != 'preflop']
-            s['vpip'] += any(a['action'] in ('call', 'raise', 'bet') for a in pre)
-            s['pfr'] += any(a['action'] in ('raise', 'bet') for a in pre)
-            s['aggr'] += sum(a['action'] in ('raise', 'bet') for a in post)
-            s['calls_post'] += sum(a['action'] == 'call' for a in post)
-            folded_pre = any(a['action'] == 'fold' for a in pre)
-            if len(h.get('board', [])) >= 3 and not folded_pre:
-                s['saw_flop'] += 1
+            row = {'hands': 1, 'vpip': any(a['action'] in ('call', 'raise', 'bet') for a in pre),
+                   'pfr': any(a['action'] in ('raise', 'bet') for a in pre),
+                   'aggr': sum(a['action'] in ('raise', 'bet') for a in post),
+                   'calls_post': sum(a['action'] == 'call' for a in post),
+                   'saw_flop': len(h.get('board', [])) >= 3 and not any(a['action'] == 'fold' for a in pre),
+                   'showdowns': 0, 'won_sd': 0, 'sd_ties': 0,
+                   'decisions': len(mine), 'talk': sum(bool(a.get('say')) for a in mine)}
             if h.get('showdown') and seat in contenders:
                 won = h.get('won') or [0] * len(players)
                 mine_won = seat < len(won) and won[seat] > 0
                 others = any(won[o] > 0 for o in contenders if o != seat and o < len(won))
-                s['showdowns'] += 1
-                s['won_sd'] += mine_won and not others
-                s['sd_ties'] += mine_won and others
-            s['decisions'] += len(mine)
-            s['talk'] += sum(bool(a.get('say')) for a in mine)
+                row.update(showdowns=1, won_sd=mine_won and not others, sd_ties=mine_won and others)
+            s = c[p]
+            where = 'button' if h.get('button') == seat else 'big_blind' if len(players) == 2 else 'other'
+            prefixes = ['', f'pos:{where}:'] + ([f'vs:{players[1 - seat]}:'] if len(players) == 2 else [])
+            for k, v in row.items():
+                for pre_ in prefixes:
+                    s[pre_ + k] += v
             s['corrected'] += sum(bool(a.get('note')) for a in mine)
     for e in _lines(d / 'events.jsonl'):
         if e.get('kind') == 'thought':
@@ -96,22 +101,33 @@ def add(into: dict, counts: dict):
         into[k] = max(into.get(k, 0), v) if k == 'slowest' else into.get(k, 0) + v
 
 
+RATES = {'vpip': ('vpip', 'hands'), 'pfr': ('pfr', 'hands'), 'af': ('aggr', 'calls_post'),
+         'wtsd': ('showdowns', 'saw_flop'), 'wsd': ('won_sd', 'showdowns'), 'sd_ties': ('sd_ties', 'showdowns'),
+         'talk': ('talk', 'decisions')}
+
+
+def _style(g) -> dict:
+    out = {k: _ratio(g(n), g(of)) for k, (n, of) in RATES.items() if k != 'sd_ties'}
+    out.update({'hands': int(g('hands')), 'showdowns': int(g('showdowns')), 'won_sd': int(g('won_sd')),
+                'sd_ties': int(g('sd_ties')), 'decisions': int(g('decisions')),
+                'counts': {k: {'n': int(g(n)), 'of': int(g(of))} for k, (n, of) in RATES.items()}})
+    return out
+
+
 def summarize(s: dict, served=()) -> dict:
-    """Rates from summed counts."""
+    """Rates from summed counts, each with its counts, and broken down by opponent and position."""
     g = lambda k: s.get(k, 0)
     out = {
-        'hands': int(g('hands')),
-        'vpip': _ratio(g('vpip'), g('hands')), 'pfr': _ratio(g('pfr'), g('hands')),
-        'af': _ratio(g('aggr'), g('calls_post')) if g('calls_post') else None,
-        'wtsd': _ratio(g('showdowns'), g('saw_flop')), 'wsd': _ratio(g('won_sd'), g('showdowns')),
-        'showdowns': int(g('showdowns')), 'won_sd': int(g('won_sd')), 'sd_ties': int(g('sd_ties')),
-        'talk': _ratio(g('talk'), g('decisions')), 'decisions': int(g('decisions')),
+        **_style(g),
         'corrected': int(g('corrected')), 'fallbacks': int(g('fallbacks')),
         'calls': int(g('calls')), 'retries': int(g('retries')),
         'latency_mean': _ratio(g('latency'), g('calls')), 'latency_max': g('slowest') or None,
         'tokens_in': int(g('tokens_in')) or None, 'tokens_out': int(g('tokens_out')) or None,
         'served_models': sorted(served),
     }
+    for key, prefix in (('by_opponent', 'vs:'), ('by_position', 'pos:')):
+        names = sorted({k[len(prefix):].rsplit(':', 1)[0] for k in s if k.startswith(prefix)})
+        out[key] = {n: _style(lambda k, n=n: s.get(f'{prefix}{n}:{k}', 0)) for n in names}
     if not g('calls_post') and g('aggr'):
         out['af_all_aggression'] = True   # never called after the flop: shown as "all aggression"
     return out

@@ -12,7 +12,8 @@ const store = {
   set(k, v) { try { localStorage.setItem('poker-arena.' + k, JSON.stringify(v)); } catch (e) { /* private mode */ } },
 };
 const state = { runs: [], run: null, index: [], kinds: {}, labels: {}, timer: null, mind: store.get('mind', false),
-  matches: new Map(), view: null, replay: null, page: null, checked: null };
+  matches: new Map(), view: null, replay: null, page: null, checked: null, showPlay: 0, carry: false,
+  autoNext: store.get('autonext', true) };
 
 const LIVE_POLL = 6000, SLOW_POLL = 60000;
 
@@ -179,6 +180,8 @@ function renderStatus(cur) {
   const checked = state.checked ? `<span class="label checked" title="When this page last asked for news">checked ${clock(state.checked)}</span>` : '';
   if (playing) $status.innerHTML = `<span class="live-dot"></span><span>Live<span class="label"> · ${plural(playing, 'table')}</span></span>${checked}`;
   else if (cur.finished) $status.innerHTML = `<span class="label">Finished</span>`;
+  else if (cur.status === 'stopped') $status.innerHTML = `<span class="idle-dot"></span><span>Stopped<span class="label"> · last action ${ago(cur.updated)}</span></span>${checked}`;
+  else if (cur.between_rounds) $status.innerHTML = `<span class="idle-dot"></span><span>Between rounds<span class="label"> · last action ${ago(cur.updated)}</span></span>${checked}`;
   else $status.innerHTML = `<span class="idle-dot"></span><span>Paused<span class="label"> · last action ${ago(cur.updated)}</span></span>${checked}`;
 }
 
@@ -191,17 +194,19 @@ function runHead(r, rt) {
   const rounds = rt.design?.round_deals ? (rt.design.max_rounds > 1 ? `up to ${rt.design.max_rounds} rounds of ${rt.design.round_deals} deals` : `${rt.design.round_deals} deals per matchup`)
     : state.index.some(m => m.round > 1) ? `rounds of ${deals} deals` : `${deals} deals each`;
   const sub = [plural(players, 'player'), plural(pairings, 'matchup'), rounds];
-  const share = r.hands_planned ? r.hands / r.hands_planned : 0;
+  const share = r.finished ? 1 : r.hands_planned ? r.hands / r.hands_planned : 0;
   let line;
   if (r.finished) line = `Finished · ${plural(r.hands, 'hand')} played · ${ago(r.updated)}`;
+  else if (r.status === 'stopped') line = `Stopped · ${plural(r.hands, 'hand')} played · last action ${ago(r.updated)}`;
+  else if (r.between_rounds) line = `${plural(r.hands, 'hand')} played · round ${r.round || 1} done, more rounds to come`;
   else {
-    line = `${r.hands.toLocaleString()} of ${plural(r.hands_planned, 'hand')}`;
-    if (r.eta_seconds != null) line += ` · about ${duration(r.eta_seconds)} left`;
+    line = `${r.hands.toLocaleString()} of ${plural(r.hands_planned, 'hand')} so far`;
+    if (r.eta_seconds != null) line += ` · about ${duration(r.eta_seconds)} left in this round`;
     else if (!r.live) line += ` · paused, last action ${ago(r.updated)}`;
   }
   return `<div class="page-head"><div><div class="eyebrow">${r.live ? '<span class="live-dot"></span> Live tournament' : 'Tournament'}</div>
     <h1>${esc(runLabel(state.run))}</h1><div class="sub">${sub.join(' · ')}</div></div>
-    <div class="progress-block"><div class="meter"><span style="width:${(share * 100).toFixed(1)}%"></span></div>
+    <div class="progress-block"><div class="meter"><span style="width:${(Math.min(1, share) * 100).toFixed(1)}%"></span></div>
       <div class="line">${line}${r.hands_per_hour ? ` · ${r.hands_per_hour.toLocaleString()} hands an hour` : ''}</div></div></div>`;
 }
 
@@ -218,93 +223,130 @@ function historyHead(r, rt) {
   if (self) notes.push(`${plural(self, 'deal')} between two entries of the same model and level don't count.`);
   return `<div class="page-head"><div><div class="eyebrow">History</div><h1>All runs</h1><div class="sub">${sub.join(' · ')}</div></div>
     <div class="progress-block"><div class="line">One player per model and reasoning level, pooled across every run
-      ${r.started_at ? `since ${new Date(r.started_at * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}` : ''}</div>
+      ${r.started_at ? `since ${new Date(r.started_at * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}` : ''}.
+      Pooled results are descriptive: nothing here is decided.</div>
       ${notes.length ? `<div class="line soft small">${notes.join(' ')}</div>` : ''}</div></div>`;
 }
 
-function intro(rt) {
-  const open = store.get('howto', true);
+function intro() {
   return `<div class="intro">
     <p class="lede"><b>AI models play heads-up No-Limit Hold'em against each other.</b> Every deal is played twice with
-      the seats swapped, so the luck of the cards cancels out and what is left is how well each model plays.</p>
-    <div class="intro-row">
-      <a class="cta" href="${runLink(state.run, '/m')}"><span class="cta-icon">▶</span>Watch the games</a>
-      <details class="howto" ${open ? 'open' : ''}><summary>How to read the standings</summary>
-        <dl>
-          <dt>Strength</dt><dd>Big blinds won per 100 hands against the average opponent${rt.contract ? '' : ' (here: against the opponents it met)'}.
-            <b class="pos">+20</b> is a clear edge; <b>0</b> is average. The bar is its 95% range: the true value is very likely inside.</dd>
-          <dt>Rank</dt><dd>A number only when a model is clearly better than the ones below it. Otherwise <b>=</b>: it can't
-            yet be told apart from its neighbours.</dd>
-          <dt>Leader</dt><dd>A model that beats every other model by more than the noise. Until one does, the page says
-            <i>No established leader yet</i>.</dd>
-          <dt>Matchups</dt><dd>Each pair's verdict: <i>wins</i>, <i>even</i> (within ±15 bb/100), <i>undecided</i>, or
-            <i>too early</i>.</dd>
-          <dt>Session Elo</dt><dd>A second, different number: how often it wins a 10-deal session. Shown for reference, not used to rank.</dd>
-        </dl></details>
-    </div></div>`;
+      the seats swapped, which reduces the luck of the cards.</p>
+    <a class="cta" href="${runLink(state.run, '/m')}"><span class="cta-icon">▶</span>Watch the games</a></div>`;
+}
+
+function glossary(rt) {
+  const open = store.get('howto-open', false);
+  return `<details class="howto" ${open ? 'open' : ''}><summary>How to read this page</summary>
+    <dl>
+      <dt>Decided</dt><dd>A result from the planned sequential test: each matchup is checked at set points, and a winner (or
+        <i>even</i>, within ±15 bb/100) is named only when the edge clears a bar that keeps the chance of a wrong call under 5%
+        across all matchups. Only decided results carry this badge.</dd>
+      <dt>Ahead on points</dt><dd>Everything else: the current estimate, recomputed as hands finish. It shows who leads, not who is better.</dd>
+      <dt>Strength</dt><dd>Big blinds won per 100 hands against the average opponent in its group${rt.contract ? '' : ' (here: against the opponents it met)'};
+        <b>0</b> is average. The bar is a 95% range for that estimate.</dd>
+      <dt>Group</dt><dd>Players linked by games. Players in different groups never met, so they are not compared.</dd>
+      <dt>Session Elo</dt><dd>A different number: how often it wins a 10-deal session. For reference, never used to rank.</dd>
+    </dl></details>`;
 }
 
 const fmtStrength = v => v == null ? '–' : signed(v, 0);
+const ciText = ci => ci ? `${signed(ci[0], 0)} to ${signed(ci[1], 0)}` : '';
+const groupName = i => 'ABCDEFGH'[i] || String(i + 1);
+const pid = x => Core.playerId(x);
+
+// The target edge in one line: what the run was planned to detect, what that takes, and what it has.
+function targetLine(rt, g) {
+  const t = Core.targetEdge(rt.design, g.pairings);
+  if (!t) return '';
+  const have = t.have[0] === t.have[1] ? plural(t.have[0], 'deal') : `${t.have[0]}–${plural(t.have[1], 'deal')}`;
+  const pct = Math.min(100, Math.round(100 * t.have[0] / Math.max(1, t.need)));
+  const words = t.planned
+    ? `This run was planned to detect a ${t.target} bb/100 edge; that needs ~${approx(t.need)} deals per pairing${t.allowed && t.allowed < t.need ? ` but the plan allows ${approx(t.allowed)}${t.power != null ? ` (power ${Math.round(t.power * 100)}%)` : ''}` : ''}; it has ${have}.`
+    : `To detect a ${t.target} bb/100 edge (80% power) takes ~${approx(t.need)} deals per pairing at the spread seen so far; ${g.pairings.length > 1 ? 'the pairings have' : 'it has'} ${have}.`;
+  return `<div class="target"><div class="meter thin"><span style="width:${pct}%"></span></div><span>${words}</span></div>`;
+}
 
 function hero(rt) {
-  const ranked = rt.players.filter(p => !p.quarantined && p.strength != null);
-  if (!ranked.length) return '';
-  const multi = rt.components.length > 1;
-  if (rt.leaders.length) {
-    return `<div class="hero-row">${rt.leaders.map(l => {
-      const p = rt.players.find(x => x.player === l.player) || {};
-      const ci = l.ci95 ? `${signed(l.ci95[0], 0)} to ${signed(l.ci95[1], 0)}` : '';
-      return `<div class="hero-card">
-        <span class="idx">A<i>♠</i></span><span class="idx br">A<i>♠</i></span>
-        <div class="hero-kicker">${multi ? `Leader of group ${groupName(l.component)}` : 'Established leader'}</div>
-        ${monogram(l.player, 'xl')}
-        <div class="hero-name">${name(l.player)}</div>
-        <div class="hero-num">${fmtStrength(p.strength)}<small>bb/100</small></div>
-        <div class="hero-sub">Beats every other model by more than the noise${l.margin_bb100 != null ? `: at least ${signed(l.margin_bb100, 0)} bb/100 over the next best` : ''}${ci ? ` (95% range ${ci})` : ''}.</div>
-      </div>`;
-    }).join('')}${multi && rt.leaders.length < rt.components.length ? noLeaderCard(rt, true) : ''}</div>`;
-  }
-  return `<div class="hero-row">${noLeaderCard(rt, false)}</div>`;
+  const gs = rt.groups.filter(g => g.ranked.length);
+  if (!gs.length) return '';
+  const multi = rt.groups.filter(g => g.members.length).length > 1;
+  return `<div class="hero-row ${gs.length > 1 ? 'many' : ''}">${gs.map(g => groupCard(rt, g, multi)).join('')}</div>`;
 }
-function noLeaderCard(rt, partial) {
-  const ranked = rt.players.filter(p => !p.quarantined && p.strength != null);
-  const top = ranked[0];
-  const deals = rt.deals || 0;
-  const powers = rt.pairings.map(p => p.power?.deals_for_80pct?.['50']).filter(x => x != null);
-  const need = powers.length ? Math.max(...powers) : null;
+
+function groupCard(rt, g, multi) {
+  const by = Object.fromEntries(rt.players.map(p => [p.player, p]));
+  const where = multi ? `Group ${groupName(g.index)}` : '';
+  if (g.leader) {
+    const p = by[g.leader] || {};
+    const beaten = g.members.length - 1;
+    return `<div class="hero-card">
+      <span class="idx">A<i>♠</i></span><span class="idx br">A<i>♠</i></span>
+      <div class="hero-kicker"><span class="decided-badge">Decided</span>${where ? ` leader of ${where}` : ' leader'}</div>
+      ${monogram(g.leader, 'xl')}
+      <div class="hero-name">${name(g.leader)}</div>
+      <div class="hero-num">${fmtStrength(p.strength)}<small>bb/100</small></div>
+      <div class="hero-sub">Won its matchup ${beaten === 1 ? 'against the other player' : `against each of the other ${beaten} players`} under the planned sequential test.
+        ${p.strength_ci95 ? `Strength estimate: 95% range ${ciText(p.strength_ci95)}.` : ''}</div>
+      ${targetLine(rt, g)}
+    </div>`;
+  }
+  const top = g.front_runner && by[g.front_runner];
+  const n = g.ranked.length;
+  const deals = Math.max(0, ...g.pairings.map(p => p.deals || 0));
   let why;
-  if (ranked.length < 2) why = ranked.length === rt.players.length ? 'Only one model has results so far.' : 'Only one model has rated results so far.';
-  else if (deals < 20) why = `Only ${plural(deals, 'deal')} so far: far too few to separate anyone.`;
-  else why = `The gaps are still inside the noise after ${plural(deals, 'deal')}.`;
+  if (rt.pooled) why = 'Pooled across runs, results are described, never decided.';
+  else if (n < 2) why = 'Only one player in this group has results so far.';
+  else if (g.pairings.every(p => p.verdict === 'early' || !p.deals)) why = rt.finished ? 'Too few deals were played to judge anyone.' : 'Too few deals so far to judge anyone.';
+  else {
+    const won = g.pairings.filter(p => p.verdict === 'a' || p.verdict === 'b').map(p => {
+      const s = Core.verdictSides(p);
+      return `${plain(s.winner)} beats ${plain(s.loser)}`;
+    });
+    const even = g.pairings.filter(p => p.verdict === 'even').length;
+    const over = g.pairings.filter(p => p.verdict === 'exhausted').length;
+    const open = g.pairings.length - won.length - even - over;
+    const bits = [];
+    if (won.length) bits.push(`Decided: ${won.join(', ')}.`);
+    if (even) bits.push(`${plural(even, 'matchup')} decided even.`);
+    if (over) bits.push(`${plural(over, 'matchup')} used every planned check without a winner.`);
+    if (open) bits.push(`${plural(open, 'matchup')} still open${deals ? ` after up to ${plural(deals, 'deal')}` : ''}.`);
+    why = bits.join(' ');
+  }
+  const settled = !rt.pooled && g.pairings.length && g.pairings.every(p => ['a', 'b', 'even', 'exhausted'].includes(p.verdict));
+  const lead = top && n > 1 ? `<div class="front">${monogram(top.player, 'lg')}<div><div class="front-name">${name(top.player)}</div>
+      <div class="soft small">ahead on points: <b class="${cls(top.strength)}">${fmtStrength(top.strength)} bb/100</b>${top.strength_ci95 ? ` (95% range ${ciText(top.strength_ci95)})` : ''}${g.front_runner_margin != null ? ` · ${Math.round(g.front_runner_margin)} clear of the next on points` : ''}</div></div></div>` : '';
   return `<div class="hero-card back">
     <div class="back-face" aria-hidden="true"><span>?</span></div>
     <div class="hero-body">
-      <div class="hero-kicker">${partial ? 'Other groups' : 'Who is winning?'}</div>
-      <div class="hero-title">No established leader yet</div>
-      <p>${why} ${top && ranked.length > 1 ? `<b>${plain(top.player)}</b> is ahead on points at <b class="${cls(top.strength)}">${fmtStrength(top.strength)} bb/100</b>${top.strength_ci95 ? `, but its 95% range runs from ${signed(top.strength_ci95[0], 0)} to ${signed(top.strength_ci95[1], 0)}` : ''}.` : ''}</p>
-      ${need ? `<p class="soft small">To detect a 50 bb/100 edge with 80% power takes about ${approx(need)} deals per pairing.</p>` : ''}
+      <div class="hero-kicker">${where || 'Who is winning?'}</div>
+      <div class="hero-title">${rt.pooled ? 'Ahead on points' : settled || rt.finished ? 'No decided leader' : 'No decided leader yet'}</div>
+      ${lead}
+      <p class="small soft">${why}</p>
+      ${targetLine(rt, g)}
     </div></div>`;
 }
-const groupName = i => 'ABCDEFGH'[i] || String(i + 1);
 
 async function renderBoard() {
+  const r = state.runs.find(x => x.run === state.run);
   const raw = await api('ratings', ['run', state.run]);
   Object.assign(state.labels, raw.labels || {});
   Object.assign(state.kinds, raw.kinds || {});
-  const rt = normalize(raw);
+  const rt = normalize(raw, { pooled: !!r?.all });
+  rt.finished = !!r?.finished;
   for (const p of rt.players) if (p.kind) state.kinds[p.player] = p.kind;
-  const r = state.runs.find(x => x.run === state.run);
-  let html = runHead(r, rt) + intro(rt);
+  let html = runHead(r, rt) + intro();
   const waiting = rt.roster.filter(x => !rt.players.some(p => p.player === x.player));
   if (!rt.players.length) {
     html += `<div class="card-box empty"><div class="big-suits">♠ ♥ ♦ ♣</div><h2>The cards are in the air</h2>
       <p>A deal counts once both of its plays are finished. ${state.index.some(m => m.started) ? `Watch the first ones on the <a href="${runLink(state.run, '/m')}"><u>games</u></a> page.` : ''}</p>
       ${waiting.length ? `<div class="waiting-list">${waiting.map(x => player(x.player, `<div class="small soft">${x.status === 'playing' ? 'playing its first deals' : 'waiting to play'}</div>`)).join('')}</div>` : ''}</div>`;
-    $app.innerHTML = html;
+    $app.innerHTML = html + glossary(rt);
     bindBoard();
     return;
   }
   html += hero(rt);
+  html += glossary(rt);
   html += standings(rt, waiting);
   html += pairingsSection(rt);
   html += headToHead(rt);
@@ -314,7 +356,7 @@ async function renderBoard() {
   bindBoard();
 }
 function bindBoard() {
-  $app.querySelector('.howto')?.addEventListener('toggle', e => store.set('howto', e.target.open));
+  $app.querySelector('.howto')?.addEventListener('toggle', e => store.set('howto-open', e.target.open));
 }
 
 function axisFor(players) {
@@ -326,54 +368,56 @@ function axisFor(players) {
 }
 
 function standings(rt, waiting) {
-  const multi = rt.components.length > 1;
+  const multi = rt.groups.filter(g => g.members.length).length > 1;
+  const by = Object.fromEntries(rt.players.map(p => [p.player, p]));
   let out = '';
-  rt.components.forEach((comp, ci) => {
-    const ps = rt.players.filter(p => comp.includes(p.player) && !p.quarantined);
-    if (!ps.length) return;
+  const shown = rt.groups.filter(g => g.members.length);
+  shown.forEach((g, k) => {
+    const ps = g.members.map(p => by[p]).sort((x, y) => (y.strength ?? -1e9) - (x.strength ?? -1e9));
     const ax = axisFor(ps);
-    const rows = ps.map(p => standingRow(rt, p, ax)).join('');
-    const extra = ci === rt.components.length - 1 ? waitingRows(waiting) : '';
-    const title = multi ? `Group ${groupName(ci)}` : 'Standings';
+    const rows = ps.map((p, i) => standingRow(rt, g, p, i, ax)).join('');
+    const extra = k === shown.length - 1 ? waitingRows(waiting) : '';
+    const deals = Math.max(0, ...g.pairings.map(p => p.deals || 0));
+    const title = multi ? `Group ${groupName(g.index)}` : 'Standings';
     out += section(title, multi ? `${plural(ps.length, 'player')} who have played each other` : `${plural(rt.deals, 'duplicate deal')} · ${plural(rt.hands || 2 * rt.deals, 'hand')}`,
-      `<div class="board-list"><div class="board-head"><span></span><span>Player</span>
-         <span class="r" title="Big blinds won per 100 hands against the average opponent">Strength</span>
+      `<div class="board-list"><div class="board-head"><span>#</span><span>Player</span>
+         <span class="r" title="Big blinds won per 100 hands against the average opponent in this group">Strength</span>
          <span class="axis-head"><span>${signed(-ax.lim, 0)}</span><span>0</span><span>${signed(ax.lim, 0)}</span></span>
          <span class="r hide-sm">Net</span><span class="r hide-sm" title="Share of 10-deal sessions won (secondary; not used to rank)">Sessions</span></div>
        ${rows}${extra}</div>`,
-      multi && ci === 0 ? 'No games connect these groups yet, so each is ranked on its own. A match between them would join them.' : '');
+      multi && k === 0 ? 'No games connect these groups, so each is ordered on its own. A match between them would join them.'
+        : deals && !multi ? '' : '');
   });
   if (!out && waiting.length) out = section('Standings', '', `<div class="board-list">${waitingRows(waiting)}</div>`);
-  const inComp = new Set(rt.components.flat());
-  const q = rt.players.filter(p => p.quarantined || !inComp.has(p.player))
-    .map(p => p.quarantined ? p : { ...p, quarantine_reason: p.quarantine_reason || 'has only played players who are not rated' });
-  if (q.length) {
-    out += section('Not rated', 'results shown, kept out of the standings', `<div class="board-list">${q.map(p => `<div class="brow quarantined">
-      <span class="rank">–</span>${player(p.player, `<div class="small soft">${esc(p.quarantine_reason || 'the model or its version was not recorded')}</div>`)}
-      <span class="r strength soft">${fmtStrength(p.strength)}</span><span class="axis"></span>
+  const out_ = rt.players.filter(p => !p.in_fit);
+  if (out_.length) {
+    out += section('Not in the standings', 'played, but left out of the fit', `<div class="board-list">${out_.map(p => `<div class="brow quarantined">
+      <span class="rank">–</span>${player(p.player, `<div class="small soft">${esc(p.unrated_reason || p.quarantine_reason || 'none of its opponents is rated')}</div>`)}
+      <span class="r strength soft">${p.hands ? `<small>${plural(p.hands, 'hand')}</small>` : ''}</span><span class="axis"></span>
       <span class="r hide-sm soft">${p.net_bb != null ? signed(p.net_bb, 0) + ' bb' : ''}</span><span class="hide-sm"></span></div>`).join('')}</div>`,
-      'A player is left out when its exact model or reasoning level is unknown, so its results could mix more than one model, or when none of its opponents is rated.');
+      'Left out when its exact model or reasoning level is unknown (its results could mix more than one model), or when it only met players who are left out.');
   }
   return out;
 }
 
-function standingRow(rt, p, ax) {
+function standingRow(rt, g, p, i, ax) {
   const ci = p.strength_ci95;
-  const clear = ci && (ci[0] > 0 || ci[1] < 0);
-  const tied = (p.rank_tied_with || []).filter(x => x !== p.player);
-  const comp = rt.components.find(c => c.includes(p.player)) || [];
-  const tiedText = p.rank == null && tied.length && tied.length < comp.length - 1
-    ? `<div class="small soft">level with ${tied.map(plain).join(', ')}</div>` : '';
-  const leader = rt.leaders.some(l => l.player === p.player);
-  const whisker = `<div class="whisker" title="${ci ? `95% range ${signed(ci[0], 0)} to ${signed(ci[1], 0)} bb/100` : 'no range yet: too few deals'}">
-      <span class="zero"></span>${ci ? `<span class="range ${clear ? cls(p.strength) : ''}" style="left:${ax.x(ci[0])};width:calc(${ax.x(ci[1])} - ${ax.x(ci[0])})"></span>` : ''}
-      ${p.strength != null ? `<span class="point ${clear ? cls(p.strength) : ''}" style="left:${ax.x(p.strength)}"></span>` : ''}</div>`;
+  const decided = p.rank_kind === 'decided' && p.rank != null;
+  const tied = (p.rank_tied_with || []).filter(x => x !== p.player && g.members.includes(x));
+  const notes = [];
+  if (!p.identity_resolved) notes.push(`<span class="flag" title="${esc(p.quarantine_reason || '')}">identity unresolved</span>`);
+  if (tied.length && tied.length < g.members.length - 1) notes.push(`<span class="small soft">difference with ${tied.map(plain).join(', ')} unresolved</span>`);
+  const mob = `<div class="mob-line small soft">${p.net_bb != null ? `<span class="${cls(p.net_bb)}">${signed(p.net_bb, 0)} bb</span> · ` : ''}${plural(p.hands || 0, 'hand')}</div>`;
+  const leader = g.leader === p.player;
+  const whisker = `<div class="whisker" title="${ci ? `95% range ${ciText(ci)} bb/100` : 'no range yet: too few deals'}">
+      <span class="zero"></span>${ci ? `<span class="range" style="left:${ax.x(ci[0])};width:calc(${ax.x(ci[1])} - ${ax.x(ci[0])})"></span>` : ''}
+      ${p.strength != null ? `<span class="point ${leader ? 'lead' : ''}" style="left:${ax.x(p.strength)}"></span>` : ''}</div>`;
   const elo = p.session_elo != null ? `<span title="Session Elo ${p.session_elo}${p.session_elo_ci95 ? ` (${p.session_elo_ci95[0]}–${p.session_elo_ci95[1]})` : ''}">${p.session_w ?? 0}–${p.session_t ?? 0}–${p.session_l ?? 0}</span>
       <small>Elo ${p.session_elo}${p.session_elo_ci95 ? ` · ${p.session_elo_ci95[0]}–${p.session_elo_ci95[1]}` : ''}</small>` : '';
   return `<div class="brow ${leader ? 'lead' : ''}">
-    <span class="rank ${p.rank != null ? 'sep' : ''}" title="${p.rank != null ? 'Clearly better than everyone below' : 'Not yet separable from its neighbours'}">${p.rank ?? '='}</span>
-    ${player(p.player, tiedText)}
-    <span class="r strength"><b class="${clear ? cls(p.strength) : ''}">${fmtStrength(p.strength)}</b>${ci ? `<small>±${Math.round((ci[1] - ci[0]) / 2)}</small>` : '<small>no range yet</small>'}</span>
+    <span class="rank ${decided ? 'sep' : ''}" title="${decided ? 'Rank decided by the matchups' : 'Order on points, not decided'}">${decided ? p.rank : i + 1}</span>
+    ${player(p.player, `${notes.length ? `<div class="row-notes">${notes.join(' ')}</div>` : ''}${mob}`)}
+    <span class="r strength"><b>${fmtStrength(p.strength)}</b>${ci ? `<small>±${Math.round((ci[1] - ci[0]) / 2)}</small>` : '<small>no range yet</small>'}</span>
     <span class="axis">${whisker}</span>
     <span class="r hide-sm"><span class="${cls(p.net_bb)}">${p.net_bb != null ? signed(p.net_bb, 0) + ' bb' : ''}</span><small>${plural(p.hands || 0, 'hand')}</small></span>
     <span class="r hide-sm sess">${elo}</span></div>`;
@@ -385,91 +429,113 @@ function waitingRows(waiting) {
     <span class="r strength soft">–</span><span class="axis"></span><span class="hide-sm"></span><span class="hide-sm"></span></div>`).join('');
 }
 
-// Each pairing: the edge with its range, and decide()'s verdict.
+function matchupId(p) {
+  const ids = Object.fromEntries(state.index.map(m => [m.id.split('/').pop(), m.id]));
+  const mu = (p.matchups || [])[(p.matchups || []).length - 1];
+  if (mu && state.index.some(m => m.id === mu)) return mu;
+  if (mu && (ids[mu] || ids[String(mu).split('/').pop()])) return ids[mu] || ids[String(mu).split('/').pop()];
+  const m = state.index.find(m => m.started && ((m.a === p.a && m.b === p.b) || (m.a === p.b && m.b === p.a)));
+  return m ? m.id : null;
+}
+
+// Each pairing: the edge with its range, and its verdict, decided or not.
 function pairingsSection(rt) {
   if (!rt.pairings.length) return '';
-  const ids = Object.fromEntries(state.index.map(m => [m.id.split('/').pop(), m.id]));
-  const order = { a: 0, b: 0, even: 1, exhausted: 2, open: 3, early: 4 };
+  const order = { a: 0, b: 0, even: 1, exhausted: 2, open: 3, descriptive: 3, early: 4 };
   const ax = axisFor(rt.pairings.map(p => ({ strength: Math.abs(p.edge ?? 0), strength_ci95: p.ci95 })));
   const rows = [...rt.pairings].sort((x, y) => (order[x.verdict] ?? 5) - (order[y.verdict] ?? 5) || Math.abs(y.edge ?? 0) - Math.abs(x.edge ?? 0)).map(p => {
     const up = (p.edge ?? 0) >= 0, lead = up ? p.a : p.b, trail = up ? p.b : p.a;
     const edge = Math.abs(p.edge ?? 0);
     const ci = p.ci95 ? (up ? p.ci95 : [-p.ci95[1], -p.ci95[0]]) : null;
     const v = verdict(p, plain);
-    const mu = (p.matchups || [])[p.matchups?.length - 1];
-    const full = mu && (state.index.some(m => m.id === mu) ? mu : ids[mu] || ids[String(mu).split('/').pop()]);
-    const checks = p.looks_planned ? (p.looks_used ? ` · checked ${p.looks_used} of ${plural(p.looks_planned, 'time')}` : ' · not checked yet') : '';
+    const full = matchupId(p);
+    const checks = p.looks_planned && !rt.pooled ? (p.looks_used ? ` · checked ${p.looks_used} of ${p.looks_planned}` : ' · not checked yet') : '';
     const power = powerLine(p);
-    return `<div class="prow">
-      <div class="duo-names">${player(lead)}<span class="over">${v.tone === 'won' ? 'beats' : 'ahead of'}</span>${player(trail)}</div>
-      <div class="edge"><b>${edge.toFixed(0)}</b><small>bb/100${ci ? ` · ${signed(ci[0], 0)} to ${signed(ci[1], 0)}` : ''}</small></div>
-      <div class="edge-bar"><div class="whisker"><span class="zero"></span>${ci ? `<span class="range ${v.tone === 'won' ? 'pos' : ''}" style="left:${ax.x(ci[0])};width:calc(${ax.x(ci[1])} - ${ax.x(ci[0])})"></span>` : ''}
+    const word = v.tone === 'won' ? 'beats' : v.tone === 'even' ? 'even with' : edge ? 'ahead of' : 'level with';
+    return `<div class="prow ${v.decided ? 'decided' : ''}">
+      <div class="duo-names">${player(lead)}<span class="over">${word}</span>${player(trail)}</div>
+      <div class="edge"><b>${edge.toFixed(0)}</b><small>bb/100${ci ? ` · ${ciText(ci)}` : ''}</small></div>
+      <div class="edge-bar"><div class="whisker"><span class="zero"></span>${ci ? `<span class="range" style="left:${ax.x(ci[0])};width:calc(${ax.x(ci[1])} - ${ax.x(ci[0])})"></span>` : ''}
         <span class="point ${v.tone === 'won' ? 'pos' : ''}" style="left:${ax.x(edge)}"></span></div></div>
-      <div class="vcell"><span class="verdict ${v.tone}" title="${esc(v.long)}">${esc(v.short)}</span>
+      <div class="vcell">${v.decided ? '<span class="decided-badge">Decided</span>' : ''}<span class="verdict ${v.tone}" title="${esc(v.long)}">${esc(v.short)}</span>
         <small>${plural(p.deals || 0, 'deal')}${checks}</small></div>
       ${full ? `<a class="watch" href="${matchLink(full)}" title="Watch this matchup">Watch ›</a>` : '<span></span>'}
       ${power ? `<div class="power">${esc(power)}</div>` : ''}</div>`;
   }).join('');
-  const design = rt.design && rt.design.round_deals ? `Each pairing is checked after every ${rt.design.round_deals} deals, at most ${plural(rt.design.max_rounds, 'time')}, against a bar set so the chance of naming a wrong winner stays under ${Math.round(rt.design.alpha * 100)}% across all pairings.` : '';
+  const design = rt.pooled ? 'Pooled across runs, each run stopped on its own rule, so these are descriptive: no verdict here is a decision.'
+    : rt.design && rt.design.round_deals ? `Each matchup is checked after every ${rt.design.round_deals} deals, at most ${plural(rt.design.max_rounds, 'time')}, against a bar that keeps the chance of naming a wrong winner under ${Math.round(rt.design.alpha * 100)}% across all matchups.
+      <b>Decided</b> results come only from those checks; the rest is ahead on points.` : '';
   return section('Matchups', 'who beats whom, in bb/100 over duplicate deals', `<div class="pair-list">${rows}</div>`,
-    `${design} <b>Wins</b>: the edge cleared that bar. <b>Even</b>: the two are within ±15 bb/100 of each other. <b>Undecided</b>: neither yet. The range is 95%.`);
+    `${design} The range is 95%.`);
 }
 
 function headToHead(rt) {
   const paired = new Set(rt.pairings.flatMap(p => [p.a, p.b]));
-  const names = rt.players.filter(p => !p.quarantined && paired.has(p.player)).map(p => p.player);
+  const names = rt.groups.flatMap(g => g.ranked).filter(p => paired.has(p));
   if (names.length < 3 || !rt.pairings.length) return '';
   const cell = {};
   for (const p of rt.pairings) {
-    const lo = p.ci95 ? p.ci95[0] : null, hi = p.ci95 ? p.ci95[1] : null;
-    const clear = lo != null && (lo > 0 || hi < 0);
-    cell[p.a + '|' + p.b] = { v: p.edge, clear, p };
-    cell[p.b + '|' + p.a] = { v: -p.edge, clear, p };
+    cell[p.a + '|' + p.b] = { v: p.edge, p };
+    cell[p.b + '|' + p.a] = { v: -p.edge, p };
   }
   const max = Math.max(1, ...rt.pairings.map(p => Math.abs(p.edge || 0)));
-  const ids = Object.fromEntries(state.index.map(m => [m.id.split('/').pop(), m.id]));
+  const short = p => esc(nameParts(labelText(p))[0]);
   const table = `<table class="matrix"><thead><tr><th></th>${names.map(n => `<th title="${plain(n)}">${monogram(n, 'sm')}</th>`).join('')}</tr></thead><tbody>
-    ${names.map(a => `<tr><th>${player(a)}</th>${names.map(b => {
+    ${names.map(a => `<tr><th><div class="player">${monogram(a, 'sm')}<span class="mx-name">${name(a)}</span></div></th>${names.map(b => {
       if (a === b) return '<td class="cell self"></td>';
       const c = cell[a + '|' + b];
       if (!c) return '<td class="cell dim">·</td>';
-      const alpha = c.clear ? (0.12 + 0.3 * Math.sqrt(Math.abs(c.v) / max)).toFixed(2) : 0;
-      const bg = c.clear ? `background:rgba(var(--${c.v > 0 ? 'pos' : 'neg'}-rgb),${alpha})` : '';
-      const mu = (c.p.matchups || []).slice(-1)[0];
-      const full = mu && (state.index.some(m => m.id === mu) ? mu : ids[String(mu).split('/').pop()]);
-      return `<td class="cell" style="${bg}"><a ${full ? `href="${matchLink(full)}"` : ''} title="${plain(a)} against ${plain(b)}">
-        <span class="v ${c.clear ? cls(c.v) : 'soft'}">${signed(c.v, 0)}</span></a></td>`;
+      const won = c.p.verdict === 'a' || c.p.verdict === 'b';
+      const mine = won && ((c.p.verdict === 'a') === (c.p.a === a));
+      const alpha = won ? (0.16 + 0.3 * Math.sqrt(Math.abs(c.v) / max)).toFixed(2) : 0;
+      const bg = won ? `background:rgba(var(--${mine ? 'pos' : 'neg'}-rgb),${alpha})` : '';
+      const full = matchupId(c.p);
+      return `<td class="cell" style="${bg}"><a ${full ? `href="${matchLink(full)}"` : ''} title="${short(a)} against ${short(b)}: ${esc(verdict(c.p, plain).short)}">
+        <span class="v ${won ? cls(c.v) : 'soft'}">${signed(c.v, 0)}</span></a></td>`;
     }).join('')}</tr>`).join('')}</tbody></table>`;
   return section('Head to head', 'bb/100, row against column', table,
-    'Shaded when the 95% range excludes zero. A cell opens that matchup.', { scroll: true });
+    `${rt.pooled ? 'Pooled, so nothing is shaded: no result here is decided.' : 'Shaded only where the matchup is decided; plain numbers are ahead on points.'} A cell opens that matchup.<span class="show-sm"> Swipe sideways for every column.</span>`, { scroll: true });
 }
 
+// Tendencies, not quality: how often each does something, out of how many chances.
 function styleTable(rt) {
   const st = rt.stats || {};
   const names = rt.players.map(p => p.player).filter(p => st[p] && st[p].hands);
   if (!names.length) return '';
-  const bar = v => v == null ? '' : `<span class="bar"><span style="width:${Math.round(v * 100)}%"></span></span>`;
-  const rows = names.map(p => {
-    const s = st[p];
-    const af = s.af_all_aggression ? '<span title="bet or raised after the flop and never called">∞</span>'
-      : s.af == null ? '<span class="dim">–</span>' : s.af.toFixed(1);
-    const ties = s.sd_ties ? ` <small class="soft" title="split pots at showdown, not counted as wins">+${s.sd_ties} split</small>` : '';
-    return `<tr class="${s.hands < 100 ? 'thin' : ''}"><td>${player(p)}</td>
-      <td class="num">${pct(s.vpip)}${bar(s.vpip)}</td><td class="num">${pct(s.pfr)}${bar(s.pfr)}</td>
-      <td class="num">${af}</td><td class="num">${pct(s.wtsd)}</td><td class="num">${pct(s.wsd)}${ties}</td>
-      <td class="num">${isBot(p) ? '<span class="dim">–</span>' : pct(s.talk)}</td>
-      <td class="num soft">${s.hands.toLocaleString()}</td></tr>`;
+  const cellOf = (s, k) => {
+    const r = Core.rateOf(s, k);
+    if (r.x == null) return '<td class="num"><span class="dim">–</span></td>';
+    return `<td class="num">${Math.round(r.x * 100)}%${r.of != null ? `<small class="nof">${r.n}/${r.of}</small>` : ''}</td>`;
+  };
+  const af = s => {
+    if (s.af_all_aggression) return '<span title="bet or raised after the flop and never called">all bets</span>';
+    if (s.af == null) return '<span class="dim">–</span>';
+    const c = s.counts?.af;
+    return `${s.af.toFixed(1)}${c ? `<small class="nof">${c.n}/${c.of}</small>` : ''}`;
+  };
+  const row = (p, s, vs) => `<tr class="${s.hands < 100 ? 'thin' : ''}"><td>${vs ? `<span class="soft small">vs</span> ${player(vs)}` : player(p)}</td>
+      ${cellOf(s, 'vpip')}${cellOf(s, 'pfr')}<td class="num">${af(s)}</td>${cellOf(s, 'wtsd')}${cellOf(s, 'wsd')}
+      ${isBot(p) ? '<td class="num"><span class="dim">–</span></td>' : cellOf(s, 'talk')}
+      <td class="num soft">${(s.hands || 0).toLocaleString()}</td></tr>`;
+  const head = `<thead><tr><th>Player</th>
+    ${th('Plays', 'VPIP: put money in voluntarily before the flop, out of its hands', 'num')}
+    ${th('Raises', 'PFR: raised before the flop, out of its hands', 'num')}
+    ${th('Bets/calls', 'After the flop: bets and raises per call', 'num')}
+    ${th('To showdown', 'Reached showdown, out of the hands where it saw a flop', 'num')}
+    ${th('Won showdown', 'Won outright, out of its showdowns (split pots not counted)', 'num')}
+    ${th('Talks', 'Said something to the opponent, out of its decisions', 'num')}
+    ${th('Hands', '', 'num')}</tr></thead>`;
+  const rows = names.map(p => row(p, st[p])).join('');
+  const split = names.map(p => {
+    const by = st[p].by_opponent || st[p].opponents;
+    if (!by || !Object.keys(by).length) return '';
+    return `<tr class="split-head"><td colspan="8">${player(p)}</td></tr>` + Object.entries(by).map(([o, s]) => row(p, s, o)).join('');
   }).join('');
-  return section('How they play', '', `<table><thead><tr><th>Player</th>
-    ${th('VPIP', 'Voluntarily put money in the pot: called or raised before the flop', 'num')}
-    ${th('PFR', 'Raised before the flop', 'num')}
-    ${th('Aggression', 'After the flop: bets and raises per call', 'num')}
-    ${th('To showdown', 'Of the hands where it saw a flop, how many reached showdown', 'num')}
-    ${th('Won showdown', 'Of its showdowns, how many it won outright (split pots apart)', 'num')}
-    ${th('Talk', 'Share of its decisions that came with something said to the opponent', 'num')}
-    ${th('Hands', '', 'num')}</tr></thead><tbody>${rows}</tbody></table>`,
-    `<b>VPIP</b> and <b>PFR</b>: how often it plays a hand, and how often it raises with it; heads-up, strong players are
-    usually above 50%. <b>Aggression</b> above 2: it bets far more than it calls after the flop. Rows under 100 hands are dimmed.`, { scroll: true });
+  const splitBlock = split ? `<details class="split"><summary>Split by opponent</summary><div class="scroll"><table>${head}<tbody>${split}</tbody></table></div></details>` : '';
+  return section('How they play', 'tendencies, not quality', `<table>${head}<tbody>${rows}</tbody></table>`,
+    `Each figure is how often it did something, with the count out of its chances beneath. These describe style, pooled over
+    opponents and seats; they do not say who plays better. Rows under 100 hands are dimmed.<span class="show-sm"> Swipe sideways for every column.</span>`, { scroll: true })
+    + splitBlock;
 }
 
 // ---- games ----------------------------------------------------------------------------------------
@@ -558,24 +624,34 @@ async function matchBody(cur, params) {
   const done = [...Array(total).keys()].filter(k => ha[k] && hb[k]);
   const nets = Object.fromEntries(done.map(k => [k, ha[k].net[0] + hb[k].net[1]]));
   const wanted = params.has('deal') ? Number(params.get('deal')) - 1 : null;
-  const pick = wanted != null && played.has(wanted) ? wanted : played.size ? Math.max(...played) : 0;
+  const pick = wanted != null && played.has(wanted) ? wanted : !played.size ? 0 : cur.live ? Math.max(...played) : Math.min(...played);
   state.view = { cur, pick, total, played };
 
-  // the headline is chips: net big blinds over both plays of every finished deal
+  // the headline is the whole pairing (every round so far); the selected round's own score sits beneath it
   const net = done.reduce((s, k) => s + nets[k], 0);
   const wins = done.filter(k => nets[k] > 0).length, losses = done.filter(k => nets[k] < 0).length;
-  const leader = net > 0 ? cur.a : net < 0 ? cur.b : null;
-  const rate = done.length ? net / bb / (2 * done.length) * 100 : 0;
+  const same = m => m.started && ((m.a === cur.a && m.b === cur.b) || (m.a === cur.b && m.b === cur.a));
+  const rounds = state.index.filter(same);
+  const multi = rounds.length > 1;
+  const cumBB = multi ? rounds.reduce((s, m) => s + (m.a === cur.a ? 1 : -1) * m.pair_net_a / (m.bb || 1), 0) : net / bb;
+  const cumDeals = multi ? rounds.reduce((s, m) => s + m.pairs_done, 0) : done.length;
+  const leader = cumBB > 0 ? cur.a : cumBB < 0 ? cur.b : null;
+  const rate = cumDeals ? cumBB / (2 * cumDeals) * 100 : 0;
   const v = pairing ? verdict(pairing, plain) : null;
   const face = (p, side) => `<div class="face ${side} ${leader === p ? 'ahead' : ''}">${monogram(p, 'xl')}<div class="face-name">${name(p)}</div></div>`;
+  const roundNet = net / bb, roundLead = roundNet > 0 ? cur.a : roundNet < 0 ? cur.b : null;
+  const roundLine = multi ? `<div class="score-round"><b>Round ${cur.round}</b>${cur.replicate > 1 ? ` · replicate ${cur.replicate}` : ''}: ${done.length
+      ? (roundLead ? `${plain(roundLead)} up ${trim(Math.abs(Math.round(roundNet * 10) / 10))} bb` : 'even') + ` · deals won ${wins}–${losses}` : 'no deals finished'} · ${done.length} of ${total} played</div>`
+    : `<div class="score-cap">deals won ${wins}–${losses}${done.length - wins - losses ? ` · ${done.length - wins - losses} even` : ''} · ${done.length} of ${total} played</div>`;
   const scoreboard = `<div class="scoreboard card-box">
       ${face(cur.a, 'left')}
       <div class="score-mid">
-        ${done.length ? (leader ? `<div class="score-who">${plain(leader)} is up</div><div class="score-big">${trim(Math.abs(net) / bb)}<small>bb</small></div>
+        ${multi ? `<div class="score-scope">All ${rounds.length} rounds · ${plural(cumDeals, 'deal')}</div>` : ''}
+        ${cumDeals ? (leader ? `<div class="score-who">${plain(leader)} is up</div><div class="score-big">${trim(Math.abs(Math.round(cumBB * 10) / 10))}<small>bb</small></div>
           <div class="score-rate">${trim(Math.abs(Math.round(rate * 10) / 10))} bb/100 hands</div>`
           : '<div class="score-big even">Even</div>') : '<div class="score-who">No deals finished yet</div>'}
-        <div class="score-cap">deals won ${wins}–${losses}${done.length - wins - losses ? ` · ${done.length - wins - losses} even` : ''} · ${done.length} of ${total} played</div>
-        ${v ? `<div class="score-verdict"><span class="verdict ${v.tone}">${esc(v.short)}</span><span class="small soft">${esc(v.long)}</span></div>` : ''}
+        ${v ? `<div class="score-verdict">${v.decided ? '<span class="decided-badge">Decided</span>' : ''}<span class="verdict ${v.tone}">${esc(v.short)}</span><span class="small soft">${esc(v.long)}</span></div>` : ''}
+        ${roundLine}
       </div>
       ${face(cur.b, 'right')}</div>`;
 
@@ -595,18 +671,23 @@ async function matchBody(cur, params) {
   const order = [...played].sort((x, y) => x - y);
   const i = order.indexOf(pick);
   const dealNet = pick in nets ? nets[pick] : null;
-  const rounds = state.index.some(m => m.round > 1 && m.a === cur.a && m.b === cur.b);
   const outcome = dealNet == null ? 'in progress' : dealNet === 0 ? 'even over both plays'
     : `<b>${short(dealNet > 0 ? cur.a : cur.b)}</b> wins it by <b class="gold">${trim(Math.abs(dealNet) / bb)} bb</b> over both plays`;
-  const bar = `<div class="deal-bar"><h2>${rounds ? `<span class="round">Round ${cur.round}</span>` : ''}Deal ${pick + 1}<small> of ${total}</small></h2>
+  const bar = `<div class="deal-bar"><h2>${multi ? `<span class="round">Round ${cur.round}</span>` : ''}Deal ${pick + 1}<small> of ${total}</small></h2>
     <div class="nav"><button data-deal="${order[i - 1]}" ${i > 0 ? '' : 'disabled'} aria-label="Previous deal" title="Previous deal (←)">←</button>
       <button data-deal="${order[i + 1]}" ${i < order.length - 1 ? '' : 'disabled'} aria-label="Next deal" title="Next deal (→)">→</button></div>
     <span class="deal-outcome soft">${outcome}</span></div>`;
 
-  const plays = [ma, mb].filter(Boolean).map((m, j) => ({ m, j, ...PokerTable.steps(m.events[pick] || []) }));
+  const plays = [ma, mb].filter(Boolean).map((m, j) => ({ m, j, names: m.config.players.map(x => nameParts(labelText(x))[0]),
+    ...PokerTable.steps(m.events[pick] || []) }));
   const last = Math.max(0, ...plays.map(p => p.steps.length - 1));
   const key = cur.id + '#' + pick;
-  const rp = state.replay && state.replay.key === key ? state.replay : { key, s: last, follow: true, playing: false, fresh: true };
+  // a finished deal opens at its first step; a deal still being played follows the latest step
+  const following = !(pick in nets);
+  const carry = state.carry;
+  state.carry = false;
+  const rp = state.replay && state.replay.key === key ? state.replay
+    : { key, s: following && !carry ? last : 0, follow: following && !carry, playing: !!carry, fresh: true };
   if (rp.fresh && params.has('step')) { rp.s = Math.max(0, Math.min(last, Number(params.get('step')) - 1 || 0)); rp.follow = rp.s >= last; }
   if (rp.follow && !rp.playing) rp.s = last;
   rp.last = last;
@@ -622,12 +703,14 @@ async function matchBody(cur, params) {
     <button class="ctl" data-ctl="end" title="To the end">⏭</button>
     <input type="range" class="scrub" min="0" max="${last}" value="${rp.s}" aria-label="Step">
     <span class="step-text"></span>
+    <span class="play-switch" role="group" aria-label="Which play">${plays.map(p => `<button class="toggle" data-show="${p.j}" aria-pressed="${state.showPlay === p.j}">${p.j ? 'Play 2<span class="hide-xs"> · swapped</span>' : 'Play 1'}</button>`).join('')}</span>
+    <button class="toggle" id="auto-toggle" aria-pressed="${state.autoNext}" title="When a deal ends, go on to the next one">Auto-next deal</button>
     <button class="toggle" id="mind-toggle" aria-pressed="${state.mind}" title="Show every decision's reasoning (r)">Reasoning</button>
     <span class="keys"><span class="kbd">←</span><span class="kbd">→</span> deals · <span class="kbd">space</span> play · <span class="kbd">,</span><span class="kbd">.</span> step · <span class="kbd">r</span> reasoning</span></div>`;
 
   const body = `${scoreboard}<div class="strip-wrap"><div class="strip" style="--cols:${total <= 30 ? Math.max(total, 16) : Math.ceil(total / Math.ceil(total / 25))}">${strip}</div>${legend}</div>
     ${bar}${controls}
-    <div class="pair ${state.mind ? 'show-mind' : ''}">${plays.map(p => playPanel(p, cur, bb)).join('')}</div>`;
+    <div class="pair ${state.mind ? 'show-mind' : ''}" data-show="${state.showPlay}">${plays.map(p => playPanel(p, cur, bb)).join('')}</div>`;
   const after = () => {
     $app.querySelectorAll('[data-deal]').forEach(b => b.onclick = () => go(cur, Number(b.dataset.deal)));
     $app.querySelectorAll('[data-ctl]').forEach(b => b.onclick = () => control(b.dataset.ctl));
@@ -643,6 +726,16 @@ async function matchBody(cur, params) {
       b.setAttribute('aria-expanded', String(ev.classList.contains('open')));
     });
     document.getElementById('mind-toggle')?.addEventListener('click', toggleMind);
+    document.getElementById('auto-toggle')?.addEventListener('click', e => {
+      state.autoNext = !state.autoNext;
+      store.set('autonext', state.autoNext);
+      e.currentTarget.setAttribute('aria-pressed', String(state.autoNext));
+    });
+    $app.querySelectorAll('.play-switch [data-show]').forEach(b => b.onclick = () => {
+      state.showPlay = Number(b.dataset.show);
+      $app.querySelector('.pair')?.setAttribute('data-show', state.showPlay);
+      $app.querySelectorAll('.play-switch [data-show]').forEach(x => x.setAttribute('aria-pressed', String(Number(x.dataset.show) === state.showPlay)));
+    });
     const fresh = rp.fresh;
     rp.fresh = false;
     applyStep(fresh ? null : 'keep');
@@ -718,7 +811,7 @@ function applyStep(mode) {
     if (!panel || !p.steps.length) return;
     const mine = Math.min(s, p.steps.length - 1);
     const prev = mode !== 'keep' && p.shown != null && p.shown < mine ? p.steps[p.shown] : null;
-    PokerTable.show(panel, p.steps[mine], { fmt: c => bbs(c, v.bb), prev });
+    PokerTable.show(panel, p.steps[mine], { fmt: c => bbs(c, v.bb), prev, names: p.names });
     p.shown = mine;
     panel.querySelectorAll('[data-step]').forEach(el => {
       const k = Number(el.dataset.step);
@@ -732,7 +825,7 @@ function applyStep(mode) {
   if (txt) txt.textContent = s >= rp.last ? 'End of the hand' : `Step ${s + 1} of ${rp.last + 1}`;
   $app.querySelector('.deal-outcome')?.classList.toggle('spoiler', s < rp.last);
   const pb = $app.querySelector('[data-ctl="play"]');
-  if (pb) pb.textContent = rp.playing ? '❚❚ Pause' : s >= rp.last ? '↺ Replay' : '▶ Play';
+  if (pb) pb.textContent = rp.playing ? '❚❚ Pause' : s >= rp.last ? '↺ Replay' : s === 0 ? '▶ Watch from start' : '▶ Play';
 }
 function setStep(s) {
   const rp = state.replay;
@@ -747,10 +840,22 @@ function schedulePlay() {
   if (!rp || !rp.playing) return;
   rp.timer = setTimeout(() => {
     if (!rp.playing) return;
-    if (rp.s >= rp.last) { stopPlay(); return; }
+    if (rp.s >= rp.last) { nextDeal(rp); return; }
     setStep(rp.s + 1);
-    if (rp.s >= rp.last) stopPlay(); else schedulePlay();
-  }, 1100);
+    schedulePlay();
+  }, rp.s >= rp.last - 1 ? 1500 : 1100);
+}
+// At the end of a deal, playback goes on to the next played deal, unless that is switched off.
+function nextDeal(rp) {
+  const v = state.view;
+  const order = v ? [...v.played].sort((a, b) => a - b) : [];
+  const next = order[order.indexOf(v?.pick) + 1];
+  if (!state.autoNext || next == null) { stopPlay(); return; }
+  rp.timer = setTimeout(() => {
+    if (!rp.playing) return;
+    state.carry = true;
+    go(v.cur, next);
+  }, 1400);
 }
 function startPlay() {
   const rp = state.replay;

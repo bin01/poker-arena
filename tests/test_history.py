@@ -1,5 +1,6 @@
-"""The history database: deal seeds and fingerprints stored, a schema-1 database upgraded in place, repeated
-deals across runs averaged in the all-time standings, and unresolved identities quarantined."""
+"""The history database: deal seeds and fingerprints stored, older databases upgraded in place, repeated deals
+across runs averaged, only identical protocols pooled, unresolved identities and served-model mismatches
+quarantined, and the all-time standings descriptive only."""
 import json
 import sqlite3
 import tempfile
@@ -12,20 +13,27 @@ from poker_arena.ratings import fingerprint, ratings
 GAME = {'name': 'holdem', 'unit': 'chips', 'big_unit': 2, 'sb': 1, 'bb': 2, 'stack': 200, 'hands_per_match': 20}
 
 
-def write_matchup(root: Path, run, a, b, specs, nets, seed0=1000):
-    """A finished duplicate pair whose deal k gives a `nets[k]` chips over its two hands."""
+def write_matchup(root: Path, run, a, b, specs, nets, seed0=1000, protocols=None, served=None):
+    """A finished duplicate pair whose deal k gives a `nets[k]` chips over its two hands. `protocols`
+    ({pid: fingerprint}) as the runner records them; `served` ({pid: model}) a model that answered."""
     m = root / run / f'{a}__vs__{b}'
     for side, players in (('a-first', [a, b]), ('b-first', [b, a])):
         d = m / side
         d.mkdir(parents=True)
         seeds = [seed0 + k for k in range(len(nets))]
-        (d / 'config.json').write_text(json.dumps({'game': {**GAME, 'hands_per_match': len(nets)}, 'players': players,
-                                                   'seeds': seeds, 'specs': {a: specs[a], b: specs[b]}}))
+        cfg = {'game': {**GAME, 'hands_per_match': len(nets)}, 'players': players, 'seeds': seeds,
+               'specs': {a: specs[a], b: specs[b]}}
+        if protocols:
+            cfg['protocol'] = {p: {'fingerprint': f, 'settings': {}} for p, f in protocols.items()}
+        (d / 'config.json').write_text(json.dumps(cfg))
+        if served:
+            (d / 'calls.jsonl').write_text(''.join(json.dumps({'player': p, 'served_model': m, 'attempt': 0}) + '\n'
+                                                   for p, m in served.items()))
         lines = []
         for k, net in enumerate(nets):
             half = net // 2 if side == 'a-first' else net - net // 2
             n = [half, -half] if side == 'a-first' else [-half, half]
-            lines.append(json.dumps({'hand': k, 'net': n, 'won': [0, 0], 'actions': [], 'board': []}))
+            lines.append(json.dumps({'hand': k, 'button': k % 2, 'net': n, 'won': [0, 0], 'actions': [], 'board': []}))
         (d / 'hands.jsonl').write_text('\n'.join(lines) + '\n')
         (d / 'result.json').write_text('{}')
 
@@ -75,6 +83,69 @@ class TestHistory(unittest.TestCase):
         run = ratings(self.root / 'one', boot=30)
         self.assertTrue(next(p for p in run['players'] if p['player'] == 'alias')['quarantined'])
         self.assertEqual(len(run['components'][0]), 4)
+
+    def test_protocols_never_pool(self):
+        nets = [8, -4, 0, 12, -8, 4, 0, 0, 16, -12] * 2
+        write_matchup(self.root, 'one', 'm1', 'm2', SPECS, nets, protocols={'m1': 'aaaaaaaa11', 'm2': 'bbbbbbbb22'})
+        write_matchup(self.root, 'two', 'm1', 'm2', SPECS, nets, seed0=5000, protocols={'m1': 'cccccccc33', 'm2': 'bbbbbbbb22'})
+        history.sync(self.root)
+        r = history.all_time(self.root / history.DB_NAME, boot=30, players_file='/none')
+        ids = {p['player'] for p in r['players']}
+        self.assertEqual(ids, {'claude:claude-x-1:high#aaaaaaaa', 'claude:claude-x-1:high#cccccccc', 'codex:gpt-y:high#bbbbbbbb'})
+        labels = {r['labels'][i] for i in ids if i.startswith('claude')}
+        self.assertEqual(len(labels), 2)                                  # told apart by protocol
+        self.assertTrue(all('protocol' in lab for lab in labels))
+
+    def test_served_model_mismatch_is_quarantined(self):
+        write_matchup(self.root, 'one', 'm1', 'm2', SPECS, [4, -2] * 10, served={'m2': 'gpt-old'})
+        write_matchup(self.root, 'two', 'm1', 'm2', SPECS, [4, -2] * 10, seed0=3000, served={'m2': 'gpt-y'})
+        history.sync(self.root)
+        r = history.all_time(self.root / history.DB_NAME, boot=30, players_file='/none')
+        by = {p['player']: p for p in r['players']}
+        bad = 'codex:gpt-y:high!served=gpt-old'
+        self.assertEqual((by[bad]['quarantined'], by[bad]['in_fit']), (True, False))
+        self.assertTrue(by['codex:gpt-y:high']['in_fit'])                # its other run still counts
+        self.assertIn({'run': 'one', 'player': 'codex:gpt-y:high', 'reason': 'answered by gpt-old'}, r['left_out'])
+        run = ratings(self.root / 'one', boot=30)
+        m2 = next(p for p in run['players'] if p['player'] == 'm2')
+        self.assertEqual((m2['quarantined'], m2['in_fit']), (True, True))
+        self.assertIn('gpt-old', m2['quarantine_reason'])
+
+    def test_all_time_is_descriptive(self):
+        write_matchup(self.root, 'one', 'm1', 'm2', SPECS, [40, 30] * 30)
+        write_matchup(self.root, 'two', 'm1', 'm2', SPECS, [40, 30] * 30, seed0=9000)
+        history.sync(self.root)
+        r = history.all_time(self.root / history.DB_NAME, boot=30, players_file='/none')
+        self.assertTrue(r['pooled'])
+        self.assertEqual({m['verdict'] for m in r['pairings']}, {'descriptive'})
+        self.assertIsNone(r['leader'])
+        self.assertIsNone(r['groups'][0]['leader'])
+        self.assertTrue(all(p['rank'] is None and p['rank_kind'] == 'descriptive' for p in r['players']))
+        self.assertTrue(any('descriptive only' in n for n in r['notes']))
+
+    def test_style_by_opponent_identity(self):
+        write_matchup(self.root, 'one', 'm1', 'm2', SPECS, [4, -2] * 10)
+        history.sync(self.root)
+        r = history.all_time(self.root / history.DB_NAME, boot=30, players_file='/none')
+        s = r['stats']['claude:claude-x-1:high']
+        self.assertEqual(set(s['by_opponent']), {'codex:gpt-y:high'})
+        self.assertEqual(s['by_opponent']['codex:gpt-y:high']['hands'], 40)
+        self.assertEqual(set(s['by_position']), {'button', 'big_blind'})
+        self.assertEqual(s['counts']['vpip']['of'], 40)
+
+    def test_schema_2_database_resyncs(self):
+        write_matchup(self.root, 'one', 'm1', 'm2', SPECS, [4, -2] * 10, protocols={'m1': 'aaaaaaaa11', 'm2': 'bbbbbbbb22'})
+        db = self.root / history.DB_NAME
+        history.sync(self.root)
+        con = sqlite3.connect(db)
+        con.execute("UPDATE deals SET a_identity = 'old'")
+        con.execute("UPDATE meta SET v = '2' WHERE k = 'schema'")
+        con.commit()
+        con.close()
+        self.assertGreater(history.sync(self.root)['matches'], 0)
+        con = sqlite3.connect(db)
+        self.assertEqual(con.execute('SELECT DISTINCT a_identity FROM deals').fetchall(), [('claude:claude-x-1:high#aaaaaaaa',)])
+        con.close()
 
     def test_schema_1_database_upgrades(self):
         db = self.root / history.DB_NAME

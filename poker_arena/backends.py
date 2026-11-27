@@ -15,9 +15,13 @@ any OpenAI-compatible chat endpoint), also stateless.
 
 Every backend has the same shape: `await backend.send(text)` returns a Reply with the model's text, any
 reasoning the tool exposes, usage and timing, and in `meta` the command line it ran (`argv`, prompts elided),
-the tool's raw output (`raw`) and every failed try before it (`failed_attempts`, rate-limit waits included).
-`state()` / `restore()` let a stopped match resume; `rebuild()` starts a CLI conversation over from the
-turns the match committed, for when the CLI's own conversation may hold turns the record dropped.
+the tool's raw output (`raw`), the CLI session before and after, and every failed try before it
+(`failed_attempts`, rate-limit waits included, each with its exit status, stdout and stderr). A failed try
+that may have advanced a CLI's own conversation is followed by a rebuild, so the retry never builds on a
+turn the record lacks. `meta['tool_use']` lists any tool the model ran or tried in its turn (the seat rejects
+such a reply). `state()` / `restore()` let a stopped match resume; `rebuild()` starts a CLI conversation over
+from the turns the match committed, for when the CLI's own conversation may hold turns the record dropped.
+`protocol()` is what a player's results depend on, for its identity across runs.
 """
 from __future__ import annotations
 import asyncio
@@ -25,6 +29,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -72,6 +77,8 @@ class Backend:
     stateful = False
     exe: str | None = None   # the CLI this backend runs, for the version in the match's config
     PRIVATE = {'system', 'turns', 'session', 'workdir', 'label', 'key', 'rebuilding', 'last_call'}
+    NOT_PROTOCOL = {'timeout', 'rate_limit_wait', 'max_wait', 'print_timeout'}   # settings that don't change play
+    TOOLS = 'none offered'   # how this CLI keeps tools away from the model (tool_policy)
 
     def __init__(self, system: str, *, model: str | None = None, timeout: float = 900, retries: int = 3,
                  rate_limit_wait: float = 900, max_wait: float = 6 * 3600, max_history_chars: int = 400_000,
@@ -95,6 +102,14 @@ class Backend:
     def version(self) -> str | None:
         return cli_version(self.exe)
 
+    def tool_policy(self) -> dict:
+        return {'restriction': self.TOOLS, 'tool_turns': 'rejected and asked again in a rebuilt conversation'}
+
+    def protocol(self) -> dict:
+        """The settings that change how this seat plays (not timeouts or waits), with the tool policy."""
+        out = {k: v for k, v in self.describe().items() if k not in self.NOT_PROTOCOL}
+        return {**out, 'tool_policy': self.tool_policy()}
+
     # ---- state for resuming a stopped match -------------------------------------------------
     def state(self):
         return {'turns': self.turns, 'session': self.session, 'workdir': self.workdir}
@@ -113,13 +128,25 @@ class Backend:
             self.session = None
             self.rebuilding = bool(self.turns)
 
+    def forget_last(self):
+        """Take back the last turn (a reply that was rejected unseen, e.g. one that used a tool): it leaves the
+        record, and a CLI's conversation, which holds it, is rebuilt without it."""
+        if self.turns:
+            self.turns.pop()
+        self.rebuild()
+
+    def _session_from(self, stdout: str) -> str | None:
+        """The CLI session a (possibly failed) run's output names, if any."""
+        return None
+
     # ---- the transcript a stateless backend re-sends ----------------------------------------
     def transcript(self, text: str, system: bool = True) -> str:
         """System prompt, earlier turns (oldest dropped first when too long) and the new turn, as one prompt."""
         turns = list(self.turns)
         def build(ts):
             parts = ([self.system, ''] if system else [
-                'This match was interrupted and continues in a new conversation; your earlier turns are replayed.',
+                'This match continues in a new conversation (the last one was interrupted or reset); your earlier '
+                'turns are replayed.',
                 '']) + ['=== THE MATCH SO FAR (your earlier turns and replies) ===']
             if len(ts) < len(self.turns):
                 parts.append(f'[{len(self.turns) - len(ts)} earlier turns omitted for length; your notes carry what '
@@ -136,16 +163,24 @@ class Backend:
 
     async def send(self, text: str) -> Reply:
         waited, attempt, failed = 0.0, 0, []
-        payload = self.transcript(text, system=False) if self.rebuilding else text
         while True:
-            start, t = time.monotonic(), round(time.time(), 1)
+            payload = self.transcript(text, system=False) if self.rebuilding else text
+            start, t, before = time.monotonic(), round(time.time(), 1), self.session
             self.last_call = {}
             try:
                 reply = await self._call(payload)
             except BackendError as e:
                 msg = str(e)
+                raw = self.last_call.get('raw') or {}
+                after = self._session_from(raw.get('stdout') or '') or self.session
                 rec = {'t': t, 'latency': round(time.monotonic() - start, 2), 'error': msg[:2000],
-                       'argv': self.last_call.get('argv')}
+                       'argv': self.last_call.get('argv'), 'returncode': raw.get('returncode'),
+                       'session_before': before, 'session_after': after, 'raw': raw or None}
+                # a CLI that ran may have stored the turn in its conversation: drop that conversation, so the
+                # retry replays the committed turns instead of building on one the record lacks
+                if self.stateful and self.last_call.get('launched') and (before or after):
+                    self.rebuild()
+                    rec['rebuilt'] = True
                 failed.append(rec)
                 if RATE_LIMIT.search(msg) and waited < self.max_wait:
                     rec.update(rate_limited=True, waited=self.rate_limit_wait)
@@ -161,7 +196,8 @@ class Backend:
                 await asyncio.sleep(rec['waited'])
                 continue
             reply.latency = round(time.monotonic() - start, 2)
-            meta = {'argv': self.last_call.get('argv'), 'raw': self.last_call.get('raw')}
+            meta = {'argv': self.last_call.get('argv'), 'raw': self.last_call.get('raw'),
+                    'session_before': before, 'session_after': self.session}
             if failed:
                 meta['failed_attempts'] = failed
             if self.rebuilding:
@@ -183,6 +219,8 @@ class Backend:
         return self.workdir
 
     async def run(self, cmd: list[str], stdin: str | None = None, cwd: str | None = None) -> str:
+        """Run a CLI; its exit status, stdout and stderr are kept in last_call['raw'] even when it fails or
+        times out (what it printed before the kill)."""
         self.last_call['argv'] = [('<system prompt>' if a == self.system else f'<{len(a)} chars>' if len(a) > 500
                                    else a) for a in cmd]
         exe = shutil.which(cmd[0])
@@ -191,18 +229,67 @@ class Backend:
         workdir = cwd or self.folder()
         proc = await asyncio.create_subprocess_exec(
             exe, *cmd[1:], cwd=workdir, stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True)
+        self.last_call['launched'] = True
+
+        def kill():   # the CLI and anything it started
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                if proc.returncode is None:
+                    proc.kill()
+        bufs = ([], [])
+
+        async def pump(stream, buf):
+            while chunk := await stream.read(65536):
+                buf.append(chunk)
+
+        async def feed():
+            if stdin is not None:
+                try:
+                    proc.stdin.write(stdin.encode())
+                    await proc.stdin.drain()
+                    proc.stdin.close()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        io = asyncio.ensure_future(asyncio.gather(pump(proc.stdout, bufs[0]), pump(proc.stderr, bufs[1]), feed()))
+        timed_out = False
         try:
-            out, err = await asyncio.wait_for(proc.communicate(stdin.encode() if stdin is not None else None),
-                                              self.timeout)
+            await asyncio.wait_for(asyncio.shield(io), self.timeout)
+            await proc.wait()
+        except asyncio.CancelledError:
+            kill()
+            raise
         except asyncio.TimeoutError:
-            proc.kill()
+            timed_out = True
+            kill()
+            try:
+                await asyncio.wait_for(asyncio.shield(io), 5)
+            except asyncio.TimeoutError:
+                io.cancel()
+            await proc.wait()
+        out_s, err_s = (b''.join(b).decode(errors='replace') for b in bufs)
+        self.last_call['raw'] = {'returncode': proc.returncode, 'stdout': out_s, 'stderr': err_s,
+                                 **({'timed_out': True} if timed_out else {})}
+        if timed_out:
             raise BackendError(f'{cmd[0]} timed out after {self.timeout:.0f}s')
-        out_s, err_s = out.decode(errors='replace'), err.decode(errors='replace')
-        self.last_call['raw'] = {'returncode': proc.returncode, 'stdout': out_s, 'stderr': err_s}
         if proc.returncode != 0:
             raise BackendError(f'{cmd[0]} exited {proc.returncode}: {(err_s or out_s).strip()[-1500:]}')
         return out_s
+
+
+def _ids(stdout: str, key: str, types=None) -> str | None:
+    """The last `key` in a JSONL stream (optionally only from events of the given types)."""
+    found = None
+    for line in stdout.splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(ev, dict) and ev.get(key) and (types is None or ev.get('type') in types):
+            found = ev[key]
+    return found
 
 
 class ClaudeCLI(Backend):
@@ -213,6 +300,7 @@ class ClaudeCLI(Backend):
     Thinking is shown as summaries (`--thinking-display summarized`) so the viewer can show it."""
     stateful = True
     exe = 'claude'
+    TOOLS = "--tools '' (no built-in tools) and --strict-mcp-config with no servers"
 
     def __init__(self, system, *, isolate: bool = True, thinking_display: str | None = 'summarized',
                  effort: str | None = None, **kw):
@@ -233,7 +321,7 @@ class ClaudeCLI(Backend):
         if self.session:
             cmd += ['--resume', self.session]
         out = await self.run(cmd + self.extra_args, stdin=text)
-        thinking, result, usage, session, is_error = [], None, {}, None, False
+        thinking, result, usage, session, is_error, tools = [], None, {}, None, False, []
         for line in out.splitlines():
             try:
                 ev = json.loads(line)
@@ -243,6 +331,9 @@ class ClaudeCLI(Backend):
                 for block in (ev.get('message') or {}).get('content') or []:
                     if block.get('type') == 'thinking' and block.get('thinking'):
                         thinking.append(block['thinking'])
+                    elif str(block.get('type', '')).endswith('tool_use'):
+                        tools.append({'type': block['type'], 'name': block.get('name'),
+                                      'input': json.dumps(block.get('input'), default=str)[:500]})
             elif ev.get('type') == 'result':
                 result, usage = ev.get('result'), ev.get('usage') or {}
                 session, is_error = ev.get('session_id'), ev.get('is_error', False)
@@ -252,24 +343,41 @@ class ClaudeCLI(Backend):
         if result is None or is_error:
             raise BackendError(f'claude returned no result: {out.strip()[-1500:]}')
         self.session = session or self.session
-        return Reply(result, '\n'.join(thinking), usage, meta={'session': self.session})
+        meta = {'session': self.session, **({'tool_use': tools} if tools else {})}
+        return Reply(result, '\n'.join(thinking), usage, meta=meta)
+
+    def _session_from(self, stdout):
+        return _ids(stdout, 'session_id')
+
+
+CODEX_NO_TOOLS = ['-c', 'web_search="disabled"', '-c', 'mcp_servers={}', '-c', 'agents.enabled=false',
+                  *[f for feature in ('shell_tool', 'unified_exec', 'apps', 'plugins', 'browser_use',
+                                      'browser_use_external', 'in_app_browser', 'computer_use', 'image_generation',
+                                      'view_image', 'multi_agent', 'goals', 'hooks', 'skill_search', 'tool_suggest',
+                                      'sleep_tool', 'code_mode_host') for f in ('--disable', feature)]]
+CODEX_SAFE_ITEMS = {'agent_message', 'assistant_message', 'reasoning', 'error', 'todo_list'}
 
 
 class CodexCLI(Backend):
-    """Codex CLI (`codex exec`), read-only sandbox in an empty folder. The system prompt goes in the
-    The game's system prompt replaces Codex's built-in coding instructions (`model_instructions_file`); later
-    turns resume the same thread. Codex's tools can't be switched off, so the read-only sandbox is the guard.
-    Reasoning comes back as short summary titles."""
+    """Codex CLI (`codex exec`), read-only sandbox in an empty folder. The game's system prompt replaces Codex's
+    built-in coding instructions (`model_instructions_file`); later turns resume the same thread. Every tool
+    Codex lets a flag switch off is off (CODEX_NO_TOOLS: shell, web search, MCP servers, subagents, apps,
+    browser, images, ...), and with `isolate` (the default) your own config.toml and exec rules don't load.
+    A turn that still ran a tool is rejected by the seat. Reasoning comes back as short summary titles."""
     stateful = True
     exe = 'codex'
+    TOOLS = 'read-only sandbox; disabled: ' + ' '.join(CODEX_NO_TOOLS)
 
     def __init__(self, system, *, effort: str | None = 'high', summary: str | None = 'auto',
-                 replace_instructions: bool = True, **kw):
+                 replace_instructions: bool = True, isolate: bool = True, **kw):
         super().__init__(system, **kw)
         self.effort, self.summary, self.replace_instructions = effort, summary, replace_instructions
+        self.isolate = isolate
 
     async def _call(self, text):
-        flags = ['--json', '--skip-git-repo-check']
+        flags = ['--json', '--skip-git-repo-check', *CODEX_NO_TOOLS]
+        if self.isolate:
+            flags += ['--ignore-user-config', '--ignore-rules']
         if self.replace_instructions:
             path = os.path.join(self.folder(), 'instructions.md')
             if not os.path.exists(path):
@@ -284,13 +392,13 @@ class CodexCLI(Backend):
             flags += ['-c', f'model_reasoning_summary="{self.summary}"']
         flags += self.extra_args
         if self.session:
-            cmd = ['codex', 'exec', 'resume', self.session, *flags, '-']
+            cmd = ['codex', 'exec', 'resume', self.session, '-c', 'sandbox_mode="read-only"', *flags, '-']
             prompt = text
         else:
             cmd = ['codex', 'exec', '--sandbox', 'read-only', *flags, '-']
             prompt = text if self.replace_instructions else self.system + '\n\n=== THE MATCH BEGINS ===\n' + text
         out = await self.run(cmd, stdin=prompt)
-        messages, thinking, usage = [], [], {}
+        messages, thinking, usage, tools = [], [], {}, {}
         for line in out.splitlines():
             try:
                 ev = json.loads(line)
@@ -299,10 +407,13 @@ class CodexCLI(Backend):
             t = ev.get('type', '')
             if t == 'thread.started':
                 self.session = ev.get('thread_id') or self.session
-            elif t == 'item.completed':
+            elif t in ('item.started', 'item.completed'):
                 item = ev.get('item') or {}
                 kind = item.get('type') or item.get('item_type')
-                if kind == 'error':  # config warnings arrive as items; they don't fail the turn
+                if kind not in CODEX_SAFE_ITEMS:
+                    tools[item.get('id') or len(tools)] = {'type': kind, 'name': str(
+                        item.get('command') or item.get('query') or item.get('tool') or item.get('server') or '')[:500]}
+                if t == 'item.started' or kind == 'error':  # config warnings arrive as items; they don't fail the turn
                     continue
                 if kind in ('agent_message', 'assistant_message'):
                     messages.append(item.get('text', ''))
@@ -314,7 +425,11 @@ class CodexCLI(Backend):
                 raise BackendError(f'codex: {json.dumps(ev)[:1500]}')
         if not messages:
             raise BackendError(f'codex returned no message: {out.strip()[-1500:]}')
-        return Reply(messages[-1], '\n'.join(thinking), usage, meta={'session': self.session})
+        meta = {'session': self.session, **({'tool_use': list(tools.values())} if tools else {})}
+        return Reply(messages[-1], '\n'.join(thinking), usage, meta=meta)
+
+    def _session_from(self, stdout):
+        return _ids(stdout, 'thread_id', {'thread.started'})
 
 
 AGY_AGENT = """---
@@ -340,6 +455,7 @@ class AgyCLI(Backend):
     the conversation's transcript, along with the model that actually answered."""
     stateful = True
     exe = 'agy'
+    TOOLS = "agent with tools: [], settings deny " + ' '.join(AGY_DENY['permissions']['deny']) + ', --sandbox'
     BRAIN = os.path.expanduser('~/.gemini/antigravity-cli/brain')
 
     def __init__(self, system, *, effort=None, print_timeout='15m', lockdown: bool = True, **kw):
@@ -355,21 +471,28 @@ class AgyCLI(Backend):
                 f.write(AGY_AGENT + self.system + '\n')
 
     def _transcript(self):
-        """(thinking, model) of the latest model step in this conversation's transcript, if agy wrote one."""
+        """(thinking, model, tool calls) of this turn (the steps after the last user input) in the
+        conversation's transcript, if agy wrote one."""
         path = os.path.join(self.BRAIN, self.session or '', '.system_generated', 'logs', 'transcript.jsonl')
         try:
             with open(path) as f:
                 lines = f.read().splitlines()
         except OSError:
-            return '', None
-        for line in reversed(lines):
+            return '', None, []
+        rows = []
+        for line in lines:
             try:
-                rec = json.loads(line)
+                rows.append(json.loads(line))
             except ValueError:
                 continue
+        start = max((i for i, r in enumerate(rows) if r.get('type') == 'USER_INPUT'), default=-1) + 1
+        thinking, model, tools = '', None, []
+        for rec in rows[start:]:
             if rec.get('type') == 'PLANNER_RESPONSE':
-                return rec.get('thinking') or '', rec.get('model')
-        return '', None
+                thinking, model = rec.get('thinking') or thinking, rec.get('model') or model
+                tools += [{'type': 'tool_call', 'name': c.get('name'), 'input': json.dumps(c.get('args'))[:500]}
+                          for c in rec.get('tool_calls') or []]
+        return thinking, model, tools
 
     async def _call(self, text):
         cmd = ['agy', '--output-format', 'json', '--sandbox', '--print-timeout', self.print_timeout]
@@ -394,9 +517,16 @@ class AgyCLI(Backend):
         if data.get('status') != 'SUCCESS':
             raise BackendError(f'agy {data.get("status")}: {json.dumps(data.get("error") or data)[:1500]}')
         self.session = data.get('conversation_id') or self.session
-        thinking, served = self._transcript()
-        meta = {'session': self.session, **({'served_model': served} if served else {})}
+        thinking, served, tools = self._transcript()
+        meta = {'session': self.session, **({'served_model': served} if served else {}),
+                **({'tool_use': tools} if tools else {})}
         return Reply(data.get('response') or '', thinking, data.get('usage') or {}, meta=meta)
+
+    def _session_from(self, stdout):
+        try:
+            return json.loads(stdout[stdout.find('{'):]).get('conversation_id')
+        except (ValueError, AttributeError):
+            return None
 
 
 class GeminiCLI(Backend):
@@ -420,7 +550,10 @@ class GeminiCLI(Backend):
             raise BackendError(f'gemini returned non-JSON output: {out.strip()[-1500:]}')
         if data.get('error'):
             raise BackendError(f'gemini: {json.dumps(data["error"])[:1500]}')
-        return Reply(data.get('response') or '', '', data.get('usage') or data.get('stats') or {})
+        by_name = (((data.get('stats') or {}).get('tools') or {}).get('byName')) or {}
+        tools = [{'type': 'tool_call', 'name': k} for k, v in by_name.items() if (v or {}).get('count', 1)]
+        return Reply(data.get('response') or '', '', data.get('usage') or data.get('stats') or {},
+                     meta={'tool_use': tools} if tools else {})
 
 
 class CommandCLI(Backend):
@@ -464,7 +597,9 @@ class OpenAICompat(Backend):
         raw = await asyncio.to_thread(self._post, {'model': self.model, 'messages': messages})
         self.last_call['raw'] = raw
         msg = ((raw.get('choices') or [{}])[0]).get('message') or {}
-        return Reply(msg.get('content') or '', msg.get('reasoning') or '', raw.get('usage') or {})
+        tools = [{'type': 'tool_call', 'name': (c.get('function') or {}).get('name')} for c in msg.get('tool_calls') or []]
+        return Reply(msg.get('content') or '', msg.get('reasoning') or '', raw.get('usage') or {},
+                     meta={'tool_use': tools} if tools else {})
 
 
 BACKENDS = {'claude': ClaudeCLI, 'codex': CodexCLI, 'agy': AgyCLI, 'gemini': GeminiCLI, 'command': CommandCLI,

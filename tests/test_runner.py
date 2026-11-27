@@ -122,7 +122,7 @@ class TestInterruptedHand(Base):
         (m / 'hands.jsonl').write_text(''.join(json.dumps(h) + '\n' for h in hist[:hands]))
         # the state as it was written at the end of hand `hands`
         turns = [c for c in self.rows(m / 'calls.jsonl') if c['hand'] < hands]
-        st['hands'] = hands
+        st['hands'] = st['hands_committed'] = hands
         st['agents'][0]['backend']['turns'] = [[c['prompt'], c['output']] for c in turns]
         st['agents'][0]['backend']['session'] = 's1'
         (m / 'state.json').write_text(json.dumps(st))

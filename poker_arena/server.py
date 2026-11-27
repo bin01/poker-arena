@@ -16,6 +16,7 @@ static site (`python -m poker_arena export runs/pilot --out site`).
 """
 from __future__ import annotations
 import json
+import re
 import shutil
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -132,9 +133,10 @@ def _matchup(root: Path, m: Path):
     hb = {h['hand']: h for h in hands['b-first']}
     both = sorted(set(ha) & set(hb))
     specs = cfg.get('specs', {})
+    rep = re.search(r'__x(\d+)', m.name.split('__vs__')[-1])
     rnd = m.name.rsplit('__r', 1)[1] if '__r' in m.name.split('__vs__')[-1] else ''
     return {'id': str(m.relative_to(root)), 'run': run_of(root, m), 'a': a, 'b': b, 'started': True,
-            'round': int(rnd) if rnd.isdigit() else 1,
+            'round': int(rnd) if rnd.isdigit() else 1, 'replicate': int(rep.group(1)) if rep else 1,
             'matches': matches, 'deals_total': len(cfg.get('seeds', [])), 'pairs_done': len(both),
             'pair_net_a': sum(ha[k]['net'][0] + hb[k]['net'][1] for k in both),
             'kinds': {p: 'bot' if 'bot' in s else 'model' for p, s in specs.items()},
@@ -214,6 +216,58 @@ def roster(root: Path, run: str) -> list:
     return out
 
 
+TERMINAL = ('a', 'b', 'even', 'exhausted')
+
+
+def _design(plan: dict):
+    try:
+        from .ratings import normalize_design
+    except ImportError:
+        from .runner import plan_design as normalize_design
+    try:
+        return normalize_design(plan)
+    except Exception:
+        return None
+
+
+def lifecycle(root: Path, run: str, ms: list) -> dict:
+    """Where a run stands: {status: 'running'|'finished'|'stopped', round, pairings: {"a|b": {status, verdict,
+    looks_used}}}. From the runner's tournament.json when there is one; else from plan.json and decisions.json
+    (a pairing is over on a terminal verdict or once its planned rounds are played); else from the folders."""
+    base = root if run == '.' else root / run
+    t = _json(base / 'tournament.json')
+    if isinstance(t, dict) and t.get('status'):
+        return {'source': 'tournament', 'round': t.get('round'), 'pairings': t.get('pairings') or {},
+                'status': t['status'], 'updated': t.get('updated')}
+    plan = _json(base / 'plan.json')
+    if not plan or not plan.get('matchups'):
+        done = bool(ms) and all(m['finished'] for m in ms)
+        return {'source': 'folders', 'status': 'finished' if done else 'running', 'round': None, 'pairings': {}}
+    design = _design(plan) or {}
+    rounds = design.get('max_rounds') or 1
+    decisions = _json(base / 'decisions.json') or {}
+    pairings = {}
+    for a, b in plan['matchups']:
+        mine = [m for m in ms if {m['a'], m['b']} == {a, b} and m['started']]
+        looks = decisions.get(f'{a}__vs__{b}') or []
+        last = looks[-1] if looks else {}
+        verdict = last.get('verdict')
+        played = max((m['round'] for m in mine if m['finished']), default=0)
+        if verdict in TERMINAL:
+            status = 'decided' if verdict != 'exhausted' else 'exhausted'
+        elif played >= rounds and all(m['finished'] for m in mine):
+            status = 'exhausted' if design else 'done'
+        elif any(m['live'] for m in mine):
+            status = 'playing'
+        else:
+            status = 'waiting'
+        pairings[f'{a}|{b}'] = {'status': status, 'verdict': verdict, 'looks_used': last.get('looks_used', 0),
+                                'rounds_played': played, 'rounds_planned': rounds}
+    over = all(p['status'] in ('decided', 'exhausted', 'done') for p in pairings.values())
+    return {'source': 'plan', 'status': 'finished' if over else 'running',
+            'round': max((m['round'] for m in ms if m['started']), default=None), 'pairings': pairings}
+
+
 def _public(m):
     return {k: v for k, v in m.items() if k != 'times'}
 
@@ -240,11 +294,14 @@ def runs(root: Path):
         rate = None  # hands per second
         if live and len(recent) >= 4:
             rate = (len(recent) - 1) / max(1.0, recent[-1] - recent[0])
+        life = lifecycle(root, run, ms)
         out.append({'run': run, 'title': root.name if run == '.' else run.split('/')[-1], 'matchups': len(ms), 'matchups_started': sum(m['started'] for m in ms),
                     'matchups_finished': sum(m['finished'] for m in ms),
                     'players': sorted({m['a'] for m in ms} | {m['b'] for m in ms}),
                     'hands': done, 'hands_planned': planned, 'live': live,
-                    'finished': all(m['finished'] for m in ms),
+                    'finished': life['status'] == 'finished', 'status': life['status'], 'round': life['round'],
+                    'pairings': life['pairings'],
+                    'between_rounds': life['status'] == 'running' and not live and bool(ms) and all(m['finished'] for m in ms if m['started']),
                     'updated': max((m['updated'] for m in ms), default=0),
                     'started_at': times[0] if times else None,
                     'hands_per_hour': round(rate * 3600) if rate else None,
@@ -279,6 +336,7 @@ def _all_runs(rs):
             **{k: sum(r[k] for r in rs) for k in ('matchups', 'matchups_started', 'matchups_finished', 'hands', 'hands_planned')},
             'players': sorted({p for r in rs for p in r['players']}),
             'live': any(r['live'] for r in rs), 'finished': all(r['finished'] for r in rs),
+            'status': 'finished' if all(r['finished'] for r in rs) else 'running',
             'updated': max(r['updated'] for r in rs),
             'started_at': min((r['started_at'] for r in rs if r['started_at']), default=None),
             'hands_per_hour': None, 'eta_seconds': None}

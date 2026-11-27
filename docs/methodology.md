@@ -1,9 +1,10 @@
 # How Poker Arena decides who wins
 
-This page explains how results become standings and verdicts, what the numbers mean, how far they can be
-trusted, and what they cannot tell you. The code is `poker_arena/ratings.py` (standings, verdicts, the
-stopping rule) and `poker_arena/history.py` (all-time standings). The calibration claims below are checked by
-`tests/test_calibration.py` on every test run.
+This page explains how results become verdicts and standings, which of them are tests and which are only
+descriptions, how far they can be trusted, and what they cannot tell you. The code is `poker_arena/ratings.py`
+(the design, the test, the standings) and `poker_arena/history.py` (all-time standings). The calibration claims
+below are checked by `tests/test_calibration.py`: small seeded versions on every test run, and the larger runs
+reported here with `POKER_ARENA_HEAVY=1 python -m pytest -s tests/test_calibration.py`.
 
 ## The question
 
@@ -11,183 +12,233 @@ Which models, each at a given reasoning level, win at heads-up No-Limit Hold'em,
 are told to win chips, so chips decide. The measure is **bb/100 over duplicate deals**: big blinds won per 100
 hands, counted only on deals that both players played from both seats.
 
-## The unit: a duplicate deal
+## Units
 
-Every matchup is two matches on the same seeds with the seats swapped. Deal *k* is hand *k* of both matches. On
-it, each player holds each seat's cards once against the other player, so the luck of the cards largely
-cancels. Its value for player *a* against player *b* is
+**A duplicate deal.** Every conversation of a pairing is two matches on the same seeds with the seats swapped.
+Deal *k* is hand *k* of both. On it each player holds each seat's cards once against the other, which reduces
+the luck of the cards; it does not remove it, because the two plays of a deal can go differently. Its value for
+player *a* against player *b* is
 
-    x = net chips of a over both hands / big blind / 2 × 100
+    x = net chips of a over both hands / big blind / 2 × 100          (bb/100)
 
-which is in bb/100. In the first model runs, the spread of `x` was about 340 bb/100, with many exact zeros (both
-plays ended the same way) and heavy tails.
+In the first model runs the spread of `x` was about 340 bb/100, with many exact zeros and heavy tails.
 
-**Repeated deals.** Every run starts from the same seeds, so the same pair can meet on the same cards in more
-than one run. A deal is identified by its fingerprint: a hash of the game settings that shape it (everything but
-the number of hands), the seed, and the seat holding the button (`ratings.fingerprint`). When a pair has played
-the same fingerprint more than once, those plays are averaged into one observation. A repeat is not new
-evidence about how the two play those cards; counting it twice would overstate the sample. Runs older than
-the fingerprint field are fingerprinted from their recorded game settings and seeds.
+**A conversation** is one such pair of matches with fresh memories: one replicate of one round of one pairing,
+one match folder. A model remembers everything inside a conversation, so its deals are dependent, and two
+conversations of the same pairing can differ for reasons that have nothing to do with the cards (a read the
+model formed early, a style it settled into). The conversation is therefore the independent unit.
 
-## Strength
+**A slate** is the set of deals that one round and replicate deals to every pairing (the same seeds). The
+conversations on one slate share their cards, so a deal that suits an aggressive style moves every pairing
+with an aggressive player the same way: results of different pairings on one slate are correlated.
 
-Each player gets one number, its **strength** in bb/100. It comes from a least-squares fit over all
-observations:
+**Repeated deals.** A deal is identified by its fingerprint: a hash of the game settings that shape it, the seed
+and the seat holding the button (`ratings.fingerprint`). When a pair has played the same fingerprint more than
+once (only possible across runs), those plays are averaged into one observation.
 
-    x(a vs b) ≈ s_a − s_b
+## What is a test and what is a description
 
-with the strengths summing to zero within each group of connected players. So a strength is the edge a player
-would have against the average opponent of its group, and the difference of two strengths is the predicted edge
-between them. Two players who only played each other get `+edge/2` and `−edge/2`.
+Exactly one thing is a test: the **preregistered sequential procedure on each pairing**. Its verdicts *a is
+better*, *b is better* and *even*, reached at a completed planned look, are the only inferential results. The
+chance of any false verdict in a whole tournament is at most `alpha` (5% by default).
 
-The fit assumes edges add up across players (if A beats B by 30 and B beats C by 20, A beats C by about 50).
-Poker has rock-paper-scissors effects, so that can fail. When every pairing is the only link between its
-players, as in a three-player round robin with one pairing per pair, the fit reproduces each pairing exactly and
-the assumption cannot be checked; the output says so in its notes. The per-pairing edges are always reported
-too, and they make no such assumption.
+A **decided rank** and a **decided leader** are built from those verdicts alone, so they inherit the same
+guarantee: a false leader needs at least one false verdict. A leader is a player with a decided win over every
+other player of its group; a rank is decided when a player has a decided win or loss against every other player
+of its group (and the verdicts form no cycle).
 
-**Groups.** Players are connected when a chain of played pairings links them. Players in different groups have
-never been compared, directly or indirectly, so their strengths are on separate scales. Ranks, leaders and the
-all-runs view are per group. A group can only be joined to another by playing a bridge pairing.
+Everything else is **descriptive**: strengths and their intervals, the order by points, the group's front
+runner and its margin, session Elo, style statistics, and every all-time number. These are recomputed on every
+refresh, would answer differently at a different moment, and are never called a result. The output labels them:
+players carry `rank_kind: 'decided' | 'descriptive'` and a `position` (order by points); each group carries a
+`leader` (inferential, or null) next to a `front_runner` (descriptive).
 
-## Uncertainty
+## The preregistered design
 
-A model remembers every earlier hand of a match, so deals within a match are not independent. The resampling
-unit is therefore a **block of 10 consecutive observations within one matchup**. A block bootstrap (300
-resamples, fixed seed) resamples blocks within each pairing, so every pairing keeps its size and the memory
-structure inside each block is kept.
+`ratings.normalize_design(plan)` turns a plan into the one design that the runner plays by, the ratings judge by
+and the viewer shows (nothing else builds one):
 
-Bootstraps with few clusters underestimate the spread, by a factor of about (G − 1)/G in variance, G being the
-number of blocks. So the bootstrap standard error is scaled by √(G/(G − 1)), and the 95% interval uses the
-Student t quantile with G − 1 degrees of freedom rather than 1.96. A player behind fewer than 2 blocks, or in a
-pairing that has only one block (whose spread cannot be resampled), gets no interval at all, and is separated
-from no one. The interval is never a point.
+| key | default | meaning |
+|---|---|---|
+| `alpha` | 0.05 | chance of any false verdict over the tournament |
+| `round_deals` | the plan's `deals` (50) | deals per conversation |
+| `replicates` | 1 in a plan, 2 from `plan` on the command line | conversations per pairing per round |
+| `max_rounds` | 6 | rounds (looks) at most |
+| `n_pairings`, `alpha_pairing` | | Bonferroni: each pairing is tested at `alpha / n_pairings` |
+| `nominal_alpha` | | the level each look is tested at (below) |
+| `target_edge_bb100` | 50 | the edge the plan is powered for, fixed before play |
+| `prior_sd_bb100` | 350 | the per-deal spread assumed when planning |
+| `deals_needed` | | deals per pairing for 80% power at the target (in conversations of `round_deals`) |
+| `deals_planned`, `max_deals` | | the deals needed rounded up to whole rounds and capped at `max_rounds × round_deals × replicates`, and that cap |
+| `power_at_max` | | the simulated chance that the whole procedure calls the better player at the target edge |
 
-## Ranks and the leader
+`python -m poker_arena plan` prints the target in words and warns when the plan cannot reach 80% power, with the
+`--max-rounds` that would. A plan with no design (older runs) has no target; its ratings say so.
 
-Every pair of players in a group is tested for a difference in strength (bootstrap standard error, t with
-G − 1 degrees of freedom), and the p-values are adjusted for the number of pairs with **Holm's** step-down method.
+## The test
 
-- A player's `rank` is shown only when it is separated from every other player in its group. Otherwise
-  `rank_tied_with` lists the players it is not separated from, and `rank_range` gives the best and worst rank
-  the data allow (1 + the number of players significantly better; the group size minus the number
-  significantly worse).
-- The **leader** of a group is the player separated above every other player. If there is none, the output
-  says "No established leader yet". The leader's margin over the next player is reported with its interval.
+After each round a pairing's verdict comes from `ratings.decide`, called by the runner with every deal so far and
+the conversation of each deal.
 
-## Verdicts on pairings, and when to stop
+**Statistic.** The conversation-level t: the deal-weighted mean of `x` over the pairing's conversations, divided
+by a cluster-robust (CR1) standard error with each conversation as one cluster, on C − 1 degrees of freedom. For
+conversations of equal length this is exactly the one-sample t-test on conversation means. It makes no
+assumption about dependence inside a conversation (memory of any length is fine) and it counts how much
+conversations differ from each other, because that is what it measures. A verdict needs at least **2
+conversations**: from one conversation nothing can be said about how a new match would go, so the verdict
+stays open and the output says why (`reason`).
 
-Each pairing gets a verdict from `ratings.decide`. The statistic is the block-mean t: the mean of `x` over
-the pairing, divided by a standard error that treats blocks as clusters (exact batch means when blocks are
-equal). Blocks restart with each matchup, so no block spans two matches.
+**Repeated looks.** Looking after every round gives a false winner more chances. Every look is tested at the
+same nominal level α′ (a Pocock design on the p-value scale, so the bar follows each look's degrees of freedom),
+and α′ is found by simulating 400,000 null sequences (fixed seed, cached) so that over all planned looks a
+pairing with no edge is called with chance `alpha_pairing`. With 3 pairings, 50-deal rounds, 2 replicates and 6
+rounds, α′ = 0.0036 and the bars at looks 1 to 6 are 176, 8.3, 5.2, 4.3, 3.9 and 3.7. A look with one
+conversation has no bar.
 
-A tournament plays a pairing in rounds and looks after each one. Looking repeatedly gives a false winner more
-chances, so the bar is a **group-sequential boundary**:
-
-- The plan's `design` is `{alpha: 0.05, round_deals: 50, max_rounds: 6, block: 10}` by default. The family
-  error is split over the pairings by Bonferroni, so each pairing is tested at `alpha_pairing = alpha / n_pairings`.
-- Each look is tested at the same nominal level α′ (a Pocock design on the p-value scale), so the bar follows each
-  look's degrees of freedom: high at the first look, with only 5 blocks, and lower later. α′ is found by
-  simulating 500,000 null sequences (normal deals, the plan's round size and block size, fixed seed) and solving
-  for the level at which the chance of crossing at any look is `alpha_pairing`. The result is deterministic and
-  cached. For 3 pairings and the default design, α′ = 0.0040 and the bars are 5.96, 3.84, 3.44, 3.28, 3.19 and
-  3.13 at looks 1 to 6.
-- A single planned look (a fixed-length run) uses the plain t quantile at `alpha_pairing`.
-
-The verdicts:
+**Verdicts.**
 
 | verdict | meaning |
 |---|---|
-| `a` / `b` | \|t\| reached the bar at a planned look: that player is better. |
-| `even` | The repeated (1 − 2·alpha_pairing) interval for the edge lies inside ±15 bb/100: an equivalence test (TOST) valid at every look. The pairing is shown to be close, not just undecided. |
-| `exhausted` | The last planned look came and went without a decision. **This is not evidence that the two are equally good**; it only says the data cannot tell at this size. |
-| `open` | Undecided, and looks remain (or a round is in progress). |
-| `early` | Fewer than 2 blocks of deals: no spread to judge by. |
+| `a` / `b` | \|t\| reached the bar at a planned look: that player is better. Decided. |
+| `even` | The repeated (1 − 2·alpha_pairing) interval for the edge lies inside ±15 bb/100: an equivalence test (TOST) at every look. Decided. With a spread near 350 bb/100 it needs thousands of deals. |
+| `exhausted` | The last planned look came without a decision. **Not evidence that the two are equally good.** |
+| `open` | Undecided and looks remain, or a round is under way, or only one conversation. |
+| `early` | Too few deals to estimate any spread. |
 
-With a spread near 350 bb/100, `even` needs thousands of deals, so in practice it is rare. That is intended:
-"we could not tell them apart" and "they are about equal" are different claims, and only the second earns `even`.
-
-`ci95` is the ordinary 95% interval at the current data. `ci_decision` is the interval that matches the
-verdict (the edge ± the bar × the standard error); it is wider, because it pays for the repeated looks.
+`ci95` is the ordinary 95% interval at the look; `ci_decision` is the edge ± the bar × the standard error, the
+interval that matches the verdict. When a run's `decisions.json` recorded a different verdict (an earlier
+version of the test), the pairing shows `recorded_verdict` and the notes say so.
 
 ### Calibration
 
-`tests/test_calibration.py` plays null pairings (no edge) through `ratings.decide` look by look, exactly as the
-runner does, for three kinds of per-deal noise, scaled to a spread of 350 bb/100. With 3 pairings
-(`alpha_pairing` = 0.0167) and 24,000 sequences each:
+Null false-winner rate per pairing, design as above (`alpha_pairing` = 0.0167), 200,000 sequences each
+(Monte Carlo standard error 0.0003), conversations of 50 deals with a per-deal spread of 350:
 
-| noise | false winners per pairing | any false winner in a 3-pairing tournament |
-|---|---|---|
-| normal | 0.0174 ± 0.0008 | 0.051 |
-| t, 3 degrees of freedom | 0.0142 ± 0.0008 | 0.043 |
-| poker-like (40% exact zeros, t3 otherwise) | 0.0127 ± 0.0007 | 0.037 |
+| per-deal results | memory inside a conversation | conversation effect (sd, in standard errors of a conversation mean) | false winners |
+|---|---|---|---|
+| normal | none | 0 | 0.0163 |
+| t, 3 df | none | 0 | 0.0153 |
+| poker-like (40% exact zeros, t3 otherwise) | none | 0 | 0.0143 |
+| normal | AR(1), ρ = 0.3 | 0 | 0.0168 |
+| normal | none | 1.0 | 0.0166 |
+| poker-like | AR(1), ρ = 0.3 | 0.5 | 0.0149 |
+| t, 3 df | none | 2.0 | 0.0169 |
 
-On 1,000,000 fresh normal sequences the per-pairing rate is 0.0168 ± 0.0001 against the target 0.0167. The test
-suite checks smaller versions of these (2,400 sequences each) on every run, plus a single-look design and power.
+Through `ratings.decide` itself, look by look as the runner calls it (poker-like, ρ = 0.3, conversation effect
+1.0, 3,000 sequences): 0.0123.
 
-Power with the default design, 3 pairings and a spread of 350 bb/100: a real edge of 100 bb/100 is called for the
-right player 97% of the time, an edge of 50 bb/100 34% of the time. The wrong player was never called.
+**Shared cards.** Three pairings among three players on the same slates, with a shared deal effect loaded on each
+player's style so that pairings with a common player are correlated, plus memory and conversation effects: the
+chance of any false verdict in the tournament is 0.046 (target 0.05, 50,000 tournaments). Bonferroni needs no
+independence between pairings.
 
-Where the guarantee weakens (measured, not part of the test):
+**Power** (3 pairings, spread 350, the procedure simulated):
 
-- **Dependence longer than a block.** If each deal's result carries over half of the previous one's (AR(1),
-  ρ = 0.5, reset at each new match), the per-pairing false-winner rate is 0.025 instead of 0.0167. At ρ = 0.2 it
-  is 0.016. Real per-deal results in the first run showed no positive lag-1 correlation, but that run is short.
-- **Skewed results.** With strongly skewed noise (a shifted exponential) the rate is 0.026. For two players of
-  equal skill the duplicate result is symmetric by construction, so this matters only when two different
-  styles happen to have the same mean.
+| design | max deals per pairing | edge 100 bb/100 | edge 50 bb/100 |
+|---|---|---|---|
+| 1 replicate, 6 rounds of 50 | 300 | 61% | 14% |
+| 2 replicates, 6 rounds of 50 | 600 | 99.6% | 53% |
+| 2 replicates, 10 rounds of 50 | 1,000 | 100% | 87% |
 
-### Power table
+The wrong player was never called in these simulations. One replicate per round wastes the first look (one
+conversation) and leaves few degrees of freedom, which is why `plan` defaults to 2 replicates.
 
-Each pairing also reports `power.deals_for_80pct`: the deals per pairing needed for an 80% chance of detecting a
-real edge of 20, 50 or 100 bb/100, from the spread observed so far (the cluster standard error times √n, so it
-includes the dependence the blocks see):
+**Power table per pairing.** Each pairing also reports `power.deals_for_80pct`: deals per pairing for an 80%
+chance to detect an edge of 20, 50 or 100 bb/100, from its own observed spread (`se × √n`, so it includes how much
+its conversations differ). A planning number for a future run, not a forecast for this pairing.
 
-    n ≈ ((z(1 − α′/2) + z(0.8)) × spread / edge)²
+## Strength (descriptive)
 
-This is a planning number for a future run. It is not a forecast of how many more deals this pairing needs,
-which would require knowing the true edge. With a spread of 350 and 3 pairings it is roughly 4,200, 680 and 170
-deals.
+Each player gets a strength in bb/100 from a least-squares fit over all observations, `x(a vs b) ≈ s_a − s_b`,
+with the strengths summing to zero within each group of connected players: the edge against the average
+opponent of the group. The fit assumes edges add up across players, which poker's rock-paper-scissors effects can
+break; when every pairing is the only link between its players the assumption cannot be checked, and the notes
+say so. The per-pairing edges never depend on it.
 
-## Session Elo (secondary)
+**Groups.** Players are connected when a chain of played pairings links them; different groups are on separate
+scales and every summary is per group, from that group's own data. A group without a reference bot has no fixed
+anchor, and the notes say so; plans should include a bot to connect models to the same reference.
 
-Session Elo answers a different question: how often a player wins a 10-deal session (20 hands), where winning
-means being up by more than 1 big blind over the session (closer is a tie, counted half). It is a Bradley–Terry
-fit on the Elo scale with a Gaussian prior (1.5 logits), centred on 1500 within each group, and its 95% interval is
-the Laplace approximation of the posterior (the inverse Hessian at the mode). Because of the prior, the interval
-cannot collapse to a point, even after three wins in three sessions.
+**Uncertainty: a joint, stratified bootstrap.** The resampling must keep two dependencies: deals within a
+conversation (memory, conversation effects) and pairings on one slate (shared cards). So the units are whole
+slates, resampled jointly across every pairing on them:
 
-Session Elo can disagree with strength: a player that wins many sessions narrowly and loses a few heavily has a
-high session Elo and a low strength. Strength follows the stated objective (chips), so session Elo never decides
-ranks or leaders.
+1. Slates with the same set of pairings form a stratum. A stratum of at least two slates resamples whole slates:
+   every conversation on a drawn slate comes with it, so both dependencies are kept (`ci_basis: conversations`).
+2. A slate alone in its stratum (for example the only slate of a run with one round) cannot show how slates
+   differ. It is split into aligned blocks of 10 deals (deals 0-9 of every pairing on it together, and so on),
+   which are resampled jointly (`ci_basis: blocks`). Such an interval is conditional on the conversations
+   played: it leaves out how much fresh matches differ, and the output says so.
+3. Each stratum uses the Rao–Wu rescaling bootstrap (k − 1 of its k units drawn with replacement, weighted
+   k / (k − 1)), so the bootstrap variance of a linear statistic is unbiased even with two units. Intervals are
+   the point ± the Student t quantile on the bootstrap's degrees of freedom (units minus strata, over the strata
+   that hold the player's pairings) × the bootstrap standard error. A player behind no resampled unit gets no
+   interval. Groups never share a stratum.
+
+**Coverage** of the 95% strength intervals in seeded round robins of 4 players (strengths ±60 and ±20 bb/100,
+poker-like noise, AR(1) memory, conversation effects and a shared-card effect through style loadings), 1,000 to
+1,600 intervals each:
+
+| setting | coverage |
+|---|---|
+| 4 slates, conversation effects 0.5, shared cards | 0.954 |
+| 4 slates, strong shared cards, joint resampling | 0.954 |
+| same, but resampling each pairing independently (what the joint bootstrap replaces) | 0.883 |
+| 1 slate (blocks), no conversation effect | 0.961 |
+| 1 slate (blocks), AR(1) ρ = 0.3 | 0.952 |
+| 1 slate (blocks), conversation effect 1.0 | 0.895 |
+
+The last row is the limit stated above: with a single conversation per pairing, the interval cannot see how much
+conversations differ.
+
+## Session Elo (secondary, descriptive)
+
+How often a player wins a 10-deal session (up by more than 1 big blind; closer is a tie), as a Bradley–Terry fit
+on the Elo scale with a Gaussian prior (1.5 logits), centred on 1500 within each group, with a Laplace
+(posterior) interval that cannot collapse to a point. It can disagree with strength (many narrow wins and a few
+heavy losses), and it never decides anything.
 
 ## Who is a player
 
-A model player is `backend:model:effort`, for example `claude:claude-sonnet-5-5:high`. Two ids in different
-runs with the same identity pool in the all-time standings; the same model at another reasoning level is a
-different player.
+A model player is `backend:model:effort#protocol`, for example `claude:claude-sonnet-5-5:high#1a2b3c4d`. The
+protocol is the first 8 characters of the fingerprint the runner records for each seat: a hash of every
+setting that changes play (backend, model, effort, isolation, instructions or system prompt, tool policy, extra
+arguments, retries and fixes, thinking display). Only identical protocols pool in the all-time standings; a
+player from before protocols were recorded is kept apart from later runs.
 
-A player whose model was not recorded, or was recorded only as a bare alias (`sonnet`, `opus`, `haiku`, whose
-version changes over time), is **quarantined**: in the all-time standings it is listed with its hands and net
-result but not rated, and its deals are left out of the fit, because two runs of "sonnet" may not be the same
-model. Within a single run it is rated and flagged. A player whose only opponents were quarantined is listed as
-unrated for that reason.
+A player is **quarantined** when its identity is unresolved (no model recorded, or a bare alias such as `sonnet`
+whose version changes over time), when its settings differ between the matches of one run, or when the model
+that answered (as the CLI reports it) is not the configured one. Within a run a quarantined player stays in the
+fit and is flagged (`in_fit: true`, `quarantined: true`). In the all-time standings it is left out of the fit
+(`in_fit: false`), listed with its hands and net result; a served-model mismatch quarantines only that run's
+deals, under their own identity (`...!served=<model>`). `identity_resolved` says separately whether the exact
+model is known.
 
-## Style statistics
+## All-time standings (descriptive only)
 
-`stats.collect` counts standard poker tracking statistics per hand dealt. At showdown, `won_sd` counts pots won
-outright; a split pot is not a win and is counted as `sd_ties`. `wsd` is outright wins over showdowns.
+`history.all_time` pools every run in `arena.db` that was played under the same game settings. Those runs had
+different designs and stopped pairings at different times, so pooling them is no one's preregistered test:
+every pairing there has `verdict: 'descriptive'`, there is no leader and no rank, and the notes say so. Repeated
+deals are averaged; slates are matched by seed across runs, so runs on the same cards are resampled together.
+Independent confirmation needs a new run with its own design.
+
+## Style statistics (tendencies, not quality)
+
+`stats.collect` counts standard poker tracking statistics per hand dealt. Every rate comes with its counts
+(`counts: {rate: {n, of}}`) and a breakdown by opponent (`by_opponent`) and by position (`by_position`: button,
+which posts the small blind heads-up, or big blind). At showdown, `won_sd` counts pots won outright; a split pot
+is counted as `sd_ties`. No value of these is good or bad in itself.
 
 ## Limits
 
-- **Few pairings, one replicate.** Most runs play each pairing once per round as one continuous match. The
-  intervals describe the variation of deals within those matches. They do not cover how much a model's play
-  would vary across fresh conversations, which only independent replicates (`replicates` in a plan) measure.
-- **Memory dependence** beyond 10 deals is not fully absorbed by the blocks (see Calibration).
-- **All-time pooling.** All-time verdicts are one test on all pooled data, with alpha split over all pairings.
-  Runs that stopped a pairing early because it looked decided bias pooled edges slightly away from zero.
+- **Few conversations.** Until a pairing has several conversations its verdict cannot be reached, and its
+  descriptive interval may rest on blocks within one conversation (see Coverage). The first model runs had one
+  conversation per pairing.
+- **Small runs.** A 50 bb/100 edge with a spread of 350 needs about 900 deals per pairing; the first model runs had
+  50. Their numbers are descriptions of those matches.
+- **The prior spread** behind `deals_needed` is an assumption; the per-pairing power table uses the observed one.
 - **Additivity** of strengths is an assumption (see Strength).
-- **Identity is as good as the CLI's report.** A model name in a config is what was requested; the backend may
-  serve another version. `served_models` in the style statistics shows what answered where the CLI reports it.
+- **Identity is as good as the CLI's report.** `served_models` shows what answered where the CLI reports it; a
+  CLI that doesn't report it can't be checked.
 - **One game format.** Heads-up, 100 big blinds deep, stacks reset every hand. Strengths do not carry over to
   other formats.

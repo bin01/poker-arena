@@ -74,7 +74,15 @@ class TestRounds(unittest.TestCase):
         self.assertEqual(sorted(c['looks'] for c in calls if not c['stations']), [1, 2])
         self.assertTrue(all(c['n_pairings'] == 2 for c in calls))           # alpha is split over every pairing
         self.assertTrue(all(c['n'] == 10 * c['looks'] for c in calls))      # every deal so far, pooled
-        self.assertEqual(calls[0]['design'], {'alpha': 0.05, 'round_deals': 10, 'max_rounds': 3, 'block': 10})
+        self.assertEqual(calls[0]['design'], plan_design(plan))
+        self.assertEqual({k: calls[0]['design'][k] for k in ('alpha', 'round_deals', 'max_rounds', 'block')},
+                         {'alpha': 0.05, 'round_deals': 10, 'max_rounds': 3, 'block': 10})
+        life = json.loads((out / 'tournament.json').read_text())
+        self.assertEqual(life['status'], 'finished')
+        self.assertEqual(life['round'], 3)
+        self.assertEqual(life['pairings'], {
+            'station|station2': {'status': 'exhausted', 'verdict': 'exhausted', 'looks_used': 3, 'round': 3},
+            'rule|random': {'status': 'decided', 'verdict': 'a', 'looks_used': 2, 'round': 2}})
         dec = json.loads((out / 'decisions.json').read_text())
         self.assertEqual([v['verdict'] for v in dec['rule__vs__random']], ['open', 'a'])
         self.assertEqual([v['verdict'] for v in dec['station__vs__station2']], ['open', 'open', 'exhausted'])
@@ -95,6 +103,42 @@ class TestRounds(unittest.TestCase):
         self.assertEqual(len(self.folders(plan)), 5)
         self.assertEqual(len(calls), 5)
         self.assertEqual(json.loads((out / 'decisions.json').read_text())['station__vs__station2'][-1]['looks_used'], 3)
+
+    def test_one_normalized_design(self):
+        seen = []
+        norm = lambda plan: {'alpha': 0.05, 'round_deals': plan['deals'], 'max_rounds': 2, 'block': 10,
+                             'replicates': plan.get('replicates', 1), 'target_edge_bb100': 50, 'deals_planned': 40}
+        decide = fake_decide(seen)
+        plan = self.plan(design={'max_rounds': 2}, replicates=2)
+        plan['matchups'] = [['station', 'station2']]
+        with mock.patch.object(ratings, 'normalize_design', norm, create=True), \
+                mock.patch.object(ratings, 'decide', decide, create=True):
+            asyncio.run(run_plan(plan, log=lambda *a: None))
+            self.assertTrue(all(c['design'] == norm(plan) for c in seen))   # the same design, replicates in it
+            stored = json.loads((Path(plan['out']) / 'plan.json').read_text())
+            self.assertEqual(stored['design'], norm(plan))
+            asyncio.run(run_plan(plan, log=lambda *a: None))                   # and a rerun matches it
+
+    def test_lifecycle_while_playing_and_when_stopped(self):
+        out = Path(self.plan()['out'])
+        snapshots = []
+        inner = fake_decide([])
+
+        def decide(xs, design, n, looks, groups=None):
+            snapshots.append(json.loads((out / 'tournament.json').read_text()))
+            if not all(x == 0 for x in xs):
+                raise RuntimeError('boom')
+            return inner(xs, design, n, looks, groups)
+        plan = self.plan(design={'max_rounds': 2})
+        with mock.patch.object(ratings, 'decide', decide, create=True):
+            asyncio.run(run_plan(plan, log=lambda *a: None))
+        self.assertTrue(all(s['status'] == 'running' and s['pid'] for s in snapshots))
+        self.assertIn('playing', {p['status'] for s in snapshots for p in s['pairings'].values()})
+        life = json.loads((out / 'tournament.json').read_text())
+        self.assertEqual(life['status'], 'stopped')                          # one pairing failed: not finished
+        self.assertEqual(life['pairings']['rule|random']['status'], 'waiting')
+        self.assertIn('boom', life['pairings']['rule|random']['error'])
+        self.assertEqual(life['pairings']['station|station2']['status'], 'exhausted')
 
     def test_replicates(self):
         calls = []
