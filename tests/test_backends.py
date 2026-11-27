@@ -133,7 +133,7 @@ class TestToolUse(OnPath):
         be = make_backend('codex', 'SYS', model='gpt-x', retries=0)
         r1 = asyncio.run(be.send('a plain turn'))
         r2 = asyncio.run(be.send('TOOL please'))
-        argv = [json.loads(l) for l in (d / 'argv.jsonl').read_text().splitlines()]
+        argv = [a for a in map(json.loads, (d / 'argv.jsonl').read_text().splitlines()) if a != ['--version']]
         for a in argv:
             joined = ' '.join(a)
             self.assertIn(' '.join(CODEX_NO_TOOLS), joined)
@@ -167,21 +167,22 @@ class TestToolUse(OnPath):
         (logs / 'transcript.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
         be = make_backend('agy', 'SYS')
         be.session, be.BRAIN = 'conv-1', str(brain)
-        thinking, model, tools, audit = be._transcript()
-        self.assertEqual((thinking, model, audit), ('t', 'g-1', 'verified'))
+        thinking, models, tools, audit = be.read_turn(be._transcript())
+        self.assertEqual((thinking, models, audit), ('t', ['g-1'], 'verified'))
         self.assertEqual([t['name'] for t in tools], ['search_web'])
 
     def test_agy_without_a_readable_transcript_is_unverified(self):
         brain = Path(tempfile.mkdtemp())
         be = make_backend('agy', 'SYS')
         be.session, be.BRAIN = 'conv-1', str(brain)
-        self.assertEqual(be._transcript(), ('', None, [], 'unverified'))           # no file
+        self.assertIsNone(be._transcript())                                         # no file
+        self.assertEqual(be.read_turn(None), ('', [], [], 'unverified'))
         logs = brain / 'conv-1' / '.system_generated' / 'logs'
         logs.mkdir(parents=True)
         (logs / 'transcript.jsonl').write_text(json.dumps({'type': 'PLANNER_RESPONSE', 'model': 'g'}) + '\n')
-        self.assertEqual(be._transcript()[3], 'unverified')                        # no user turn: not this turn
+        self.assertEqual(be.read_turn(be._transcript())[3], 'unverified')                        # no user turn: not this turn
         (logs / 'transcript.jsonl').write_text(json.dumps({'type': 'USER_INPUT'}) + '\n')
-        self.assertEqual(be._transcript()[3], 'unverified')                        # no response to it yet
+        self.assertEqual(be.read_turn(be._transcript())[3], 'unverified')                        # no response to it yet
         self.assertEqual(be.protocol()['tool_policy']['audit']['default'], 'verified')
 
     def test_every_reply_carries_an_audit_status(self):
@@ -269,8 +270,73 @@ class TestIdentity(OnPath):
         self.assertNotIn('tool_use', r.meta)
         os.environ['GEMINI_MODE'] = 'two-models'
         r = send()
-        self.assertEqual((r.meta['observed_model'], r.meta['observed_models'], r.meta['identity']),
-                         (None, ['gemini-x', 'gemini-y'], 'unattested'))
+        self.assertEqual((r.meta['observed_model'], r.meta['observed_models'], r.meta['identity_match']),
+                         (None, ['gemini-x', 'gemini-y'], 'mismatch'))      # a second model answered too
+
+
+def claude_stream(init, *answers):
+    lines = [{'type': 'system', 'subtype': 'init', 'session_id': 'c-1', **({'model': init} if init else {})}]
+    lines += [{'type': 'assistant', 'message': {**({'model': m} if m else {}), 'content': [{'type': 'text', 'text': 'x'}]}}
+              for m in answers]
+    lines.append({'type': 'result', 'result': '{"action": "fold"}', 'session_id': 'c-1', 'usage': {}})
+    return '\n'.join(json.dumps(x) for x in lines) + '\n'
+
+
+class TestEveryAnsweringModel(OnPath):
+    """R6-#2: identity comes from every assistant message of a Claude turn; the init event is only supplementary."""
+
+    def send(self, stream, model='claude-x-1'):
+        self.install('claude', f'#!/usr/bin/env python3\nimport sys\nsys.stdin.read()\nprint({stream!r}, end="")\n')
+        return asyncio.run(make_backend('claude', 'SYS', model=model, retries=0).send('hi'))
+
+    def test_the_reviewers_case_init_hides_another_answering_model(self):
+        r = self.send(claude_stream('claude-x-1', 'claude-other-2'))
+        self.assertEqual(r.meta['identity_match'], 'mismatch')
+        self.assertEqual((r.meta['init_model'], r.meta['answered_by']), ('claude-x-1', ['claude-other-2']))
+
+    def test_mixed_answering_models_are_a_mismatch(self):
+        r = self.send(claude_stream('claude-x-1', 'claude-x-1', 'claude-other-2'))
+        self.assertEqual((r.meta['identity_match'], r.meta['observed_model']), ('mismatch', None))
+        self.assertEqual(r.meta['observed_models'], ['claude-other-2', 'claude-x-1'])
+
+    def test_one_model_throughout_matches_and_dated_ids_count(self):
+        r = self.send(claude_stream('claude-x-1', 'claude-x-1-20260101', 'claude-x-1-20260101'))
+        self.assertEqual((r.meta['identity_match'], r.meta['observed_model']), ('match', 'claude-x-1-20260101'))
+
+    def test_init_alone_does_not_attest(self):
+        r = self.send(claude_stream('claude-x-1', None))
+        self.assertEqual((r.meta['identity_match'], r.meta['init_model']), ('unattested', 'claude-x-1'))
+
+    def test_the_raw_output_says_the_same(self):
+        from poker_arena.backends import verify_call
+        r = self.send(claude_stream('claude-x-1', 'claude-other-2'))
+        call = {'output': r.text, **r.meta}
+        self.assertEqual(verify_call('claude', call, r.meta['raw'])['status'], 'verified')
+        self.assertEqual(verify_call('claude', {**call, 'identity_match': 'match'}, r.meta['raw'])['status'],
+                         'inconsistent')
+        self.assertEqual(verify_call('claude', {**call, 'output': 'other'}, r.meta['raw'])['status'], 'inconsistent')
+        self.assertEqual(verify_call('claude', call, None)['status'], 'unverifiable')
+
+
+class TestCliArtifact(OnPath):
+    """R6-#6: every launch re-checks the resolved file, its version and its digest."""
+
+    def test_a_changed_file_is_seen_on_the_next_launch(self):
+        from poker_arena.backends import cli_artifact
+        script = '#!/bin/sh\nif [ "$1" = --version ]; then echo "tool {v}"; exit 0; fi\ncat >/dev/null\necho ok\n'
+        d = self.install('tool', script.format(v='1.0'))
+        be = make_backend('command', 'SYS', command=['tool'], retries=0)
+        r1 = asyncio.run(be.send('hi'))
+        self.assertEqual((r1.meta['cli']['version'], r1.meta['cli']['path']), ('tool 1.0', str((d / 'tool').resolve())))
+        self.assertEqual(be.cli_transitions, [])
+        (d / 'tool').write_text(script.format(v='1.0') + '# patched\n')     # same version string, another file
+        r2 = asyncio.run(be.send('hi'))
+        self.assertNotEqual(r2.meta['cli']['sha256'], r1.meta['cli']['sha256'])
+        (d / 'tool').write_text(script.format(v='2.0'))
+        r3 = asyncio.run(be.send('hi'))
+        self.assertEqual(r3.meta['cli']['version'], 'tool 2.0')
+        self.assertEqual([t['to']['sha256'] for t in be.cli_transitions], [r2.meta['cli']['sha256'], r3.meta['cli']['sha256']])
+        self.assertEqual(cli_artifact('tool')['version'], 'tool 2.0')
 
 
 class TestAttempts(unittest.TestCase):

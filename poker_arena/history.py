@@ -25,8 +25,8 @@ under the same game settings pool (blinds and stacks change what bb/100 means); 
 are listed as left out. The same pair often replays the same deal in several runs: each deal row keeps its
 seed and fingerprint, and the rating averages repeats into one observation. A duplicate pair is counted only
 if its b-first play is its a-first play with the seats swapped (ratings.check_pair) and both of its hands replay
-from their seeds through the engine's record verifier (ratings.verify_play); the rest are kept in the `rejected`
-table and listed.
+from their seeds through the engine's record verifier (ratings.verify_play), as the one reader of conversations,
+ratings.read_conversation, decides for every consumer; the rest are kept in the `rejected` table and listed.
 
 All-time standings are descriptive only. Runs had different designs and stopped pairings at different
 times, so pooling them is not any run's preregistered test: no all-time verdict, rank or leader is decided.
@@ -37,7 +37,7 @@ Tables:
     hands     every finished hand's summary (cards, board, actions, result), as hands.jsonl has it
     deals     every duplicate deal both of whose plays have finished: a's net chips over the two hands, its seed
               and fingerprint (ratings.fingerprint)
-    tallies   per match and player, the raw style counts that stats.summarize turns into rates
+    tallies   per match and player, the raw style counts of its verified results that stats.summarize turns into rates
     rejected  duplicate pairs (or single deals of them) that failed validation, with the reason
 """
 from __future__ import annotations
@@ -216,7 +216,7 @@ def _lines(text: str):
 
 def _stamp(d: Path) -> str:
     parts = []
-    for name in ('config.json', 'hands.jsonl', 'events.jsonl', 'calls.jsonl', 'result.json', 'state.json'):
+    for name in ('config.json', 'hands.jsonl', 'events.jsonl', 'calls.jsonl', 'raw.jsonl', 'result.json', 'state.json'):
         try:
             st = (d / name).stat()
             parts.append(f'{name}:{st.st_size}:{st.st_mtime_ns}')
@@ -242,7 +242,7 @@ def sync(root, db=None) -> dict:
             if d.name not in ('a-first', 'b-first'):
                 continue
             mid = str(d.relative_to(root))
-            stamp = _stamp(d)
+            stamp = _stamp(d) + '#' + _stamp(d.parent / ('b-first' if d.name == 'a-first' else 'a-first'))
             row = con.execute('SELECT stamp, config_sig FROM matches WHERE id = ?', (mid,)).fetchone()
             if row and row[0] == stamp:
                 continue
@@ -310,22 +310,15 @@ def _sync_deals(con, mdir: Path, run: str, gk) -> int:
         cb = json.loads(_read(b_dir / 'config.json'))
     except ValueError:
         cb = None
-    from .ratings import _hands, check_pair, fingerprint, verify_play
+    from .ratings import fingerprint, read_conversation
     players = cfg.get('players') or ['?', '?']
     a, b = players[:2]
     game = cfg.get('game', {})
     bb = game.get('big_unit') or game.get('bb') or 1
     seeds = cfg.get('seeds', [])
-    ha, hb = _hands(a_dir), _hands(b_dir)
-    good, rejected = check_pair(cfg, cb, ha, hb)
-    if good:
-        va, vb = verify_play(a_dir, cfg, {k: ha[k] for k in good}), verify_play(b_dir, cb, {k: hb[k] for k in good})
-        for k in list(good):
-            bad = [f'{side} hand {k} does not replay from its seed: {"; ".join(v[k]["errors"][:2])}'
-                   for side, v in (('a-first', va), ('b-first', vb)) if not v[k]['ok']]
-            if bad:
-                good.remove(k)
-                rejected.append({'hand': k, 'reason': '; '.join(bad)})
+    conv = read_conversation(mdir) or {'hands': ({}, {}), 'verified': [], 'rejected': []}
+    ha, hb = conv['hands']
+    good, rejected = list(conv['verified']), list(conv['rejected'])
     con.execute('DELETE FROM deals WHERE run = ? AND matchup = ?', (run, mdir.name))
     con.execute('DELETE FROM rejected WHERE run = ? AND matchup = ?', (run, mdir.name))
     con.executemany('INSERT OR REPLACE INTO rejected VALUES (?,?,?,?)',

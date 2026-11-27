@@ -21,31 +21,33 @@ and attested, turns audited, protocols consistent, duplicate pairs valid; else t
 'ineligible'), and the verdict is official (recorded at that look by the registered judge; what today's code
 recomputes is retrospective), and its evidence still stands today (`evidence_now`: the hands it judged are
 all here, replay from their seeds and hash as they did, and their records pass today's checks). Every
-verdict carries its diagnostics (`assumptions`): passing them does not verify the distribution assumptions,
-failing them shows the data outside the calibrated family. A decided rank and a leader are built only from
-official verdicts whose evidence stands and whose diagnostics passed: a leader has such a win over every
-other player of its group. Everything else (strengths, their intervals and fit diagnostics, the order by
-points, the front runner, session Elo, every all-time number, every number of a run that is not
-preregistered) is descriptive, recomputed on every refresh, and labelled so.
+verdict carries the checks of what its guarantee needs (`assumptions`: deals within the game's bound, no deal
+repeated across conversations). A decided rank and a leader are built only from official verdicts whose
+evidence stands and whose checks passed: a leader has such a win over every other player of its group.
+Everything else (strengths, their intervals and fit diagnostics, the order by points, the front runner, session
+Elo, the model-based result, every all-time number, every number of a run that is not preregistered) is
+descriptive, recomputed on every refresh, and labelled so.
 
-The test. The unit is the conversation; a look can decide only with at least MIN_CONVERSATIONS of them and
-some spread between them. A winner needs two arms to agree at a look: the conversation-level t (the
-deal-weighted mean edge over its cluster-robust standard error, C - 1 degrees of freedom) beyond a bar
-calibrated by simulation, and a sign-flip randomization test of the same statistic with its own error spent
-look by look. The sign-flip arm makes the guarantee exact for any conversation results symmetric about the
-true edge (any tails, any discreteness, any dependence inside a conversation: e.g. two interchangeable
-players). The t arm's bar is calibrated for a stated family of skewed results: conversation effects of
-exponential, lognormal or rare-large-loss shape holding up to half a conversation mean's variance. Together:
-with no edge, a pairing is called with chance at most alpha / n_pairings in either case (Bonferroni over the
-pairings, Pocock-type repeated looks), if those assumptions hold. Beyond the family (large, rare, one-sided
-swings) no test of this size can keep that promise; docs/methodology.md gives the measured worst cases. `even` is an equivalence
-verdict (TOST at +-EQUIV_BB100, both arms).
+The test. The unit is the conversation, and its observation is its mean edge, which no distribution can push
+beyond the game's bound (`outcome_bound`: each of a duplicate deal's two plays moves at most one stack, so
+|x| <= 100 x stack / bb bb/100; 10,000 at 100 big blinds). The official test is a betting confidence sequence
+for bounded observations (Waudby-Smith and Ramdas, 2024): for each null mean m a bettor stakes a predictable
+fraction of its capital on each new conversation, K_n(m) = prod (1 + lambda_i (Y_i - m)), lambda_i chosen from
+the earlier conversations only and capped at BET_CAP / (bound + m), so the capital never goes negative. Under
+any distribution of independent conversations whose mean is at most m, K_n(m) is a nonnegative supermartingale,
+and Ville's inequality bounds the chance it ever reaches 2 / alpha_pairing by alpha_pairing / 2: at every look,
+whenever play stops, with no assumption on the shape of the results. 'a' is a's bettor against m = 0 reaching
+that bar, 'b' the mirror one, 'even' both bettors against the margins (+-EQUIV_BB100) reaching it. Whatever the
+true edge, a false verdict needs at most two of those bettors, each valid for it, to reach the bar, so a pairing
+gives one with chance at most alpha_pairing (Bonferroni over the pairings: alpha over all of them). `model_based` is the round 6 gate (a conversation-level
+t and a sign-flip test with bars calibrated for a family of shapes): secondary, descriptive, never official.
 
-Planning. A design's power is that of the complete adjudicator, simulated (`procedure`): the chance that
-the better player gets a decided verdict that counts (both arms, the minimum, every look, the diagnostics),
-under optimistic, assumed (assumed_icc, assumed_ar1) and pessimistic dependence; by default it plays as many
-rounds as the assumed case needs for 80%. `leader_chances` gives the chance that a round robin names the true
-best player its decided leader under stated edge scenarios.
+Planning. A design's power is that of the official test, simulated (`procedure`): the chance that the better
+player is decided by the last look, under optimistic, assumed (assumed_icc, assumed_ar1) and pessimistic
+dependence; by default it plays as many rounds as the assumed case needs for 80%. Because the bound, not the
+spread, sets the cost (a pairing needs about log(2 / alpha_pairing) x bound / edge conversations, whatever their
+length), short conversations are far cheaper in deals; `length_tradeoff` gives the deals needed by conversation
+length. `leader_chances` gives the chance that a round robin names the true best player its decided leader.
 
 Strength (descriptive). A least-squares paired-comparison fit on deals, x ~ s_a - s_b, with the strengths
 summing to zero within each connected group. Repeats of one deal by one pair are averaged into one
@@ -77,14 +79,18 @@ PRIOR_SD = 350              # bb/100: the per-deal spread assumed when planning 
 ASSUMED_ICC = 0.01          # planning: share of the per-deal variance that is a conversation effect (moderate)
 ASSUMED_AR1 = 0.2           # planning: AR(1) memory between consecutive deals of a conversation (moderate)
 POWER = 0.8
-MAX_ROUNDS = 40
-MIN_CONVERSATIONS = 8       # a verdict needs this many independent conversations of the pairing
-FAMILY = ('normal', 'exponential', 'lognormal', 'rare_loss')   # null shapes the bars are calibrated for
+MAX_ROUNDS = 200             # looks at most: the official test is valid at every look, so looks cost nothing
+MODEL_MAX_ROUNDS = 40       # the model-based gate is computed only for designs this short
+MODEL_MAX_CONVERSATIONS = 200
+MIN_CONVERSATIONS = 8       # the model-based gate needs this many independent conversations of the pairing
+BET_CAP = 0.9               # the official bettor stakes at most this share of what it could lose without going broke
+BET_PRIOR_VAR = PRIOR_SD ** 2   # the bettor's prior variance of a conversation mean, worth one conversation
+OFFICIAL_TEST = 'betting confidence sequence for bounded outcomes (Waudby-Smith and Ramdas 2024)'
+FAMILY = ('normal', 'exponential', 'lognormal', 'rare_loss')   # null shapes the model-based bars are calibrated for
 FAMILY_SHARE = 0.5          # in the skewed shapes, the conversation effect's share of a conversation mean's variance
 POWER_EDGES = (20, 50, 100)
 BOOT = 300
-CAL_SIMS = 100_000          # null sequences per shape behind each nominal level
-POWER_SIMS = 40_000
+CAL_SIMS = 100_000          # null sequences per shape behind each model-based level
 FLIPS = 9_999               # random sign vectors of the sign-flip arm (plus the observed one)
 SIM_SEED = 20261126
 SESSION = 10                # deals per Elo session
@@ -95,15 +101,30 @@ ALIASES = ('sonnet', 'opus', 'haiku')   # bare CLI aliases: the model version be
 DECIDED = ('a', 'b', 'even')
 TERMINAL = ('a', 'b', 'even', 'ineligible')   # verdicts that stop a pairing before its last look
 ALLOW_UNATTESTED = ('codex',)   # backends that cannot report the model that answered, allowed unless a design says otherwise
-ASSUMPTIONS = ('Its error bound is conditional: if the test\'s assumptions hold, a pairing with no real edge is '
-               'called for either player with chance at most alpha / n_pairings (so at most alpha over all of '
-               'them). It holds exactly when every conversation\'s result is symmetric about the true edge (for '
-               'instance two interchangeable players), which no data can confirm, and, by simulation, when results '
-               'are skewed but the conversation effect holds at most half the spread of a conversation mean '
-               '(docs/methodology.md). Beyond that range the bound is not shown to hold. Each verdict reports '
-               'diagnostics against that range: passing them means only that the data show no sign of leaving it '
-               '(diagnostics passed; distribution assumptions unverified).')
+ASSUMPTIONS = ('With no edge, a pairing is called for either player with chance at most alpha / n_pairings (so at '
+               'most alpha over all of them), at every look and whenever play stops, for any distribution of '
+               'results: the official test is a betting confidence sequence for bounded outcomes, which needs only '
+               'that conversations are independent (fresh memories, no deal repeated across them) and that no '
+               'duplicate deal moves more than the stacks allow; "even" (within the equivalence margin) has the '
+               'same guarantee. Each verdict reports those checks. The model-based result shown beside it (a t and '
+               'sign-flip test calibrated for a family of shapes) is secondary and never official.')
 GUARANTEE = ASSUMPTIONS
+REFERENCE = {   # the reference bot's measured limits (docs/methodology.md, "How good at poker")
+    'version': 'reference-1',
+    'kind': 'a fixed heuristic, not a solver: tight-aggressive, position-aware, equity against the range the '
+            'opponent\'s betting implies, pot odds, a fixed bluff frequency; it never adapts to its opponent',
+    'measured_with': '2,000 duplicate deals per pairing (40 conversations of 50), 100-big-blind stacks, bots at '
+                     'their default settings; edge in bb/100 with the standard error between conversations',
+    'results': [{'a': 'reference', 'b': 'random', 'edge_bb100': 408, 'se': 50},
+                {'a': 'reference', 'b': 'station', 'edge_bb100': 290, 'se': 14},
+                {'a': 'reference', 'b': 'rule', 'edge_bb100': 169, 'se': 24},
+                {'a': 'rule', 'b': 'random', 'edge_bb100': 856, 'se': 67},
+                {'a': 'rule', 'b': 'station', 'edge_bb100': 273, 'se': 13},
+                {'a': 'station', 'b': 'random', 'edge_bb100': 44, 'se': 78}],
+    'limits': 'it beats every baseline bot directly, but wins about half as much from the random bot as the rule '
+              'bot does (+408 against +856 bb/100), so it is not a maximally exploitative player, and how it does '
+              'against strong play has not been measured (no solver or expert comparison): a positive edge against '
+              'it means "beats a solid fixed heuristic", not "plays well"'}
 _Z = NormalDist()
 
 
@@ -344,7 +365,7 @@ _VERIFIED: dict = {}
 
 def _stamp(d: Path) -> tuple:
     out = []
-    for name in ('config.json', 'hands.jsonl', 'events.jsonl', 'state.json'):
+    for name in ('config.json', 'hands.jsonl', 'events.jsonl', 'state.json', 'calls.jsonl', 'raw.jsonl'):
         try:
             st = (d / name).stat()
             out.append((name, st.st_size, st.st_mtime_ns))
@@ -353,27 +374,89 @@ def _stamp(d: Path) -> tuple:
     return tuple(out)
 
 
+def _rows_by_hand(p: Path, key: str) -> dict | None:
+    if not p.exists():
+        return None
+    out = defaultdict(list)
+    for line in p.read_text().splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(e, dict):
+            out[e.get(key)].append(e)
+    return out
+
+
+def linked_audit(cfg: dict, hand: int, events: list, calls: list, raw: list) -> dict:
+    """The audit of one hand's model decisions, derived from the records linked to each by its `decision_id`:
+    the decision record (a `thought` event), the action it led to, every call attempt and every raw backend
+    output row. Per seat: {'decisions', 'linked', 'verified', 'opaque', 'problems'}. A decision is verified when
+    its id is on its action and on at least one call, its accepted (last) call says 'verified' and has a raw
+    output row of its own (the same `call_id`, or the same decision id and attempt; a failed try's row does not
+    count), and the decision record's own audit says the same; 'opaque' when
+    the accepted call comes from a backend that exposes no record. Bots make no decisions here."""
+    ids = cfg.get('players') or []
+    specs = cfg.get('specs') or {}
+    out = {}
+    acted = {(e.get('data') or {}).get('decision_id') for e in events if e.get('kind') == 'action'}
+    by_call, by_raw = defaultdict(list), defaultdict(list)
+    for c in calls:
+        by_call[c.get('decision_id')].append(c)
+    for r in raw:
+        if r.get('failed_try') is None:
+            by_raw[r.get('call_id') or (r.get('decision_id'), r.get('attempt'))].append(r)
+    for e in events:
+        data = e.get('data') or {}
+        if e.get('kind') != 'thought' or data.get('seat') is None:
+            continue
+        seat = data['seat']
+        if seat >= len(ids) or 'bot' in (specs.get(ids[seat]) or {}):
+            continue
+        x = out.setdefault(seat, {'decisions': 0, 'linked': 0, 'verified': 0, 'opaque': 0, 'problems': []})
+        x['decisions'] += 1
+        did = data.get('decision_id')
+        if not did:
+            continue
+        mine = sorted(by_call.get(did) or [], key=lambda c: c.get('attempt') or 0)
+        why = []
+        if did not in acted:
+            why.append('no action carries its decision id')
+        if not mine:
+            why.append('no call record carries its decision id')
+        if why:
+            x['problems'].append(f'hand {hand} decision {did}: ' + '; '.join(why))
+            continue
+        x['linked'] += 1
+        last = mine[-1]
+        audit = last.get('audit')
+        has_raw = bool(by_raw.get(last.get('call_id') or (did, last.get('attempt'))))
+        if audit == 'opaque':
+            x['opaque'] += 1
+        elif audit == 'verified' and has_raw and data.get('audit') in (None, 'verified'):
+            x['verified'] += 1
+        else:
+            x['problems'].append(f'hand {hand} decision {did}: accepted call audit {audit!r}'
+                                 + ('' if has_raw else ', no raw output row'))
+    return out
+
+
 def verify_play(d: Path, cfg: dict, hands: dict) -> dict:
-    """{hand: {'ok', 'errors', 'digest'}} for every recorded hand of one match folder, each checked with
-    `verify_hand` against the seed and button the config assigns it (not the ones the hand records), with its
-    rows from events.jsonl when the folder has one. `digest` hashes the hand record and those rows: the
-    evidence a decision is bound to. Cached by the folder's file sizes and times."""
+    """{hand: {'ok', 'errors', 'digest', 'digest_linked', 'audit'}} for every recorded hand of one match folder,
+    each checked with `verify_hand` against the seed and button the config assigns it (not the ones the hand
+    records), with its rows from events.jsonl when the folder has one. `digest` hashes the hand record and those
+    rows (evidence version 1); `digest_linked` also that hand's call records and raw backend output rows
+    (version 2: what an official decision is bound to); `audit` is `linked_audit` of the hand. Cached by the
+    folder's file sizes and times."""
     d = Path(d)
     key = (str(d.resolve()), _stamp(d))
     hit = _VERIFIED.get(key)
     if hit is not None:
         return hit
     seeds, n = cfg.get('seeds') or [], len(cfg.get('players') or []) or 2
-    events = None
-    if (d / 'events.jsonl').exists():
-        events = defaultdict(list)
-        for line in (d / 'events.jsonl').read_text().splitlines():
-            try:
-                e = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(e, dict):
-                events[e.get('episode')].append(e)
+    events = _rows_by_hand(d / 'events.jsonl', 'episode')
+    calls = _rows_by_hand(d / 'calls.jsonl', 'hand') or {}
+    raw = _rows_by_hand(d / 'raw.jsonl', 'hand') or {}
     out = {}
     for k, h in hands.items():
         evs = None if events is None else events.get(k, [])
@@ -382,20 +465,28 @@ def verify_play(d: Path, cfg: dict, hands: dict) -> dict:
         else:
             v = verify_hand(cfg.get('game') or {}, seeds[k], k % n, h, evs)
         blob = json.dumps({'hand': h, 'events': evs}, sort_keys=True, default=str)
-        out[k] = {**v, 'digest': hashlib.sha256(blob.encode()).hexdigest()[:24]}
+        linked = json.dumps({'hand': h, 'events': evs, 'calls': calls.get(k, []), 'raw': raw.get(k, [])},
+                            sort_keys=True, default=str)
+        out[k] = {**v, 'digest': hashlib.sha256(blob.encode()).hexdigest()[:24],
+                  'digest_linked': hashlib.sha256(linked.encode()).hexdigest()[:24],
+                  'audit': linked_audit(cfg, k, evs or [], calls.get(k, []), raw.get(k, []))}
     if len(_VERIFIED) > 4096:
         _VERIFIED.clear()
     _VERIFIED[key] = out
     return out
 
 
-def evidence_hash(deals) -> str | None:
-    """The hash of the verified hands behind a set of duplicate deals (each deal's match folder, index and the
-    digests of its two plays): what an official decision is bound to. None when there are none, or when any
-    deal carries no verified evidence."""
+EVIDENCE_VERSION = 2        # 1: hands and events; 2: also their call records and raw backend output
+
+
+def evidence_hash(deals, version: int = EVIDENCE_VERSION) -> str | None:
+    """The hash of the verified records behind a set of duplicate deals (each deal's match folder, index and the
+    digests of its two plays: version 2 covers hands, events, call records and raw output, version 1 hands and
+    events): what an official decision is bound to. None when there are none, or when any deal carries no
+    verified evidence."""
     items = []
     for d in deals:
-        ev = d.get('evidence')
+        ev = d.get('evidence_linked' if version >= 2 else 'evidence')
         if not ev:
             return None
         items.append(f'{Path(str(d["matchup"])).name}|{d["deal"]}|{ev}')
@@ -404,49 +495,118 @@ def evidence_hash(deals) -> str | None:
     return hashlib.sha256('\n'.join(sorted(items)).encode()).hexdigest()[:24]
 
 
-def load_deals(root, report: list | None = None) -> list[dict]:
-    """[{'a', 'b', 'matchup' (the conversation), 'deal', 'net_a' (chips, both hands), 'bb', 'seed', 'fp',
-    'planned', 'slate', 'round', 'replicate', 'evidence'}] for every duplicate deal under root both of whose
-    plays finished, that passes `check_pair`, and both of whose hands replay from their seeds (`verify_play`);
-    what it rejects is appended to `report` as {'matchup', 'hand', 'reason'}. `evidence` is the digest of the
-    two verified plays."""
-    root = Path(root)
-    deals = []
-    for cfg_path in sorted(root.rglob('a-first/config.json')):
-        mdir = cfg_path.parent.parent
-        a_dir, b_dir = mdir / 'a-first', mdir / 'b-first'
-        ca = _json(cfg_path)
-        if not ca or not (b_dir / 'config.json').exists():
-            continue
-        game = ca.get('game', {})
-        bb = game.get('big_unit') or game.get('bb') or 1
-        seeds = ca.get('seeds', [])
-        n = len(ca['players'])
-        ha, hb = _hands(a_dir), _hands(b_dir)
-        a, b = ca['players'][0], ca['players'][1]
-        name = str(mdir.relative_to(root)) if mdir != root else mdir.name
-        rnd, rep = _round_of(mdir.name, ca)
-        cb = _json(b_dir / 'config.json')
+def _rows(p: Path) -> list:
+    out = []
+    if p.exists():
+        for line in p.read_text().splitlines():
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                pass
+    return out
+
+
+def read_conversation(mdir) -> dict | None:
+    """The one reader of a conversation's records (its a-first and b-first plays), for the ratings, the history,
+    the style statistics and the viewer: which hands are results and which are not. {'configs': (a-first,
+    b-first), 'hands': (committed hands of each play), 'verified' (hand indices both plays committed, that pass
+    `check_pair`, and whose two plays replay from their seeds through `verify_play`: the only results), 'checks'
+    (each play's `verify_play`), 'rejected' ([{'hand' (None: the whole conversation), 'reason'}]), 'provisional'
+    ({'a-first': [...], 'b-first': [...]}: hands written but not yet results: past the play's commit point, or
+    committed while the other play has not finished that hand)}. None when the folder holds no a-first config."""
+    mdir = Path(mdir)
+    a_dir, b_dir = mdir / 'a-first', mdir / 'b-first'
+    ca = _json(a_dir / 'config.json')
+    if not ca:
+        return None
+    cb = _json(b_dir / 'config.json') if (b_dir / 'config.json').exists() else None
+    ha, hb = _hands(a_dir), _hands(b_dir) if cb else {}
+    unreadable = cb is None and (b_dir / 'config.json').exists()
+    written = {side: {h.get('hand') for h in _rows(d / 'hands.jsonl') if isinstance(h, dict)}
+               for side, d in (('a-first', a_dir), ('b-first', b_dir))}
+    out = {'configs': (ca, cb), 'hands': (ha, hb), 'verified': [], 'checks': ({}, {}), 'rejected': [],
+           'provisional': {}}
+    if cb:
         good, rejected = check_pair(ca, cb, ha, hb)
         va = verify_play(a_dir, ca, {k: ha[k] for k in good}) if good else {}
         vb = verify_play(b_dir, cb, {k: hb[k] for k in good}) if good else {}
-        kept = []
         for k in good:
             bad = [f'{side} hand {k} does not replay from its seed: {"; ".join(v[k]["errors"][:2])}'
                    for side, v in (('a-first', va), ('b-first', vb)) if not v[k]['ok']]
             if bad:
                 rejected.append({'hand': k, 'reason': '; '.join(bad)})
             else:
-                kept.append(k)
+                out['verified'].append(k)
+        out.update(checks=(va, vb), rejected=rejected)
+    elif unreadable:
+        out['rejected'] = [{'hand': None, 'reason': 'b-first has no readable config'}]
+    whole = any(x['hand'] is None for x in out['rejected'])
+    bad = {x['hand'] for x in out['rejected']}
+    for side, mine, other in (('a-first', ha, hb), ('b-first', hb, ha)):
+        out['provisional'][side] = sorted(k for k in written[side] if isinstance(k, int) and not whole
+                                          and k not in out['verified'] and k not in bad
+                                          and (k not in mine or k not in other))
+    return out
+
+
+def verified_hands(play_dir) -> dict:
+    """For one play folder (a-first or b-first): {'verified': set of hand indices that are results,
+    'provisional': [...], 'rejected': [...]} from `read_conversation` of its conversation."""
+    play_dir = Path(play_dir)
+    side = play_dir.name
+    conv = read_conversation(play_dir.parent) if side in ('a-first', 'b-first') else None
+    if not conv:
+        return {'verified': set(), 'provisional': [], 'rejected': []}
+    return {'verified': set(conv['verified']), 'provisional': conv['provisional'].get(side, []),
+            'rejected': sorted({x['hand'] for x in conv['rejected'] if x['hand'] is not None})
+            if not any(x['hand'] is None for x in conv['rejected']) else 'all'}
+
+
+def load_deals(root, report: list | None = None) -> list[dict]:
+    """[{'a', 'b', 'matchup' (the conversation), 'deal', 'net_a' (chips, both hands), 'bb', 'seed', 'fp',
+    'planned', 'slate', 'round', 'replicate', 'evidence'}] for every duplicate deal under root that
+    `read_conversation` verifies; what it rejects is appended to `report` as {'matchup', 'hand', 'reason'}.
+    `evidence` and `evidence_linked` are the digests of the two verified plays (versions 1 and 2), `audit` per
+    player the linked audit of its decisions in both plays."""
+    root = Path(root)
+    deals = []
+    for cfg_path in sorted(root.rglob('a-first/config.json')):
+        mdir = cfg_path.parent.parent
+        if not (mdir / 'b-first' / 'config.json').exists():
+            continue
+        conv = read_conversation(mdir)
+        if not conv:
+            continue
+        ca, cb = conv['configs']
+        ha, hb = conv['hands']
+        va, vb = conv['checks']
+        game = ca.get('game', {})
+        bb = game.get('big_unit') or game.get('bb') or 1
+        seeds = ca.get('seeds', [])
+        n = len(ca['players'])
+        a, b = ca['players'][0], ca['players'][1]
+        name = str(mdir.relative_to(root)) if mdir != root else mdir.name
+        rnd, rep = _round_of(mdir.name, ca)
         if report is not None:
-            report += [{'matchup': name, 'a': a, 'b': b, **x} for x in sorted(rejected, key=lambda x: (x['hand'] is not None, x['hand'] or 0))]
-        for k in kept:
+            report += [{'matchup': name, 'a': a, 'b': b, **x}
+                       for x in sorted(conv['rejected'], key=lambda x: (x['hand'] is not None, x['hand'] or 0))]
+        for k in conv['verified']:
             seed = seeds[k] if k < len(seeds) else None
+            audit = {}
+            for v, ids in ((va, ca['players']), (vb, cb['players'])):
+                for seat, x in (v[k].get('audit') or {}).items():
+                    y = audit.setdefault(ids[seat], {'decisions': 0, 'linked': 0, 'verified': 0, 'opaque': 0, 'problems': []})
+                    for f in ('decisions', 'linked', 'verified', 'opaque'):
+                        y[f] += x[f]
+                    y['problems'] += x['problems']
             deals.append({'a': a, 'b': b, 'matchup': name, 'deal': k, 'bb': bb, 'seed': seed,
                           'fp': fingerprint(game, seed, k % n), 'planned': len(seeds),
                           'slate': seeds[0] if seeds else name, 'round': rnd, 'replicate': rep,
                           'net_a': ha[k]['net'][0] + hb[k]['net'][1],
-                          'evidence': hashlib.sha256(f'{va[k]["digest"]}|{vb[k]["digest"]}'.encode()).hexdigest()[:24]})
+                          'evidence': hashlib.sha256(f'{va[k]["digest"]}|{vb[k]["digest"]}'.encode()).hexdigest()[:24],
+                          'evidence_linked': hashlib.sha256(
+                              f'{va[k]["digest_linked"]}|{vb[k]["digest_linked"]}'.encode()).hexdigest()[:24],
+                          'audit': audit})
     return deals
 
 
@@ -454,7 +614,8 @@ def pairing_data(root, folders, a) -> dict:
     """What `adjudicate` judges for one pairing, from its match folders (relative to root) in play order:
     {'xs' (a's bb/100 per validated, verified duplicate deal), 'groups' (each deal's conversation), 'fps' (deal
     fingerprints), 'conversations', 'rejected' ([{'matchup', 'hand', 'reason'}] from `check_pair` and the
-    record verifier), 'evidence_hash' (`evidence_hash` of those deals), 'evidence_deals'}."""
+    record verifier), 'evidence_hash' (`evidence_hash` of those deals, version 2), 'evidence_hash_v1',
+    'evidence_version', 'evidence_deals', 'linked_audit' (`linked_status` per player)}."""
     root = Path(root)
     xs, groups, fps, rejected, kept = [], [], [], [], []
     for f in folders:
@@ -473,7 +634,35 @@ def pairing_data(root, folders, a) -> dict:
             kept.append({**d, 'matchup': f})
         rejected += [{**x, 'matchup': f} for x in report]
     return {'a': a, 'xs': xs, 'groups': groups, 'fps': fps, 'conversations': list(folders), 'rejected': rejected,
-            'evidence_hash': evidence_hash(kept), 'evidence_deals': len(kept)}
+            'evidence_hash': evidence_hash(kept), 'evidence_hash_v1': evidence_hash(kept, 1),
+            'evidence_version': EVIDENCE_VERSION, 'evidence_deals': len(kept), 'linked_audit': linked_status(kept)}
+
+
+def linked_status(deals) -> dict:
+    """Per player over these deals, the audit derived from decision-linked records: {'status', 'decisions',
+    'linked', 'verified', 'opaque', 'problems'}; status 'complete' (every decision linked and verified),
+    'opaque' (linked, some from a backend with no record), 'incomplete', 'legacy' (records from before decision
+    ids, none linked: the runner's own facts are all there is) or 'bot'."""
+    tot = {}
+    for d in deals:
+        for p, x in (d.get('audit') or {}).items():
+            y = tot.setdefault(p, {'decisions': 0, 'linked': 0, 'verified': 0, 'opaque': 0, 'problems': []})
+            for f in ('decisions', 'linked', 'verified', 'opaque'):
+                y[f] += x[f]
+            y['problems'] += x['problems']
+    for p, y in tot.items():
+        if not y['decisions']:
+            y['status'] = 'bot'
+        elif not y['linked'] and not y['problems']:
+            y['status'] = 'legacy'
+        elif y['linked'] == y['decisions'] == y['verified'] + y['opaque'] and not y['problems']:
+            y['status'] = 'opaque' if y['opaque'] else 'complete'
+        else:
+            y['status'] = 'incomplete'
+        if not y['problems'] and y['linked'] < y['decisions'] and y['status'] != 'legacy':
+            y['problems'].append(f'{y["decisions"] - y["linked"]} decisions carry no decision id')
+        y['problems'] = y['problems'][:5]
+    return tot
 
 
 def protocol_of(cfg: dict, pid: str) -> str | None:
@@ -524,12 +713,12 @@ def judge_fingerprint() -> str:
 
 
 def calibration_id(design: dict | None) -> str | None:
-    """Names the calibration a design's bars come from: its calibrated levels and every constant of the test
-    that sets its operating characteristics."""
+    """Names what sets a design's official test: its bound, bettor and bar (`calibration`), and every constant of
+    the test that shapes its operating characteristics."""
     if not design or not design.get('calibration'):
         return None
-    key = {'calibration': design['calibration'], 'nominal_alpha': design.get('nominal_alpha'), 'flips': FLIPS,
-           'seed': SIM_SEED, 'min_conversations': MIN_CONVERSATIONS, 'equiv_bb100': EQUIV_BB100}
+    key = {'calibration': design['calibration'], 'alpha_pairing': design.get('alpha_pairing'),
+           'equiv_bb100': EQUIV_BB100, 'bettors': [list(b) for b in BETTORS]}
     return hashlib.sha1(json.dumps(key, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
@@ -644,9 +833,10 @@ def registration_status(plan: dict | None, evidence: dict | None = None) -> dict
 _COMPUTED = ('replicates', 'n_pairings', 'alpha_pairing', 'nominal_alpha', 'deals_needed', 'deals_planned',
              'max_deals', 'power_at_max', 'min_conversations', 'conversations_needed', 'power_scenarios',
              'underpowered', 'registered', 'sd_conversation_bb100', 'calibration', 'equivalence_alpha',
-             'power_by_edge', 'power_basis', 'leader_chances')
+             'power_by_edge', 'power_basis', 'leader_chances', 'outcome_bound_bb100', 'official_test',
+             'assumption_free', 'threshold', 'bet_cap', 'equiv_bb100')
 _PLAN_KEYS = ('design', 'deals', 'until_decided', 'replicates', 'matchups', 'target_edge_bb100', 'prior_sd_bb100',
-              'registered')
+              'registered', 'game', 'game_config')
 
 
 def _n_pairings(plan: dict) -> int:
@@ -658,22 +848,22 @@ def _n_players(plan: dict) -> int:
 
 
 def normalize_design(plan: dict | None) -> dict | None:
-    """The plan's sequential design with every default filled in: alpha, round_deals, block, replicates
-    (independent conversations per pairing per round), n_pairings and alpha_pairing (Bonferroni), nominal_alpha
-    (the level each look is tested at), min_conversations, and the preregistered target: target_edge_bb100
-    (default 50), prior_sd_bb100 (the per-deal spread, default 350) and the dependence assumed when planning
-    (assumed_icc: the share of the per-deal variance that is a conversation effect; assumed_ar1: memory from one
-    deal to the next inside a conversation). max_rounds, unless the plan sets it, is the fewest rounds that give
-    80% power at the target under those assumptions (max_rounds_basis 'power'); `budget_deals` caps the deals per
-    pairing (basis 'budget'), and then `underpowered` says whether that leaves less than 80%. power_scenarios
-    gives the power at the target under optimistic, the assumed (moderate) and pessimistic dependence;
-    power_at_max is the moderate one. The eligibility rules are part of the design: allow_unattested (backends
-    whose model identity may go unattested, default codex), allow_opaque (backends whose turns may go unaudited,
-    default none) and outside_calibration ('exclude', the default: a decided verdict outside the calibrated range
-    never counts towards a decided leader; 'count'). `registered` is not computed here: it is False for a plan
-    that declines registration or played an older stopping rule (`legacy`), and absent otherwise; only
-    `registration_status` says whether a run is preregistered. The runner, the ratings and the viewer all use
-    this one. None for a plan with no sequential design."""
+    """The plan's sequential design with every default filled in: alpha, round_deals (deals per conversation),
+    block, replicates (independent conversations per pairing per round), n_pairings and alpha_pairing
+    (Bonferroni), the official test (`official_test`, `outcome_bound_bb100` from the plan's game settings, the
+    bar `threshold` = 2 / alpha_pairing on each bettor's capital, `bet_cap`), min_conversations (the fewest
+    conversations from which the official test could decide at all), and the preregistered target:
+    target_edge_bb100 (default 50), prior_sd_bb100 (the per-deal spread, default 350) and the dependence
+    assumed when planning (assumed_icc, assumed_ar1). max_rounds, unless the plan sets it, is the fewest rounds
+    that give 80% power at the target under those assumptions (max_rounds_basis 'power'); `budget_deals` caps
+    the deals per pairing (basis 'budget'), and then `underpowered` says whether that leaves less than 80%.
+    power_scenarios gives the power at the target under optimistic, the assumed (moderate) and pessimistic
+    dependence; power_at_max is the moderate one. The eligibility rules are part of the design: allow_unattested
+    (default codex), allow_opaque (default none) and outside_calibration ('exclude', the default: a decided
+    verdict whose checks failed never counts towards a decided leader; 'count'). `registered` is not computed
+    here: it is False for a plan that declines registration or played an older stopping rule (`legacy`), and
+    absent otherwise; only `registration_status` says whether a run is preregistered. The runner, the ratings
+    and the viewer all use this one. None for a plan with no sequential design."""
     if not plan or not plan.get('deals') and not (plan.get('design') or {}).get('round_deals'):
         return None
     if plan.get('design') is None and not plan.get('until_decided'):
@@ -696,8 +886,25 @@ def _normalized(key: str) -> str:
         d = {**DEFAULT_DESIGN, 'round_deals': plan['deals'],
              'max_rounds': max(1, plan['until_decided'] // plan['deals']), 'legacy': 'until_decided'}
     reps = int(plan.get('replicates') or (plan.get('design') or {}).get('replicates') or 1)
+    bound = outcome_bound(plan.get("game") or "holdem", json.dumps(plan.get("game_config") or {}, sort_keys=True))
     return json.dumps(_complete(d, reps, plan['n'], plan.get('target_edge_bb100') or d.get('target_edge_bb100'),
-                                plan.get('prior_sd_bb100') or d.get('prior_sd_bb100'), plan.get('players')))
+                                plan.get('prior_sd_bb100') or d.get('prior_sd_bb100'), plan.get('players'), bound))
+
+
+@lru_cache(maxsize=64)
+def outcome_bound(game: str = 'holdem', game_config: dict | str | None = None) -> float:
+    """The most a duplicate deal can move for one player, in bb/100: each of its two plays wins or loses at most
+    one stack (stacks reset every hand), so |x| = |net over both plays| / bb / 2 x 100 <= 100 x stack / bb. Every
+    conversation mean lies within it too, whatever its length. 10,000 at the default 200-chip stacks and 2-chip
+    big blind."""
+    from .games import get_game
+    cfg = json.loads(game_config) if isinstance(game_config, str) else dict(game_config or {})
+    g = get_game(game or 'holdem')(cfg)
+    return 100.0 * float(g.stack) / float(g.bb)
+
+
+def _bound_of(design: dict | None) -> float:
+    return float((design or {}).get('outcome_bound_bb100') or outcome_bound())
 
 
 def design_effect(ar1: float, R: int) -> float:
@@ -716,56 +923,23 @@ def scenarios(icc: float, ar1: float) -> list[tuple[str, float, float]]:
     return [('optimistic', 0.0, 0.0), ('moderate', icc, ar1), ('pessimistic', min(0.5, 2 * icc), round(min(0.9, ar1 + 0.1), 3))]
 
 
-def rounds_for(shift: float, alpha_pairing: float, replicates: int, power: float = POWER) -> int | None:
-    """The fewest rounds (looks) whose simulated power reaches `power` when each conversation's mean edge is
-    `shift` of its own spread; None beyond MAX_ROUNDS."""
-    reps = int(replicates)
-    z = _Z.inv_cdf(1 - alpha_pairing / 8) + _Z.inv_cdf(power)
-    r = max(1, math.ceil(max(MIN_CONVERSATIONS, (z / max(shift, 1e-9)) ** 2) / reps))
-    if r > MAX_ROUNDS:
-        return None if power_of(shift, alpha_pairing, MAX_ROUNDS, reps) < power else MAX_ROUNDS
-    if power_of(shift, alpha_pairing, r, reps) >= power:
-        while r > 1 and power_of(shift, alpha_pairing, r - 1, reps) >= power:
-            r -= 1
-        return r
-    while r < MAX_ROUNDS:
-        r += 1
-        if power_of(shift, alpha_pairing, r, reps) >= power:
-            return r
-    return None
+def _need_rounds(base: dict, target: float) -> int | None:
+    """The fewest rounds at which the official test decides for the better player with chance POWER at the
+    target edge (moderate dependence); None when not even MAX_ROUNDS do."""
+    curve = power_curve({**base, 'max_rounds': MAX_ROUNDS}, target)
+    return next((r for r, p in enumerate(curve, 1) if p >= POWER), None)
 
 
-def _rounds_counting(base: dict, target: float, guess: int | None) -> int | None:
-    """The fewest rounds whose full procedure (`procedure`, moderate dependence) gives the better player a
-    counting decided verdict with chance POWER at the target edge; None when not even MAX_ROUNDS do. Searched
-    up from the t arm's own answer (counting power is never above it), doubling, then by bisection."""
-    seen = {}
-
-    def ok(r):
-        if r not in seen:
-            seen[r] = procedure({**base, 'max_rounds': r}, target, even=False)['counting'] >= POWER
-        return seen[r]
-    lo, hi, step = 0, max(1, min(guess or MAX_ROUNDS, MAX_ROUNDS)), 1
-    while not ok(hi):
-        if hi >= MAX_ROUNDS:
-            return None
-        lo, hi, step = hi, min(MAX_ROUNDS, hi + step), step * 2
-    while hi - lo > 1:
-        mid = (lo + hi) // 2
-        lo, hi = (lo, mid) if ok(mid) else (mid, hi)
-    return hi
-
-
-def _complete(d, reps, n_pairings, target, prior, players=None) -> dict:
+def _complete(d, reps, n_pairings, target, prior, players=None, bound=None) -> dict:
     R, B = int(d['round_deals']), int(d.get('block') or BLOCK)
     target, prior = float(target or TARGET_EDGE), float(prior or PRIOR_SD)
     icc, ar1 = float(d.get('assumed_icc', ASSUMED_ICC)), float(d.get('assumed_ar1', ASSUMED_AR1))
     ap = d['alpha'] / n_pairings
+    bound = float(bound or outcome_bound())
     plan_sd = sd_conversation(prior, R, icc, ar1)
     base = {'round_deals': R, 'block': B, 'replicates': reps, 'alpha_pairing': ap, 'assumed_icc': icc,
-            'assumed_ar1': ar1, 'prior_sd_bb100': prior, 'target_edge_bb100': target,
-            'outside_calibration': d.get('outside_calibration', 'exclude')}
-    need = _rounds_counting(base, target, rounds_for(target / plan_sd, ap, reps))
+            'assumed_ar1': ar1, 'prior_sd_bb100': prior, 'target_edge_bb100': target, 'outcome_bound_bb100': bound}
+    need = _need_rounds(base, target)
     if d.get('max_rounds'):
         rounds, basis = int(d['max_rounds']), d.get('max_rounds_basis') or 'given'
     else:
@@ -774,7 +948,6 @@ def _complete(d, reps, n_pairings, target, prior, players=None) -> dict:
         cap = max(1, int(d['budget_deals']) // (R * reps))
         if rounds > cap:
             rounds, basis = cap, 'budget'
-    a1, _, levels, _ = _calibrate(ap, rounds, reps)
     declined = d.get('registered') is False or d.get('legacy')
     full = {**base, 'max_rounds': rounds}
     power = []
@@ -787,9 +960,11 @@ def _complete(d, reps, n_pairings, target, prior, players=None) -> dict:
     by_edge = {str(e): procedure(full, float(e))['counting'] for e in POWER_EDGES}
     cap = R * reps * rounds
     out = {**d, 'round_deals': R, 'max_rounds': rounds, 'max_rounds_basis': basis, 'block': B, 'replicates': reps,
-           'n_pairings': n_pairings, 'alpha_pairing': ap, 'nominal_alpha': a1,
-           'equivalence_alpha': equivalence_level(ap, rounds, reps),
-           'min_conversations': first_verdict(ap, rounds, reps) or MIN_CONVERSATIONS,
+           'n_pairings': n_pairings, 'alpha_pairing': ap,
+           'official_test': {'name': OFFICIAL_TEST, 'assumption_free': True, 'bound_bb100': bound,
+                             'bet_cap': BET_CAP, 'threshold': round(2 / ap, 3)},
+           'assumption_free': True, 'outcome_bound_bb100': bound, 'threshold': round(2 / ap, 3), 'bet_cap': BET_CAP,
+           'equiv_bb100': EQUIV_BB100, 'min_conversations': min_conversations(ap),
            **({'registered': False} if declined else {}), 'target_edge_bb100': target, 'prior_sd_bb100': prior,
            'allow_unattested': sorted(d.get('allow_unattested', ALLOW_UNATTESTED)),
            'allow_opaque': sorted(d.get('allow_opaque', ())),
@@ -798,30 +973,263 @@ def _complete(d, reps, n_pairings, target, prior, players=None) -> dict:
            'conversations_needed': need * reps if need else None, 'deals_needed': need * reps * R if need else None,
            'deals_planned': cap, 'max_deals': cap, 'power_at_max': moderate, 'power_scenarios': power,
            'power_by_edge': by_edge,
-           'power_basis': ('simulated through the complete adjudicator: the chance that the better player gets a '
-                           'decided verdict that counts towards a decided rank or leader (both arms, the minimum '
-                           'conversations, the diagnostics), per pairing'),
+           'power_basis': ('simulated through the official test (the betting confidence sequence, every look, as '
+                           'the runner stops): the chance that the better player gets a decided verdict by the '
+                           'last planned look, per pairing; its guarantee needs no assumption on the shape of the '
+                           'results, so the dependence scenarios change only the power'),
            'underpowered': moderate < POWER,
-           'calibration': {'family': list(FAMILY), 'conversation_effect_share': FAMILY_SHARE,
-                           'levels': {k: round(v, 6) for k, v in levels.items()}, 'sims': CAL_SIMS,
-                           'equivalence_alpha': round(equivalence_level(ap, rounds, reps), 6)}}
+           'calibration': {'test': OFFICIAL_TEST, 'bound_bb100': bound, 'bet_cap': BET_CAP,
+                           'prior_var': BET_PRIOR_VAR, 'threshold': round(2 / ap, 6), 'equiv_bb100': EQUIV_BB100}}
     if players and players >= 2 and n_pairings == players * (players - 1) // 2:
         out['leader_chances'] = leader_chances(out, players)
     return out
 
 
-def unregistered(round_deals, n_pairings, replicates=1) -> dict:
-    """The design of a run that had none fixed before play: nothing in it is a test. `retrospective` is what a
-    default design would have needed for 80% power at the target (moderate dependence), labelled as such."""
+def unregistered(round_deals, n_pairings, replicates=1, bound=None) -> dict:
+    """The design of a run that had none fixed before play: nothing in it is a test. `retrospective` is roughly
+    what the official test would have needed for 80% power at the default target (moderate dependence),
+    labelled as such."""
     R = int(round_deals or DEFAULT_DESIGN['round_deals'])
-    ref = normalize_design({'deals': R, 'design': {}, 'replicates': 4, 'matchups': [[i, -i - 1] for i in range(n_pairings)]})
+    ap = DEFAULT_DESIGN['alpha'] / max(1, n_pairings)
+    bound = float(bound or outcome_bound())
+    n = conversations_for(TARGET_EDGE, sd_conversation(PRIOR_SD, R, ASSUMED_ICC, ASSUMED_AR1), ap, bound)
     return {'registered': False, 'alpha': DEFAULT_DESIGN['alpha'], 'round_deals': R, 'replicates': int(replicates or 1),
-            'block': BLOCK, 'n_pairings': n_pairings, 'min_conversations': MIN_CONVERSATIONS,
-            'retrospective': {k: ref[k] for k in ('target_edge_bb100', 'prior_sd_bb100', 'assumed_icc', 'assumed_ar1',
-                                                  'replicates', 'conversations_needed', 'deals_needed')}}
+            'block': BLOCK, 'n_pairings': n_pairings, 'min_conversations': min_conversations(ap),
+            'outcome_bound_bb100': bound,
+            'retrospective': {'target_edge_bb100': float(TARGET_EDGE), 'prior_sd_bb100': float(PRIOR_SD),
+                              'assumed_icc': ASSUMED_ICC, 'assumed_ar1': ASSUMED_AR1, 'replicates': int(replicates or 1),
+                              'conversations_needed': n, 'deals_needed': n * R, 'basis': 'approximate'}}
 
 
-# The stopping rule.
+# The official test: a betting confidence sequence for bounded conversation means.
+
+def _bet(Y, m, bound, state=None, prior_var=BET_PRIOR_VAR, cap=BET_CAP):
+    """The log capital of the bettor against H: mean <= m after each observation of Y (rows: independent
+    sequences, columns: conversations in play order, every value within +-bound), and its state to carry into
+    the next columns. The stake on conversation i is the aGRAPA fraction (mu - m) / (var + (mu - m)^2) from the
+    mean mu and variance var of the conversations before it (the variance starts from prior_var, worth one
+    conversation), clipped to [0, cap / (bound + m)]: it uses only the past, and 1 + lambda (Y - m) >= 1 - cap
+    for every Y >= -bound, so the capital is a nonnegative supermartingale under H for any distribution."""
+    Y = np.asarray(Y, float)
+    S, T = Y.shape
+    m = np.broadcast_to(np.asarray(m, float).reshape(-1, 1) if np.ndim(m) else np.full((S, 1), float(m)), (S, 1))
+    n0, s1, s2, lk = state if state is not None else (0, np.zeros(S), np.zeros(S), np.zeros(S))
+    c1, c2 = s1[:, None] + np.cumsum(Y, 1), s2[:, None] + np.cumsum(Y * Y, 1)
+    p1 = np.concatenate([s1[:, None], c1[:, :-1]], 1)
+    p2 = np.concatenate([s2[:, None], c2[:, :-1]], 1)
+    k = n0 + np.arange(T)
+    mu = np.where(k > 0, p1 / np.maximum(k, 1), m)
+    var = (prior_var + np.maximum(p2 - k * mu * mu, 0.0)) / (k + 1)
+    gap = mu - m
+    lam = np.clip(gap / (var + gap * gap), 0.0, cap / (bound + m))
+    path = lk[:, None] + np.cumsum(np.log1p(lam * (Y - m)), 1)
+    return path, (n0 + T, c1[:, -1], c2[:, -1], path[:, -1])
+
+
+def min_conversations(alpha_pairing: float, cap: float = BET_CAP) -> int:
+    """The fewest conversations from which the official test could decide at all: the first stake is zero, and
+    each later one multiplies the capital by at most 1 + cap (a conversation at the bound)."""
+    return 1 + math.ceil(math.log(2 / alpha_pairing) / math.log1p(cap) - 1e-12)
+
+
+BETTORS = (('a', 1, 0.0), ('b', -1, 0.0), ('lo', 1, -EQUIV_BB100), ('hi', -1, EQUIV_BB100))
+
+
+def betting(ys, alpha_pairing: float, bound: float, looks=None) -> dict:
+    """The official test on conversation means `ys` (play order): the running maximum of each bettor's log
+    capital at each look (`looks`: conversations at each look; default every conversation), and the verdict at
+    the first look where one reached log(2 / alpha_pairing): 'a' (the bettor against an edge <= 0), 'b' (against
+    >= 0), 'even' (both bettors against the margins, <= -EQUIV_BB100 and >= +EQUIV_BB100), else None.
+    {'verdict', 'look' (1-based), 'conversation' (where its bar was first reached), 'capital' (per bettor, at the
+    last look), 'threshold'}."""
+    y = np.clip(np.asarray(ys, float), -bound, bound)
+    C = len(y)
+    looks = list(range(1, C + 1)) if looks is None else [int(c) for c in looks]
+    bar = math.log(2 / alpha_pairing)
+    out = {'verdict': None, 'look': None, 'conversation': None, 'threshold': round(2 / alpha_pairing, 3),
+           'capital': None}
+    if not C:
+        return out
+    signs = np.array([s for _, s, _ in BETTORS], float)
+    nulls = np.array([s * m for _, s, m in BETTORS], float)
+    path, _ = _bet(signs[:, None] * y[None, :], nulls, bound)
+    best = np.maximum.accumulate(path, 1)
+    first = [int(np.argmax(best[i] >= bar)) + 1 if best[i, -1] >= bar else None for i in range(len(BETTORS))]
+    for j, c in enumerate(looks):
+        hit = {name: best[i, c - 1] >= bar for i, (name, _, _) in enumerate(BETTORS)}
+        if hit['a'] or hit['b']:
+            pick = 'a' if hit['a'] and (not hit['b'] or first[0] <= first[1]) else 'b'
+            out.update(verdict=pick, look=j + 1, conversation=first[0 if pick == 'a' else 1])
+            break
+        if hit['lo'] and hit['hi']:
+            out.update(verdict='even', look=j + 1, conversation=max(first[2], first[3]))
+            break
+    last = looks[-1] if looks else C
+    out['capital'] = {name: round(float(np.exp(min(best[i, last - 1], 700))), 4) for i, (name, _, _) in enumerate(BETTORS)}
+    return out
+
+
+def confidence_sequence(ys, alpha_pairing: float, bound: float) -> list[float] | None:
+    """The anytime-valid interval for the mean edge after the conversations `ys`: every m whose two bettors
+    (against <= m and against >= m) have not reached 2 / alpha_pairing at any point so far. It covers the true
+    mean at every look at once with chance at least 1 - alpha_pairing, whatever the distribution."""
+    y = np.clip(np.asarray(ys, float), -bound, bound)
+    if not len(y):
+        return None
+    bar = math.log(2 / alpha_pairing)
+
+    def keep(grid):
+        up, _ = _bet(np.broadcast_to(y, (len(grid), len(y))), grid, bound)
+        down, _ = _bet(np.broadcast_to(-y, (len(grid), len(y))), -grid, bound)
+        return up.max(1) < bar, down.max(1) < bar
+
+    lim = bound * (1 - 1e-6)
+    grid = np.linspace(-lim, lim, 401)
+    ok_up, ok_down = keep(grid)
+    if not ok_up.any() or not ok_down.any():
+        return None
+    i, j = int(np.argmax(ok_up)), int(len(grid) - 1 - np.argmax(ok_down[::-1]))
+    fine = np.linspace(grid[max(0, i - 1)], grid[i], 201)
+    lo = fine[int(np.argmax(keep(fine)[0]))]
+    fine = np.linspace(grid[j], grid[min(len(grid) - 1, j + 1)], 201)
+    d = keep(fine)[1]
+    hi = fine[int(len(fine) - 1 - np.argmax(d[::-1]))]
+    return [round(float(lo), 1), round(float(hi), 1)]
+
+
+def conversations_for(edge: float, sd_conv: float, alpha_pairing: float, bound: float, power: float = POWER) -> int:
+    """Approximately how many conversations the official test needs to decide an edge with chance `power`:
+    with the stake at its cap lambda = BET_CAP / bound, the log capital drifts by g = lambda edge - lambda^2
+    (sd^2 + edge^2) / 2 per conversation with spread lambda sd, and must reach log(2 / alpha_pairing); plus the
+    first conversation, on which nothing is staked. Within a few percent of the simulation for spreads far
+    below the bound."""
+    lam, L, z = BET_CAP / bound, math.log(2 / alpha_pairing), _Z.inv_cdf(power)
+    g = lam * abs(edge) - lam * lam * (sd_conv ** 2 + edge ** 2) / 2
+    if g <= 0:
+        return 10 ** 9
+    s = lam * sd_conv
+    root = (z * s + math.sqrt(z * z * s * s + 4 * g * L)) / (2 * g)
+    return 1 + math.ceil(root * root)
+
+
+PLAN_SIMS = 4_000           # simulated pairings behind each planning number of the official test
+_TIMES: dict = {}
+
+
+def _crossing_times(sd_conv: float, edge: float, alpha_pairing: float, bound: float, T: int, sims: int = PLAN_SIMS,
+                    stream: int = 0, even: bool = True) -> dict:
+    """For `sims` simulated pairings of conversation means N(edge, sd_conv^2) clipped to the bound, the
+    conversation at which each bettor of the official test first reaches its bar (0: not within T), for
+    looks after every conversation. Kept for reuse: one simulation answers every number of rounds and of
+    replicates."""
+    key = (round(float(sd_conv), 6), round(float(edge), 6), float(alpha_pairing), float(bound), int(sims), int(stream),
+           bool(even))
+    hit = _TIMES.get(key)
+    if hit is not None and hit[0] >= T:
+        return hit[1]
+    names = [b for b in BETTORS if even or b[0] in ('a', 'b')]
+    signs = np.repeat(np.array([s for _, s, _ in names], float), sims)[:, None]
+    nulls = np.repeat(np.array([s * m for _, s, m in names], float), sims)
+    first = np.zeros(len(names) * sims, np.int64)
+    rng = np.random.default_rng([SIM_SEED, 47, int(stream), int(round(edge * 1e3)), int(round(sd_conv * 1e3))])
+    bar, state, done, step = math.log(2 / alpha_pairing), None, 0, 128
+    while done < T:
+        n = min(step, T - done)
+        y = np.clip(edge + sd_conv * rng.standard_normal((sims, n)), -bound, bound)
+        path, state = _bet(signs * np.tile(y, (len(names), 1)), nulls, bound, state)
+        hit_ = path >= bar
+        new = (first == 0) & hit_.any(1)
+        first[new] = done + hit_[new].argmax(1) + 1
+        done += n
+        if (first.reshape(len(names), sims)[:2] > 0).any(0).all():
+            break
+    times = {name: first[i * sims:(i + 1) * sims] for i, (name, _, _) in enumerate(names)}
+    _TIMES[key] = (T if done >= T else 10 ** 9, times)
+    return times
+
+
+def _plan_verdicts(times: dict, reps: int, rounds: int):
+    """(verdict per pairing: 1 'a', -1 'b', 2 'even', 0 undecided; conversations played) from the bettors'
+    crossing times, with looks after every `reps` conversations and the runner stopping at the first verdict."""
+    big = 10 ** 9
+    t = {k: np.where(v > 0, v, big) for k, v in times.items()}
+    look = {k: np.where(v < big, -(-v // reps), big) for k, v in t.items()}
+    la, lb = look['a'], look['b']
+    le = np.maximum(look['lo'], look['hi']) if 'lo' in look else np.full(la.shape, big)
+    lw = np.minimum(la, lb)
+    win = np.where((la < lb) | ((la == lb) & (t['a'] <= t['b'])), 1, -1)
+    sign = np.where(lw <= le, win, 2)
+    at = np.minimum(lw, le)
+    sign = np.where(at <= rounds, sign, 0)
+    return sign, np.where(at <= rounds, at, rounds) * reps
+
+
+def procedure(design: dict, edge: float, icc: float | None = None, ar1: float | None = None, sd: float | None = None,
+              sims: int = PLAN_SIMS, stream: int = 0, even: bool = True) -> dict:
+    """What the official test does with one eligible pairing of this design whose true edge is `edge` bb/100
+    (planning dependence icc and ar1, per-deal spread sd; the design's own by default), by simulation: the
+    verdict at the look the runner stops at. Returns the chance of each outcome: 'counting' and 'right' (the
+    better player decided: in the simulation the test's checks always pass, so every decided verdict counts),
+    'wrong' (the worse one decided), 'even', 'undecided', and the average conversations played."""
+    d = design
+    R, reps, rounds = int(d['round_deals']), int(d.get('replicates') or 1), int(d['max_rounds'])
+    icc = float(d.get('assumed_icc', ASSUMED_ICC) if icc is None else icc)
+    ar1 = float(d.get('assumed_ar1', ASSUMED_AR1) if ar1 is None else ar1)
+    sd = float(d.get('prior_sd_bb100') or PRIOR_SD) if sd is None else float(sd)
+    sdc = sd_conversation(sd, R, icc, ar1)
+    eq = even and abs(edge) < 2 * EQUIV_BB100
+    times = _crossing_times(sdc, float(edge), float(d['alpha_pairing']), _bound_of(d), rounds * reps, sims, stream, eq)
+    sign, used = _plan_verdicts(times, reps, rounds)
+    better = 1 if edge >= 0 else -1
+    right = (sign == better) if edge else np.zeros(len(sign), bool)
+    wrong = (sign == -better) if edge else (np.abs(sign) == 1)
+    n = float(len(sign))
+    return {'edge_bb100': float(edge), 'assumed_icc': icc, 'assumed_ar1': ar1, 'prior_sd_bb100': sd,
+            'sd_conversation_bb100': round(sdc, 1),
+            'counting': round(float(right.sum()) / n, 4), 'right': round(float(right.sum()) / n, 4),
+            'wrong': round(float(wrong.sum()) / n, 4), 'even': round(float((sign == 2).sum()) / n, 4),
+            'even_counting': round(float((sign == 2).sum()) / n, 4),
+            'undecided': round(float((sign == 0).sum()) / n, 4), 'conversations': round(float(used.mean()), 1),
+            'sims': int(n)}
+
+
+def power_curve(design: dict, edge: float, icc=None, ar1=None, sd=None) -> list[float]:
+    """The official test's power at `edge` by the end of each round 1..max_rounds."""
+    d = design
+    R, reps, rounds = int(d['round_deals']), int(d.get('replicates') or 1), int(d['max_rounds'])
+    icc = float(d.get('assumed_icc', ASSUMED_ICC) if icc is None else icc)
+    ar1 = float(d.get('assumed_ar1', ASSUMED_AR1) if ar1 is None else ar1)
+    sd = float(d.get('prior_sd_bb100') or PRIOR_SD) if sd is None else float(sd)
+    times = _crossing_times(sd_conversation(sd, R, icc, ar1), float(edge), float(d['alpha_pairing']), _bound_of(d),
+                            rounds * reps, even=abs(edge) < 2 * EQUIV_BB100)
+    sign, used = _plan_verdicts(times, reps, rounds)
+    better = 1 if edge >= 0 else -1
+    at = used // reps
+    return [round(float(((sign == better) & (at <= r)).mean()), 4) for r in range(1, rounds + 1)]
+
+
+def length_tradeoff(design: dict, lengths=(1, 2, 5, 10, 25, 50)) -> list[dict]:
+    """What the official test needs at the design's target, by conversation length (deals per conversation),
+    under the design's assumed dependence: conversations and deals per pairing for 80% power (looks after every
+    conversation). The bound, not the spread, sets the number of conversations, so short conversations need
+    far fewer deals; long ones measure what a model learns about its opponent within a conversation."""
+    target = float(design.get('target_edge_bb100') or TARGET_EDGE)
+    out = []
+    for R in lengths:
+        sdc = sd_conversation(float(design.get('prior_sd_bb100') or PRIOR_SD), int(R),
+                              float(design.get('assumed_icc', ASSUMED_ICC)), float(design.get('assumed_ar1', ASSUMED_AR1)))
+        T = MAX_ROUNDS * 40
+        t = _crossing_times(sdc, target, float(design['alpha_pairing']), _bound_of(design), T, even=False)
+        right = np.where(t['a'] > 0, t['a'], 10 ** 9)
+        wrong = np.where(t['b'] > 0, t['b'], 10 ** 9)
+        hit = np.sort(np.where(right < wrong, right, 10 ** 9))
+        n = int(hit[int(math.ceil(POWER * len(hit))) - 1])
+        out.append({'round_deals': int(R), 'sd_conversation_bb100': round(sdc, 1),
+                    'conversations': n if n < 10 ** 9 else None, 'deals': n * int(R) if n < 10 ** 9 else None})
+    return out
+
+
+# The model-based gate (round 6): secondary, never official.
 
 def _look_cs(rounds, reps):
     return [k * reps for k in range(1, rounds + 1)]
@@ -981,36 +1389,6 @@ def equivalence_level(alpha_pairing: float, rounds: int, reps: int) -> float:
     return 2 * min(ap, level * (1 - 1e-9))
 
 
-def first_verdict(alpha_pairing: float, rounds: int, reps: int) -> int | None:
-    """The fewest conversations at which a look of this design can decide."""
-    eligible = _calibrate(float(alpha_pairing), int(rounds), int(reps))[3]
-    return next((C for C, e in zip(_look_cs(int(rounds), int(reps)), eligible) if e), None)
-
-
-def nominal_alpha(alpha_pairing: float, round_deals: int, max_rounds: int, block: int = BLOCK, replicates: int = 1) -> float:
-    """The two-sided level every look is tested at so that, over all `max_rounds` looks, a pairing with no edge
-    is called for either player with chance at most alpha_pairing for every null shape of the calibration family
-    (normal, and skewed conversation effects: exponential, lognormal, rare large losses), found by simulation.
-    It depends only on the looks and the conversations per round (round_deals and block are kept for the
-    signature)."""
-    return _calibrate(float(alpha_pairing), int(max_rounds), int(replicates))[0]
-
-
-@lru_cache(maxsize=None)
-def power_of(shift: float, alpha_pairing: float, max_rounds: int, replicates: int = 1) -> float:
-    """The chance the t arm alone calls the better player when each conversation's mean edge is `shift` of the
-    spread of a conversation mean (normal conversation means): an upper bound on the full procedure's power,
-    used only to start the search for a design's rounds. What a design advertises is `procedure`'s."""
-    rounds, reps = int(max_rounds), int(replicates)
-    a1, _, _, eligible = _calibrate(float(alpha_pairing), rounds, reps)
-    cols = _tcols('normal', reps, float(shift), POWER_SIMS, 99, rounds)
-    hit = _crossings(cols, reps, eligible, a1)
-    first = hit.argmax(1)
-    T = np.stack(cols, 1)
-    return round(float((hit.any(1) & (T[np.arange(len(T)), first] > 0)).mean()), 3)
-
-
-PLAN_SIMS = 20_000          # simulated pairings behind each planning number of the full procedure
 _P_CACHE: dict = {}
 
 
@@ -1064,14 +1442,13 @@ def _procedure_cols(R, B, sd, icc, ar1, edge, reps, sims, looks, stream=0):
     return c['cols'][:looks]
 
 
-def procedure(design: dict, edge: float, icc: float | None = None, ar1: float | None = None, sd: float | None = None,
-              sims: int = PLAN_SIMS, stream: int = 0, even: bool = True) -> dict:
-    """What the complete adjudicator does with one eligible pairing of this design whose true edge is `edge`
-    bb/100 (planning dependence icc and ar1, per-deal spread sd; the design's own by default), by simulation:
-    the verdict at the look the runner stops at, from both of `decide`'s arms (the t arm against its calibrated
-    bar; the sign-flip arm is taken to agree whenever the t arm crosses, which tests/test_calibration.py checks
-    against `adjudicate` itself), the 'even' test, the minimum number of conversations, and the diagnostics
-    behind `counts_toward_leader` (conversation share within FAMILY_SHARE). Returns the chance of each
+def procedure_model_based(design: dict, edge: float, icc: float | None = None, ar1: float | None = None,
+                          sd: float | None = None, sims: int = 20_000, stream: int = 0, even: bool = True) -> dict:
+    """The round 6 planner, kept to compare costs: what the model-based gate would do with one pairing of this
+    design (it needs `max_rounds` and `alpha_pairing`) whose true edge is `edge` bb/100, by simulation: the
+    verdict at the look the runner would stop at, from the t arm against its calibrated bar (the sign-flip arm
+    taken to agree whenever the t arm crosses), its 'even' test, its minimum number of conversations, and the
+    diagnostics it needed to count (conversation share within FAMILY_SHARE). Returns the chance of each
     outcome: 'counting' (the better player decided, and it counts towards a decided rank or leader), 'right'
     (the better player decided, whatever the diagnostics), 'wrong' (the worse one decided), 'even',
     'even_counting', 'undecided', and the average conversations played."""
@@ -1096,7 +1473,7 @@ def procedure(design: dict, edge: float, icc: float | None = None, ar1: float | 
 
 
 def verdicts_of(cols, design: dict, even: bool = True):
-    """The planner's model of `adjudicate` on an eligible pairing, from per-look statistics (`cols`: per look
+    """The round 6 planner's model of its gate on an eligible pairing, from per-look statistics (`cols`: per look
     the conversations' mean edge, its standard error and the conversation share, as `_procedure_cols` gives
     them): (verdict per sequence: 1 'a', -1 'b', 2 'even', 0 undecided; whether it counts towards a decided rank
     or leader; conversations played). Looks run in order and the first decision stops the pairing, as the runner
@@ -1137,7 +1514,7 @@ def leader_chances(design: dict, players: int, icc=None, ar1=None) -> list[dict]
     leader (a counting win over every other player), by edge scenario: 'one best' (it is better than each
     other player by the target edge, the rest equal), 'one best by twice the target', and 'ladder'
     (strengths evenly spaced, the target edge apart). Each of the leader's pairings is simulated through the
-    full procedure (`procedure`) and treated as independent of the others. Pairings that share cards are
+    official test (`procedure`) and treated as independent of the others. Pairings that share cards are
     positively correlated, which keeps the joint chance at or above that product (tests/test_calibration.py);
     anything that lowers a single pairing's power (a noisier game than planned) lowers it as a power."""
     T = float(design.get('target_edge_bb100') or TARGET_EDGE)
@@ -1151,19 +1528,6 @@ def leader_chances(design: dict, players: int, icc=None, ar1=None) -> list[dict]
     return [{'scenario': 'one best', 'edge_bb100': T, 'p_leader': round(one ** (players - 1), 3)},
             {'scenario': 'one best by twice the target', 'edge_bb100': 2 * T, 'p_leader': round(two ** (players - 1), 3)},
             {'scenario': 'ladder', 'edge_bb100': T, 'p_leader': round(ladder, 3)}]
-
-
-def boundary(alpha_pairing: float, round_deals: int, max_rounds: int, block: int = BLOCK, look: int | None = None,
-             replicates: int = 1) -> float:
-    """Critical |t| at look `look` (default: the last) for the conversation-level t, with look x replicates
-    conversations: the Student t quantile at the calibrated nominal level. inf where a look has fewer than
-    MIN_CONVERSATIONS conversations (no verdict is possible there)."""
-    rounds, reps = int(max_rounds), int(replicates)
-    look = rounds if look is None else max(1, min(int(look), rounds))
-    C = look * reps
-    if not _calibrate(float(alpha_pairing), rounds, reps)[3][look - 1]:
-        return math.inf
-    return t_ppf(1 - nominal_alpha(alpha_pairing, round_deals, rounds, block, reps) / 2, C - 1)
 
 
 _FLIP_COLS: list = []
@@ -1263,42 +1627,47 @@ def _cr1(sizes, sums):
 def decide(xs, design=None, n_pairings=1, looks_used=None, groups=None) -> dict:
     """The verdict on one pairing from a's result per duplicate deal (bb/100), at look `looks_used` of the
     design. `groups` labels each deal's conversation (its match folder), conversations in play order (round by
-    round); without it all deals are one.
+    round, replicate by replicate); without it all deals are one.
 
-    A look can decide only with at least `min_conversations` conversations (MIN_CONVERSATIONS or more: the
-    first look of the design at which the sign-flip arm can reject at all) and some spread between them. Then a
-    winner needs both arms at that look: the conversation-level t beyond the calibrated bar, and the sign-flip
-    test (exact when results are symmetric about the true edge) rejecting by then. verdict: 'a' or 'b' (the
-    first look where both did, `decided_at_look`), 'even' (the repeated (1 - 2 alpha) interval inside
-    +-EQUIV_BB100, and both one-sided sign-flip tests), 'exhausted' (the last planned look, undecided), 'open'
-    (undecided, looks remain, or no look yet), 'early' (a completed look with fewer conversations than a verdict
-    needs, or too few deals for any spread). The
-    numbers describe all the deals given; with one conversation `basis` is 'blocks' and the interval is
-    conditional on it."""
+    The official verdict (`verdict`) is the betting confidence sequence's (`betting`) on the conversations'
+    mean edges, each clipped to the game's bound (deals beyond it are counted in `out_of_bound`, which the
+    adjudicator rejects): 'a' or 'b' at the first look where that player's bettor reached 2 / alpha_pairing
+    (`decided_at_look`, `decided_at_conversation`), 'even' where both bettors against the margins did,
+    'exhausted' (the last planned look, undecided), 'open' (undecided, looks remain, or no look yet), 'early'
+    (a completed look with fewer conversations than any verdict could come from). `capital` is each bettor's
+    best capital so far against the bar `official_test.threshold`; `cs` the anytime-valid interval for the edge
+    (level `cs_level`). The other numbers describe all the deals given (`ci95` is an ordinary t interval, not a
+    test); with one conversation `basis` is 'blocks' and it is conditional on it. `model_based` is the round 6
+    gate on the same data, secondary and never official (None for designs it was never calibrated for)."""
     d = {**DEFAULT_DESIGN, 'max_rounds': 1, **(design or {})}
     xs = [float(x) for x in xs]
     n, B, rounds, reps = len(xs), int(d.get('block') or BLOCK), int(d['max_rounds']), int(d.get('replicates') or 1)
     R = int(d.get('round_deals') or n or 1)
     alpha_p = d['alpha'] / max(1, n_pairings)
+    bound = _bound_of(d)
     if looks_used is None:
         looks_used = min(rounds, n // (R * reps))
     labels = list(groups) if groups is not None else ['.'] * n
     conv = {}
     for g, x in zip(labels, xs):
-        c = conv.setdefault(g, [0, 0.0, 0.0])
+        c = conv.setdefault(g, [0, 0.0])
         c[0] += 1
         c[1] += x
-        c[2] += x * x
     sizes = np.array([c[0] for c in conv.values()], float)
     sums = np.array([c[1] for c in conv.values()], float)
     bsizes, bsums = _chunks(xs, labels, B)
     C, G = len(conv), len(bsizes)
+    need = min_conversations(alpha_p)
     out = {'deals': n, 'blocks': G, 'conversations': C, 'edge': round(sum(xs) / n, 1) if n else None, 'se': None,
-           'ci95': None, 't': None, 'df': None, 'basis': None, 'boundary': None, 'verdict': 'early',
+           'ci95': None, 't': None, 'df': None, 'basis': None, 'verdict': 'early',
            'looks_used': looks_used, 'looks_planned': rounds, 'alpha_pairing': alpha_p, 'equiv_bb100': EQUIV_BB100,
-           'min_conversations': MIN_CONVERSATIONS, 'decided_at_look': None, 'signflip': None,
-           'conversation_share': None, 'ci_decision': None, 'equiv_ci': None, 'sd_per_deal': None, 'reason': None,
-           'power': {'deals_for_80pct': {str(e): None for e in POWER_EDGES}}}
+           'min_conversations': need, 'decided_at_look': None, 'decided_at_conversation': None,
+           'official_test': {'name': OFFICIAL_TEST, 'assumption_free': True, 'bound_bb100': bound, 'bet_cap': BET_CAP,
+                             'threshold': round(2 / alpha_p, 3)},
+           'assumption_free': True, 'bound_bb100': bound,
+           'out_of_bound': sum(abs(x) > bound * (1 + 1e-9) for x in xs), 'capital': None, 'cs': None,
+           'cs_level': round(1 - alpha_p, 6), 'conversation_share': None, 'sd_per_deal': None, 'reason': None,
+           'model_based': None, 'power': {'deals_for_80pct': {str(e): None for e in POWER_EDGES}}}
     if C >= 2:
         m, se = _cr1(sizes, sums)
         df, basis = C - 1, 'conversations'
@@ -1306,25 +1675,79 @@ def decide(xs, design=None, n_pairings=1, looks_used=None, groups=None) -> dict:
         m, se = _cr1(bsizes, bsums)
         df, basis = G - 1, 'blocks'
     else:
-        out['reason'] = 'too few deals to estimate any spread'
+        m = se = df = basis = None
+    means = sums / np.maximum(sizes, 1)
+    verdict, reason, at, at_c = None, None, None, None
+    cs_ = [min(j * reps, C) for j in range(1, looks_used + 1)]
+    if cs_:
+        cs_[-1] = C
+    test = betting(means, alpha_p, bound, cs_ or [C]) if C else None
+    if looks_used < 1:
+        verdict = 'open'
+    elif C < need:
+        verdict = 'early'
+        reason = (f'{C} conversation{"s" if C != 1 else ""}: the official test cannot decide from fewer than {need} '
+                  f'independent conversations (fresh match pairs) of the pairing')
+    elif test['verdict']:
+        verdict, at, at_c = test['verdict'], test['look'], test['conversation']
+    else:
+        verdict = 'exhausted' if looks_used >= rounds else 'open'
+    if test:
+        out['capital'] = {'a': test['capital']['a'], 'b': test['capital']['b'],
+                          'even': min(test['capital']['lo'], test['capital']['hi'])}
+        out['cs'] = confidence_sequence(means, alpha_p, bound)
+    out.update(verdict=verdict, reason=reason, decided_at_look=at, decided_at_conversation=at_c)
+    if m is None:
+        out.update(verdict='early', reason=out['reason'] or 'too few deals to estimate any spread')
         return out
-    iv = lambda c: [round(m - c * se, 1), round(m + c * se, 1)]
+    share = None
+    if C >= 2:
+        w = _within(xs, labels, B)
+        between = float(np.var(sums / sizes, ddof=1))
+        share = round(max(0.0, 1 - float(np.mean(w)) / between), 2) if between > 0 and w else None
+    flat = se <= 1e-9 * (1 + abs(m))
+    t = 0.0 if flat else m / se
+    sd_conv = se * math.sqrt(C) if C >= 2 else None
+    per = n / max(C, 1)
+    out.update({'edge': round(m, 1), 'se': round(se, 1), 'ci95': [round(m - t_ppf(0.975, df) * se, 1),
+                                                                  round(m + t_ppf(0.975, df) * se, 1)],
+                't': round(t, 2), 'df': df, 'basis': basis, 'conversation_share': share,
+                'sd_per_deal': round(se * math.sqrt(n), 1),
+                'power': {'deals_for_80pct': {str(e): (math.ceil(conversations_for(e, sd_conv, alpha_p, bound) * per)
+                                                       if sd_conv is not None else None) for e in POWER_EDGES},
+                          'basis': 'official test, approximate, from the observed spread of conversation means'}})
+    if d.get('model_based', True) and _model_cheap(rounds, reps, R) and C >= 2:
+        out['model_based'] = _model_based(xs, labels, sizes, sums, m, se, df, C, share, d, alpha_p, looks_used,
+                                          rounds, reps)
+    return out
+
+
+def _model_cheap(rounds: int, reps: int, R: int) -> bool:
+    return R >= 2 and rounds <= MODEL_MAX_ROUNDS and rounds * reps <= MODEL_MAX_CONVERSATIONS
+
+
+MODEL_LABEL = ('model-based (round 6 gate: a conversation-level t and a sign-flip test, with bars calibrated for '
+               'a family of shapes): secondary, descriptive, never official; its error rate is not guaranteed')
+
+
+def _model_based(xs, labels, sizes, sums, m, se, df, C, share, d, alpha_p, looks_used, rounds, reps) -> dict:
+    """The round 6 gate on the same deals: both arms (the t arm against its calibrated bar, the sign-flip arm
+    with its error spent look by look) for a winner, TOST with both one-sided sign-flip tests for 'even', from
+    MIN_CONVERSATIONS conversations, and its diagnostic against the calibrated family (conversation share)."""
     a1, cum, _, eligible = _calibrate(alpha_p, rounds, reps)
     aeq = equivalence_level(alpha_p, rounds, reps)
     need = next((c for c, e in zip(_look_cs(rounds, reps), eligible) if e), None) or MIN_CONVERSATIONS
-    out['min_conversations'] = need
+    flat = lambda mean, s: s <= 1e-9 * (1 + abs(mean))
     can = C >= need
     bnd = t_ppf(1 - a1 / 2, df) if can else None
     beq = t_ppf(1 - aeq / 2, df) if can else None
-    flat = lambda mean, s: s <= 1e-9 * (1 + abs(mean))
     t = 0.0 if flat(m, se) else m / se
     verdict, reason, at, flip = None, None, None, None
     if looks_used < 1:
         verdict = 'open'
     elif not can:
         verdict = 'early'
-        reason = (f'{C} conversation{"s" if C != 1 else ""}: a verdict needs at least {need} independent '
-                  f'conversations (fresh match pairs) of the pairing')
+        reason = f'{C} conversations: the model-based gate needs at least {need}'
     else:
         cs = [min(j * reps, C) for j in range(1, looks_used + 1)]
         cs[-1] = C
@@ -1352,50 +1775,48 @@ def decide(xs, design=None, n_pairings=1, looks_used=None, groups=None) -> dict:
         if verdict is None:
             verdict = 'exhausted' if looks_used >= rounds else 'open'
             if flat(m, se):
-                reason = 'the conversations show no spread at all, so no verdict is possible from them'
+                reason = 'the conversations show no spread at all, so the model-based gate cannot decide'
             elif abs(t) >= bnd and not flip:
                 reason = 'the t arm crossed its bar but the sign-flip arm did not (both are needed)'
-    share = None
-    if C >= 2:
-        w = _within(xs, labels, B)
-        between = float(np.var(sums / sizes, ddof=1))
-        share = round(max(0.0, 1 - float(np.mean(w)) / between), 2) if between > 0 and w else None
-    sigma = se * math.sqrt(n)
-    plan_c = _Z.inv_cdf(1 - a1 / 2)
-    out.update({'edge': round(m, 1), 'se': round(se, 1), 'ci95': iv(t_ppf(0.975, df)), 'df': df, 'basis': basis,
-                't': round(t, 2), 'boundary': round(bnd, 3) if can else None, 'verdict': verdict,
-                'decided_at_look': at, 'signflip': flip, 'conversation_share': share,
-                'ci_decision': iv(bnd) if can else None, 'equiv_ci': iv(beq) if can else None,
-                'sd_per_deal': round(sigma, 1), 'reason': reason,
-                'power': {'deals_for_80pct': {str(e): math.ceil(((plan_c + _Z.inv_cdf(POWER)) * sigma / e) ** 2)
-                                              for e in POWER_EDGES}}})
-    return out
+    status = 'unknown' if share is None or not can else 'supported' if share <= FAMILY_SHARE else 'unsupported'
+    iv = lambda c: [round(m - c * se, 1), round(m + c * se, 1)]
+    return {'verdict': verdict, 'label': MODEL_LABEL, 'official': False, 't': round(t, 2),
+            'boundary': round(bnd, 3) if can else None, 'signflip': flip, 'decided_at_look': at,
+            'ci_decision': iv(bnd) if can else None, 'equiv_ci': iv(beq) if can else None, 'nominal_alpha': a1,
+            'min_conversations': need, 'conversation_share': share, 'reason': reason,
+            'diagnostics': {'status': status, 'summary': MODEL_DIAGNOSTICS[status], 'limit': FAMILY_SHARE}}
+
+
+MODEL_DIAGNOSTICS = {'supported': 'diagnostics passed; distribution assumptions unverified',
+                     'unsupported': 'diagnostics failed: the data are outside the calibrated family',
+                     'unknown': 'diagnostics incomplete: some could not be checked'}
 
 
 # The adjudicator: the only function whose verdicts stop, record or decide anything.
 
-DIAGNOSTICS = {'supported': 'diagnostics passed; distribution assumptions unverified',
-               'unsupported': 'diagnostics failed: the data are outside the calibrated family',
-               'unknown': 'diagnostics incomplete: some could not be checked'}
+DIAGNOSTICS = {'supported': 'checks passed: the guarantee holds for any distribution of results within the '
+                            'game\'s bound, given independent conversations',
+               'unsupported': 'checks failed: deals are repeated across conversations, so they are not shown to be '
+                              'independent',
+               'unknown': 'checks incomplete: some could not be made'}
 
 
 def assumptions(v: dict, fps=None, groups=None) -> dict:
     """What a verdict's error bound rests on, checked against the data: {'status': 'supported' | 'unsupported' |
-    'unknown', 'checks': {name: {'status', 'value', 'limit', 'meaning'}}}. The bound holds exactly when
-    conversation results are symmetric about the true edge (which no data can confirm) and, by calibration, for
-    skewed results whose conversation effect holds at most FAMILY_SHARE of a conversation mean's variance:
-    `conversation_share` estimates that share. `independent_deals`: no deal is repeated across the pairing's
-    conversations. `conversations`: enough of them to judge at all."""
+    'unknown', 'summary', 'checks': {name: {'status', 'value', 'limit', 'meaning'}}}. The official test needs no
+    assumption on the shape of the results, only independent conversations (fresh memories, by design) whose
+    results the game bounds: `independent_deals` (no deal repeated across the pairing's conversations, which
+    would make two of them share cards), `bounded` (no deal beyond the game's bound), `conversations` (enough of
+    them for any verdict)."""
     checks = {}
     C, need = v.get('conversations') or 0, v.get('min_conversations') or MIN_CONVERSATIONS
     checks['conversations'] = {'status': 'supported' if C >= need else 'unknown', 'value': C, 'limit': need,
-                               'meaning': 'independent conversations, at least the number a verdict needs'}
-    share = v.get('conversation_share')
-    checks['conversation_share'] = {
-        'status': 'unknown' if share is None else 'supported' if share <= FAMILY_SHARE else 'unsupported',
-        'value': share, 'limit': FAMILY_SHARE,
-        'meaning': 'estimated share of the spread of conversation means that is a conversation effect; the test '
-                   'is calibrated up to the limit (beyond it the bound holds only if results are symmetric)'}
+                               'meaning': 'independent conversations, at least the number any verdict needs'}
+    bad = v.get('out_of_bound')
+    checks['bounded'] = {'status': 'unknown' if bad is None else 'supported' if not bad else 'unsupported',
+                         'value': bad, 'limit': 0,
+                         'meaning': f'deals beyond the game\'s bound of +-{v.get("bound_bb100") or outcome_bound():,.0f} '
+                                    f'bb/100 (more than the stacks allow)'}
     if fps is not None and groups is not None:
         seen, repeats = {}, 0
         for fp, g in zip(fps, groups):
@@ -1454,12 +1875,15 @@ def adjudicate(pairing_data: dict, design: dict, n_pairings: int, look: int, eli
     'identity', 'audit', 'protocol_consistent', 'observed_models', ...}}}).
 
     Returns `decide`'s keys plus: eligible, ineligible_reasons, assumptions ({status, checks}), calibrated
-    (True / False / None: assumptions supported / unsupported / unknown), counts_toward_leader, standing,
+    (True / False / None: the official test's checks supported / unsupported / unknown; the name is kept from
+    round 6), counts_toward_leader, standing, linked_audit (per player, the audit derived from the decision-linked
+    call and raw records, when `pairing_data` found them),
     test_verdict (decide's verdict), identity_status and audit_status per player, judge_fingerprint (= judge),
     calibration_id, registered_judge and official (made by the registered judge under a valid registration).
     verdict is 'ineligible', a terminal verdict, whenever any rule fails: no valid registration, code changed
     during the run, a player's identity unresolved, mismatched or unattested where the design doesn't allow it,
-    its turns not fully audited, its protocol inconsistent, or a duplicate pair that failed validation."""
+    its turns not fully audited (by the runner's facts, and by the linked records where they exist), its
+    protocol inconsistent, a duplicate pair that failed validation, or a deal beyond the game's bound."""
     data = dict(pairing_data)
     if 'xs' not in data and data.get('root') is not None:
         data = {**pairing_data_of(data), **{k: v for k, v in data.items() if k in ('a', 'b')}}
@@ -1491,6 +1915,19 @@ def adjudicate(pairing_data: dict, design: dict, n_pairings: int, look: int, eli
         reasons.append('no verified duplicate deal: there is nothing to judge')
     elif not data.get('evidence_hash'):
         reasons.append('the hands were not verified against their seeds (no evidence hash), so they cannot count')
+    if v.get('out_of_bound'):
+        reasons.append(f'{v["out_of_bound"]} deal{"s" if v["out_of_bound"] != 1 else ""} beyond the game\'s bound of '
+                       f'+-{v["bound_bb100"]:,.0f} bb/100, more than the stacks allow: the records cannot be right')
+    linked = data.get('linked_audit') or {}
+    for p in named:
+        x = linked.get(p)
+        if not x or (players.get(p) or {}).get('kind') == 'bot' or x.get('status') in ('bot', 'legacy'):
+            continue
+        allowed = ('complete', 'opaque') if (players.get(p) or {}).get('backend') in ((design or {}).get('allow_opaque') or ()) \
+            else ('complete',)
+        if x.get('status') not in allowed:
+            reasons.append(f'{p}: the audit derived from its linked call records is {x.get("status")}'
+                           + (f' ({"; ".join(x.get("problems")[:2])})' if x.get('problems') else ''))
     reasons = list(dict.fromkeys(reasons))
     a = assumptions(v, data.get('fps'), groups)
     calibrated = {'supported': True, 'unsupported': False}.get(a['status'])
@@ -1500,8 +1937,8 @@ def adjudicate(pairing_data: dict, design: dict, n_pairings: int, look: int, eli
     counts = eligible and test in DECIDED and (calibrated is True or (calibrated is False and count_outside))
     standing = None
     if eligible and test in DECIDED:
-        standing = 'decided' if calibrated else ('decided (diagnostics failed: outside the calibrated family)'
-                                                 if calibrated is False else 'decided (diagnostics incomplete)')
+        standing = 'decided' if calibrated else ('decided (checks failed: conversations not shown independent)'
+                                                 if calibrated is False else 'decided (checks incomplete)')
     judge = judge_fingerprint()
     cal = calibration_id(design)
     official = bool(reg) and not registration_problems(reg, design) and reg.get('judge_fingerprint') == judge \
@@ -1515,7 +1952,8 @@ def adjudicate(pairing_data: dict, design: dict, n_pairings: int, look: int, eli
             'judge_fingerprint': judge, 'judge': judge, 'calibration_id': cal,
             'registered_judge': (reg or {}).get('judge_fingerprint'), 'official': official,
             'evidence_hash': data.get('evidence_hash'), 'judged_evidence_hash': data.get('evidence_hash'),
-            'evidence_deals': len(xs)}
+            'evidence_version': data.get('evidence_version', EVIDENCE_VERSION), 'evidence_deals': len(xs),
+            'linked_audit': linked or None}
 
 
 def _identity_of(x: dict | None) -> str | None:
@@ -1558,10 +1996,18 @@ def observations(deals, block=BLOCK) -> tuple[list[dict], int]:
             g = groups[key] = {'a': d['a'], 'b': d['b'], 'xs': [], 'matchup': d['matchup'], 'deal': d['deal'],
                                'slate': slate, 'pos': d['deal'] // block, 'round': d.get('round') or 1, 'fp': d.get('fp'),
                                'replicate': d.get('replicate') or 1, 'planned': d.get('planned') or 0,
-                               'evidence': d.get('evidence')}
-        elif g['evidence'] != d.get('evidence'):
-            g['evidence'] = None if not (g['evidence'] and d.get('evidence')) else \
-                hashlib.sha256(f'{g["evidence"]}|{d["evidence"]}'.encode()).hexdigest()[:24]
+                               'evidence': d.get('evidence'), 'evidence_linked': d.get('evidence_linked'),
+                               'audit': {}}
+        else:
+            for k in ('evidence', 'evidence_linked'):
+                if g[k] != d.get(k):
+                    g[k] = None if not (g[k] and d.get(k)) else \
+                        hashlib.sha256(f'{g[k]}|{d[k]}'.encode()).hexdigest()[:24]
+        for p, a in (d.get('audit') or {}).items():
+            y = g['audit'].setdefault(p, {'decisions': 0, 'linked': 0, 'verified': 0, 'opaque': 0, 'problems': []})
+            for f in ('decisions', 'linked', 'verified', 'opaque'):
+                y[f] += a[f]
+            y['problems'] = y['problems'] + a['problems']
         g['xs'].append(x if d['a'] == g['a'] else -x)
     obs = [{**{k: v for k, v in g.items() if k != 'xs'}, 'x': sum(g['xs']) / len(g['xs']), 'plays': len(g['xs'])}
            for g in groups.values()]
@@ -1682,7 +2128,8 @@ def _df_basis(players, strata):
 
 def sessions(obs, size=SESSION) -> list[dict]:
     """Observations grouped in order into sessions per conversation: [{'a', 'b', 'matchup', 'net_bb', 'deals'}].
-    A trailing partial session counts if it has at least half the deals."""
+    A trailing partial session counts if it has at least half the deals; a conversation shorter than a session
+    is one session."""
     by = {}
     for o in obs:
         by.setdefault(o['matchup'], []).append(o)
@@ -1690,7 +2137,7 @@ def sessions(obs, size=SESSION) -> list[dict]:
     for mu, os_ in by.items():
         for k in range(0, len(os_), size):
             chunk = os_[k:k + size]
-            if 2 * len(chunk) < size:
+            if 2 * len(chunk) < size and k:
                 continue
             a = chunk[0]['a']
             out.append({'a': a, 'b': chunk[0]['b'], 'matchup': mu, 'deals': len(chunk),
@@ -1836,8 +2283,8 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
 
     def result(p, q, outside=False):
         """'win', 'loss', 'even' or None: the decided verdict of p against q that counts towards a decided rank
-        or leader (official, eligible, within the calibrated range unless the design counts the rest; with
-        `outside`, also one outside that range), between players not quarantined in the run."""
+        or leader (official, eligible, its checks passed unless the design counts the rest; with `outside`, also
+        one whose checks failed), between players not quarantined in the run."""
         x = vmap.get(frozenset((p, q)))
         if pooled or not x or x['verdict'] not in DECIDED or info(p)['quarantine_reason'] or info(q)['quarantine_reason']:
             return None
@@ -1943,7 +2390,9 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
         ref = next((q for q in refs if q != row['player'] and frozenset((row['player'], q)) in vmap), None)
         x = vmap.get(frozenset((row['player'], ref))) if ref else None
         row['vs_reference'] = None if not x or x.get('edge') is None else {
-            'reference': ref, 'edge': x['edge'] if x['a'] == row['player'] else -x['edge'],
+            'reference': ref, 'reference_version': REFERENCE['version'],
+            'edge': x['edge'] if x['a'] == row['player'] else -x['edge'],
+            'cs': None if not x.get('cs') else x['cs'] if x['a'] == row['player'] else [-x['cs'][1], -x['cs'][0]],
             'ci95': x['ci95'] if not x['ci95'] or x['a'] == row['player'] else [-x['ci95'][1], -x['ci95'][0]],
             'deals': x['deals'], 'verdict': x['verdict']}
     unrated = sorted(excluded | ({p for d in raw for p in (d['a'], d['b'])} - set(names)))
@@ -2012,16 +2461,15 @@ def _headline(lead, front, margin, ci95, pairings, pooled, outside=None) -> str:
     """One line per group, from that group's own data only."""
     if lead:
         return (f'{lead} is the decided leader: it won its pairing against every other player in this group, each '
-                f'an official verdict whose evidence stands today and whose diagnostics passed (distribution '
-                f'assumptions unverified).')
+                f'an official verdict of the assumption-free test whose evidence stands today and whose checks passed.')
     if not front:
         return 'Only one player in this group.'
     open_ = sum(not x.get('counts_toward_leader') for x in pairings)
     what = 'pooled across runs, so nothing here is decided' if pooled else (
         f'no decided leader ({open_} of {len(pairings)} pairings without decided results that count)')
     if outside:
-        what += (f'; {outside} won every pairing, but at least one of those verdicts failed its diagnostics (outside '
-                 f'the calibrated family), where its error rate is unknown')
+        what += (f'; {outside} won every pairing, but at least one of those verdicts failed its checks (deals '
+                 f'repeated across conversations), so its error rate is not established')
     iv = f', 95% {_iv(ci95)}' if ci95 else ''
     return f'{front} is ahead on points by {margin:+.0f} bb/100 over the next player{iv}; {what}.'
 
@@ -2043,17 +2491,21 @@ def _notes(pooled, design, pairings, comps, groups, obs, repeats, excluded, unra
                      f'runner recorded it when play stopped (the official decision, by judge '
                      f'{(reg or {}).get("judge_fingerprint")}). {ASSUMPTIONS} Strengths, intervals and the order by '
                      f'points are descriptive.')
+        if any((x.get('official_test') or {}).get('assumption_free') is False for x in pairings if x.get('official')):
+            notes.append('Some official verdicts were recorded by an earlier judge whose test was model-based (a t and '
+                         'sign-flip gate calibrated for a family of shapes), so their error rate is guaranteed only '
+                         'within that family; today\'s assumption-free test is shown beside them as a recomputation.')
         if any(x['verdict'] == 'early' for x in pairings):
-            notes.append(f'A verdict needs at least {design.get("min_conversations", MIN_CONVERSATIONS)} conversations (fresh match pairs) of a '
-                         f'pairing; pairings with fewer are "too early", whatever their numbers say.')
+            notes.append(f'No verdict is possible from fewer than {design.get("min_conversations", MIN_CONVERSATIONS)} '
+                         f'conversations (fresh match pairs) of a pairing; pairings with fewer are "too early".')
         if any(x['basis'] == 'blocks' for x in pairings):
             notes.append(f'Some pairings have one conversation: their intervals describe that conversation only '
                          f'(blocks of {block} deals), not how a new match would go.')
         wide = [x for x in pairings if x.get('calibrated') is False]
         if wide:
-            notes.append('Diagnostics failed (outside the calibrated family): ' + ', '.join(f'{x["a"]} vs {x["b"]}' for x in wide) + '. Their '
-                         'conversations differ by more than the test was calibrated for (or repeat deals), so their '
-                         'error rate is unknown unless their results are symmetric, which no data can show; '
+            notes.append('Checks failed: ' + ', '.join(f'{x["a"]} vs {x["b"]}' for x in wide) + ' repeat deals across '
+                         'their conversations, so the conversations are not shown to be independent and the error '
+                         'rate is not established; '
                          + ('the design counts such verdicts anyway.' if design.get('outside_calibration') == 'count'
                             else 'such a verdict never counts towards a decided rank or leader.'))
         bad = [x for x in pairings if x['verdict'] == 'ineligible']
@@ -2094,6 +2546,11 @@ def _notes(pooled, design, pairings, comps, groups, obs, repeats, excluded, unra
                      f'compare players only within a group.')
     if any(not g['has_bot'] for g in groups if len(g['players']) > 1):
         notes.append('A group without a bot has no fixed anchor: its strengths only compare its own players.')
+    if any(g.get('has_reference') for g in groups):
+        notes.append(f'The reference bot ({REFERENCE["version"]}) is {REFERENCE["kind"].split(":")[0]}; measured '
+                     f'against the other bots it wins ' + ', '.join(f'{x["edge_bb100"]:+} bb/100 against {x["b"]}'
+                                                              for x in REFERENCE['results'] if x['a'] == 'reference')
+                     + f'; {REFERENCE["limits"]}.')
     if any(not g.get('has_reference') for g in groups if len(g['players']) > 1):
         notes.append('Strength is relative to the players met. A group without the fixed reference bot (bot = '
                      '"reference") has no common, versioned opponent to say how good its players are at poker; the '
@@ -2116,7 +2573,8 @@ def _notes(pooled, design, pairings, comps, groups, obs, repeats, excluded, unra
             f'{x["a"]} vs {x["b"]} (observed {x["observed_edge"]:+.0f}, the strengths imply {x["fitted_edge"]:+.0f})'
             for x in misfit) + ': one number per player cannot describe these results, so read the pairings '
             'directly; a strength is an average over the opponents a player happened to meet.')
-    notes.append('Session Elo is the share of 10-deal sessions won: a different, secondary statistic that never '
+    notes.append('Session Elo is the share of sessions won (10 deals of one conversation, or the whole of a shorter '
+                 'one): a different, secondary statistic that never '
                  'decides anything. Its interval is the wider of a posterior one and a bootstrap that resamples '
                  'sessions with their slates and conversations.')
     return notes
@@ -2172,7 +2630,11 @@ _DECISION_KEYS = ('verdict', 'test_verdict', 't', 'boundary', 'signflip', 'decid
                   'eligible', 'ineligible_reasons', 'assumptions', 'calibrated', 'counts_toward_leader', 'standing',
                   'conversation_share', 'min_conversations', 'identity_status', 'audit_status', 'calibration_id',
                   'looks_used', 'looks_planned', 'edge', 'ci95', 'se', 'df', 'basis', 'deals', 'conversations',
-                  'blocks', 'reason', 'sd_per_deal', 'power', 'alpha_pairing')
+                  'blocks', 'reason', 'sd_per_deal', 'power', 'alpha_pairing', 'official_test', 'assumption_free',
+                  'bound_bb100', 'out_of_bound', 'capital', 'cs', 'cs_level', 'decided_at_conversation', 'model_based',
+                  'evidence_version', 'linked_audit')
+EARLIER_JUDGE = {'name': 'conversation-level t and sign-flip gate (an earlier judge: model-based, its error rate '
+                         'not guaranteed beyond a calibrated family of shapes)', 'assumption_free': False}
 
 
 def _official(rec: dict | None, reg: dict | None) -> bool:
@@ -2225,8 +2687,10 @@ def evidence_now(last: dict, today: dict, data: dict, facts: dict | None, design
         return out('invalid', 'evidence', *[f'{x.get("matchup")}{"" if x.get("hand") is None else " hand " + str(x["hand"])}: '
                                              f'{x.get("reason")}' for x in r[:3]])
     runner = ((facts or {}).get('verification') or {}).get('evidence_hash')
-    same = data.get('evidence_hash') == judged if judged else recorded in (data.get('evidence_hash'), runner)
-    if not data.get('evidence_hash') or not same:
+    have = data.get('evidence_hash') if int(last.get('evidence_version') or 1) >= 2 else \
+        data.get('evidence_hash_v1', data.get('evidence_hash'))
+    same = have == judged if judged else recorded in (have, runner)
+    if not have or not same:
         had, have = last.get('evidence_deals') or last.get('deals') or 0, len(data.get('xs') or [])
         if have < had:
             return out('lost', 'evidence', f'{had - have} of the {had} deals it judged are missing')
@@ -2287,9 +2751,10 @@ def _pairings(raw, obs, design, n_pairings, pooled, recorded, eligibility=None, 
         sign = lambda o: o['x'] if o['a'] == x['a'] else -o['x']
         rec = recorded.get(f'{x["a"]}__vs__{x["b"]}') or recorded.get(f'{x["b"]}__vs__{x["a"]}') or []
         if pooled or not registered:
-            v = decide([sign(o) for o in os_], {'max_rounds': 1, 'round_deals': len(os_), 'block': BLOCK},
+            v = decide([sign(o) for o in os_], {'max_rounds': 1, 'round_deals': len(os_), 'block': BLOCK,
+                                                'model_based': False, 'outcome_bound_bb100': (design or {}).get('outcome_bound_bb100')},
                        n_pairings, 0, groups=[o['matchup'] for o in os_])
-            v.update(verdict='descriptive', boundary=None, ci_decision=None, equiv_ci=None, signflip=None,
+            v.update(verdict='descriptive', model_based=None,
                      reason=None if pooled else 'this run is not preregistered, so nothing in it is a test',
                      assumptions=assumptions(v, [o['fp'] for o in os_], [o['matchup'] for o in os_]),
                      official=False, retrospective=False, eligible=None, ineligible_reasons=[], calibrated=None,
@@ -2315,13 +2780,17 @@ def _pairings(raw, obs, design, n_pairings, pooled, recorded, eligibility=None, 
             at = [o for o in os_ if o['round'] <= looks] if looks else os_
             mine = [y for y in rejected if {y.get('a'), y.get('b')} == set(key)]
             data = {'a': x['a'], 'b': x['b'], 'xs': [sign(o) for o in at], 'groups': [o['matchup'] for o in at],
-                    'fps': [o['fp'] for o in at], 'rejected': mine, 'evidence_hash': evidence_hash(at)}
+                    'fps': [o['fp'] for o in at], 'rejected': mine, 'evidence_hash': evidence_hash(at),
+                    'evidence_hash_v1': evidence_hash(at, 1), 'evidence_version': EVIDENCE_VERSION,
+                    'linked_audit': linked_status(at)}
             today = adjudicate(data, design, n_pairings, looks, eligibility.get(key))
             beyond = len(os_) - len(at) if looks else 0
             last = rec[looks - 1] if looks and len(rec) >= looks and rec[looks - 1].get('looks_used') == looks else None
             if _official(last, reg):
                 now = evidence_now(last, today, data, eligibility.get(key), design)
-                v = {**today, **{k: last[k] for k in _DECISION_KEYS if k in last}, 'official': True,
+                earlier = {} if 'official_test' in last else {'official_test': EARLIER_JUDGE, 'assumption_free': False,
+                                                              'cs': None, 'capital': None, 'model_based': None}
+                v = {**today, **earlier, **{k: last[k] for k in _DECISION_KEYS if k in last}, 'official': True,
                      'retrospective': False, 'judge': last.get('judge_fingerprint') or last.get('judge'),
                      'recorded_counts': bool(last.get('counts_toward_leader')),
                      'counts_toward_leader': bool(last.get('counts_toward_leader')) and now['status'] == 'verified',
@@ -2367,12 +2836,54 @@ def _wilson(k: int, n: int) -> list[float] | None:
     return [round(max(0.0, c - h), 3), round(min(1.0, c + h), 3)]
 
 
+def _quiz_score(answers: list[dict], best: dict) -> dict:
+    """Counts from the answers themselves: a valid answer is one the player gave (no fallback, no backend
+    failure); it is correct only if it is the spot's computed best option. A fallback never counts as correct,
+    whatever the fallback did."""
+    valid = [x for x in answers if x.get('outcome', 'fallback' if x.get('fallback') else 'valid') == 'valid'
+             and not x.get('fallback')]
+    right = sum(1 for x in valid if (x.get('executed') == best[x['spot']] if x.get('spot') in best
+                                     else bool(x.get('correct'))))
+    n = len(answers)
+    return {'answered': n, 'correct': right, 'accuracy': round(right / n, 4) if n else None,
+            'valid_answers': len(valid), 'valid_correct': right,
+            'valid_accuracy': round(right / len(valid), 4) if valid else None, 'fallbacks': n - len(valid),
+            'ev_loss_bb': round(sum(float(x.get('ev_loss_bb') or 0) for x in answers), 3)}
+
+
+def _quiz_eligibility(x: dict) -> dict:
+    """Whether a quiz player's scores can be attached to it: its answers carry their evidence (raw output,
+    identity and audit per answer) and its provenance (protocol, implementation, CLI version), and the quiz's
+    own eligibility, rechecked from the answers, holds. {'status': 'eligible' | 'bot' | 'ineligible' |
+    'unverified', 'reasons'}."""
+    answers = x.get('answers')
+    if x.get('kind') == 'bot' or 'bot' in (x.get('spec') or {}):
+        return {'status': 'bot', 'reasons': []}
+    if not isinstance(answers, list) or not answers:
+        return {'status': 'unverified', 'reasons': ['the quiz record keeps no answers, so its score cannot be checked']}
+    why = list(((x.get('eligibility') or {}).get('reasons')) or [])
+    if (x.get('eligibility') or {}).get('status') not in (None, 'eligible'):
+        why.append(f'the quiz found it {(x.get("eligibility") or {}).get("status")}')
+    if any(a.get('identity_match') != 'match' for a in answers):
+        why.append(f'{sum(a.get("identity_match") != "match" for a in answers)} answers not attested as the requested model')
+    if any(a.get('audit') != 'verified' for a in answers):
+        why.append(f'{sum(a.get("audit") != "verified" for a in answers)} answers not verified against their raw output')
+    if any(not any('raw' in c or c.get('raw_ref') for c in a.get('calls') or []) for a in answers):
+        why.append('some answers keep no raw backend output')
+    missing = [k for k in ('protocol', 'implementation', 'cli_version') if not x.get(k)]
+    if missing:
+        why.append('no ' + ', '.join(missing) + ' recorded')
+    return {'status': 'ineligible' if why else 'eligible', 'reasons': list(dict.fromkeys(why))}
+
+
 def fundamentals(root, players: dict | None = None) -> dict | None:
-    """Poker fundamentals, reported apart from match results: the quiz scores (quiz.py: clear-cut decision
-    spots whose best answer is computed) found in quiz.json at root or one folder below it. Per player:
-    answered, correct, accuracy with a 95% Wilson interval, the big blinds lost to the best answers, fallbacks.
-    `players` ({player id: identity}) names a quiz player after the run's player with the same model and
-    reasoning level when there is one. None when no quiz was run."""
+    """Poker fundamentals, reported apart from match results: the quiz scores (quiz.py) found in quiz.json at
+    root or one folder below it. Scores are recounted from the answers (a fallback is never correct; accuracy
+    over every spot asked, and valid-answer accuracy apart), per category, each with its provenance (quiz
+    version and spots, protocol, implementation, CLI version) and `eligibility` (`_quiz_eligibility`). A score is
+    attached to a run's player (`players`: {player id: identity}) only when it is eligible (or a bot's) and the
+    model and reasoning level are the same; otherwise it stays under its quiz name, unattached. Intervals only
+    where a category's spots are a sample from a defined population (its generator), never for a fixed set."""
     from .history import identity as ident_of, _base
     root = Path(root)
     paths = [p for p in [root / 'quiz.json', *sorted(root.glob('*/quiz.json'))] if p.exists()]
@@ -2383,20 +2894,51 @@ def fundamentals(root, players: dict | None = None) -> dict | None:
     for path in paths:
         doc = _json(path) or {}
         versions.add((doc.get('version'), doc.get('spots_hash')))
+        best = {sp.get('id'): sp.get('correct') for sp in doc.get('spots') or [] if isinstance(sp, dict)}
+        cats = doc.get('categories') or {}
         for pid, x in (doc.get('players') or {}).items():
-            if not isinstance(x, dict) or 'answered' not in x:
+            if not isinstance(x, dict) or 'answered' not in x and 'answers' not in x:
                 continue
             base = _base(ident_of(pid, x.get('spec') or {}))
-            name = by_base.get(base, pid)
-            out[name] = {'quiz_player': pid, 'identity': base, 'answered': x.get('answered'), 'correct': x.get('correct'),
-                         'accuracy': x.get('accuracy'), 'accuracy_ci95': _wilson(int(x.get('correct') or 0), int(x.get('answered') or 0)),
-                         'ev_loss_bb': x.get('ev_loss_bb'), 'mean_ev_loss_bb': x.get('mean_ev_loss_bb'),
-                         'fallbacks': x.get('fallbacks'), 'version': doc.get('version'), 'spots_hash': doc.get('spots_hash'),
+            elig = _quiz_eligibility(x)
+            answers = x.get('answers') if isinstance(x.get('answers'), list) else None
+            by_cat = {}
+            if answers:
+                for c in dict.fromkeys(a.get('category', 'basics') for a in answers):
+                    sc = _quiz_score([a for a in answers if a.get('category', 'basics') == c], best)
+                    pop = (cats.get(c) or {}).get('population')
+                    sc['interval95'] = _wilson(sc['correct'], sc['answered']) if pop else None
+                    sc['estimand'] = (cats.get(c) or {}).get('estimand') or (
+                        None if pop else 'none: a fixed set of spots; counts, not a population interval')
+                    by_cat[c] = sc
+                head = by_cat.get('basics') or _quiz_score(answers, best)
+            else:
+                head = {'answered': x.get('answered'), 'correct': None, 'accuracy': None, 'valid_answers': None,
+                        'valid_correct': None, 'valid_accuracy': None, 'fallbacks': x.get('fallbacks'),
+                        'ev_loss_bb': x.get('ev_loss_bb')}
+            attach = elig['status'] in ('eligible', 'bot') and base in by_base
+            name = by_base[base] if attach else pid
+            out[name] = {'quiz_player': pid, 'identity': base, 'attached': attach,
+                         'attached_by': 'model and reasoning level' if attach else None,
+                         **{k: head.get(k) for k in ('answered', 'correct', 'accuracy', 'valid_answers', 'valid_correct',
+                                                     'valid_accuracy', 'fallbacks', 'ev_loss_bb')},
+                         'scored_category': 'basics' if 'basics' in by_cat else ('all' if by_cat else None),
+                         'categories': by_cat, 'eligibility': elig,
+                         'provenance': {'quiz_version': doc.get('version'), 'spots_hash': doc.get('spots_hash'),
+                                        'protocol': (x.get('protocol') or {}).get('fingerprint')
+                                        if isinstance(x.get('protocol'), dict) else x.get('protocol'),
+                                        'implementation': (x.get('implementation') or {}).get('fingerprint')
+                                        if isinstance(x.get('implementation'), dict) else x.get('implementation'),
+                                        'cli_version': x.get('cli_version'), 'identity_match': x.get('identity_match'),
+                                        'audit': x.get('audit_status')},
+                         'version': doc.get('version'), 'spots_hash': doc.get('spots_hash'),
                          'source': str(path.relative_to(root))}
     return {'label': 'poker fundamentals', 'separate_from': 'match results',
-            'meaning': 'how often a player finds the computed best answer in clear-cut spots (pot odds, all-in '
-                       'equity against a stated range); it measures fundamentals against a fixed answer key, not '
-                       'winnings against these opponents, and is never pooled with strengths or verdicts',
+            'meaning': 'how often a player finds the computed best answer in decision spots with a fixed answer '
+                       'key (a fallback is never correct; valid-answer accuracy is shown apart); it measures '
+                       'fundamentals, not winnings against these opponents, and is never pooled with strengths or '
+                       'verdicts. A score is attached to a run\'s player only with its provenance and when its '
+                       'answers are eligible; the basics are a fixed set, so they carry counts, not intervals',
             'versions': sorted([v for v in versions if v[0]], key=str), 'players': out}
 
 
@@ -2431,6 +2973,10 @@ def ratings(root, boot=BOOT, seed=0, session=SESSION) -> dict:
     audit = {p: {**(s.get('audit') or {}), 'identity': s.get('identity'), 'fallbacks': s.get('fallbacks'),
                  'retries': s.get('retries'), 'served_models': s.get('served_models')} for p, s in stats.items()}
     return {**r, 'stats': stats, 'stat_labels': LABELS, 'position_labels': POSITIONS, 'audit': audit,
+            'reference': REFERENCE,
+            'populations': {'verdicts and strengths': 'verified results: duplicate deals both plays committed, '
+                                                     'validated as pairs and replayed from their seeds',
+                            'stats': 'the same verified results (stats.population per player)'},
             'fundamentals': fundamentals(root, {p: m['identity'] for p, m in meta.items()})}
 
 
@@ -2501,22 +3047,23 @@ def design_line(d) -> str:
         x = d.get('retrospective') or {}
         if not x.get('deals_needed'):
             return 'No preregistered design: nothing in this run is a test.'
-        return (f'No preregistered design: nothing in this run is a test. Retrospective sample size only: detecting a '
-                f'{x["target_edge_bb100"]:.0f} bb/100 edge with 80% power would take about {x["deals_needed"]:,} deals '
-                f'per pairing ({x["conversations_needed"]} conversations of {d["round_deals"]} deals), assuming a '
-                f'per-deal spread of {x["prior_sd_bb100"]:.0f} and moderate dependence (ICC {x["assumed_icc"]}, '
-                f'AR(1) {x["assumed_ar1"]}).')
+        return (f'No preregistered design: nothing in this run is a test. Retrospective sample size only: the official '
+                f'test would need about {x["deals_needed"]:,} deals per pairing ({x["conversations_needed"]:,} '
+                f'conversations of {d["round_deals"]} deals) for 80% power at {x["target_edge_bb100"]:.0f} bb/100.')
     sc = {x['scenario']: x for x in d.get('power_scenarios') or []}
-    per = f'{d["replicates"]} conversation{"s" if d["replicates"] != 1 else ""} of {d["round_deals"]} deals'
+    per = f'{d["replicates"]} conversation{"s" if d["replicates"] != 1 else ""} of {d["round_deals"]} deal' \
+          + ('s' if d['round_deals'] != 1 else '')
     head = (f'Planned to detect a {d["target_edge_bb100"]:.0f} bb/100 edge: up to {d["max_rounds"]} rounds of {per} '
-            f'({d["max_deals"]:,} deals per pairing), a verdict from {d["min_conversations"]} conversations on.')
+            f'({d["max_deals"]:,} deals per pairing), a verdict possible from {d["min_conversations"]} conversations '
+            f'on. The official test is assumption-free: conversation means bounded by +-{_bound_of(d):,.0f} bb/100 '
+            f'(the stacks), a verdict when a bettor\'s capital reaches {d.get("threshold") or 2 / d["alpha_pairing"]:,.0f}.')
     if sc:
         m = sc['moderate']
-        head += (f' Chance that a pairing whose better player is ahead by the target gets a decided verdict that '
-                 f'counts (the complete adjudicator, simulated; per-deal spread {d["prior_sd_bb100"]:.0f}): '
-                 f'{_pct(m["power"])} with the assumed dependence (ICC {m["assumed_icc"]}, AR(1) {m["assumed_ar1"]}), '
-                 f'{_pct(sc["optimistic"]["power"])} with none, {_pct(sc["pessimistic"]["power"])} if it is worse '
-                 f'(ICC {sc["pessimistic"]["assumed_icc"]}, AR(1) {sc["pessimistic"]["assumed_ar1"]}).')
+        head += (f' Chance that a pairing whose better player is ahead by the target is decided (simulated; per-deal '
+                 f'spread {d["prior_sd_bb100"]:.0f}): {_pct(m["power"])} with the assumed dependence (ICC '
+                 f'{m["assumed_icc"]}, AR(1) {m["assumed_ar1"]}), {_pct(sc["optimistic"]["power"])} with none, '
+                 f'{_pct(sc["pessimistic"]["power"])} if it is worse; dependence changes only the power, never the '
+                 f'error rate.')
     lead = d.get('leader_chances')
     if lead:
         n = (1 + math.isqrt(1 + 8 * d['n_pairings'])) // 2
@@ -2525,7 +3072,8 @@ def design_line(d) -> str:
                              for x in lead) + '.')
     if d.get('underpowered'):
         why = 'a budget of ' + f'{d["budget_deals"]:,} deals' if d.get('max_rounds_basis') == 'budget' else 'its max_rounds'
-        need = f'about {d["deals_needed"]:,}' if d.get('deals_needed') else f'more than {MAX_ROUNDS * d["round_deals"] * d["replicates"]:,}'
+        need = f'about {d["deals_needed"]:,}' if d.get('deals_needed') else \
+            f'more than {MAX_ROUNDS * d["round_deals"] * d["replicates"]:,}'
         head += f' Underpowered: capped by {why}; 80% would need {need} deals per pairing.'
     return head
 
@@ -2535,8 +3083,16 @@ LEADER_SCENARIO = {'one best': 'it is {e:.0f} bb/100 better than each other play
                    'ladder': 'the players are evenly spaced {e:.0f} bb/100 apart'}
 
 
+def _capital(m) -> str:
+    cap, bar = m.get('capital'), (m.get('official_test') or {}).get('threshold')
+    if not cap or not bar:
+        return ''
+    best = max(('a', 'b', 'even'), key=lambda k: cap.get(k) or 0)
+    return f'best capital {cap[best]:,.2f} ({best}) of the {bar:,.0f} a verdict needs'
+
+
 def verdicts(r, labels=None) -> str:
-    """Each pairing: the edge, its interval, the test against the stopping bar, and the verdict."""
+    """Each pairing: the edge, its intervals, the official test's capital against its bar, and the verdict."""
     labels = labels or {}
     name = lambda p: labels.get(p, p)
     order = {'a': 0, 'b': 0, 'even': 1, 'exhausted': 2, 'open': 3, 'early': 4, 'ineligible': 5, 'retrospective': 6,
@@ -2550,10 +3106,10 @@ def verdicts(r, labels=None) -> str:
         lines = [f'Pairings (descriptive: this run is not preregistered ({why}); nothing here is a test):']
     else:
         lines = [f'Pairings (decided only by the preregistered sequential test, as recorded when play stopped by the '
-                 f'registered judge {reg.get("judge_fingerprint") or "?"}; if its assumptions hold, at most '
+                 f'registered judge {reg.get("judge_fingerprint") or "?"}: an assumption-free betting test, at most '
                  f'{d["alpha"]:.0%} chance of any false verdict over {d["n_pairings"]} '
-                 f'pairing{"s" if d["n_pairings"] != 1 else ""}; a verdict needs '
-                 f'{d.get("min_conversations", MIN_CONVERSATIONS)}+ conversations):']
+                 f'pairing{"s" if d["n_pairings"] != 1 else ""} for any distribution of results, given independent '
+                 f'conversations):']
     for m in sorted(r['pairings'], key=lambda m: (order[m['verdict']], m['a'], m['b'])):
         a, b = name(m['a']), name(m['b'])
         head = f'  {a} vs {b}: '
@@ -2561,22 +3117,24 @@ def verdicts(r, labels=None) -> str:
             lines.append(head + 'no deals yet')
             continue
         head += f'{m["edge"]:+.0f} bb/100 for {a} over {m["deals"]} deals in {m["conversations"]} conversation' \
-                + ('s' if m['conversations'] != 1 else '')
-        if m['ci95']:
-            head += f' (95% {_iv(m["ci95"])})'
-            if m['boundary'] is not None:
-                t = m['t'] if m['t'] is not None else 'inf'
-                head += (', no planned look yet' if m['looks_used'] < 1 else
-                         f', t = {t} vs bar {m["boundary"]:.2f} at look {m["looks_used"]} of {m["looks_planned"]}'
-                         + ('' if m.get('signflip') is None else
-                            f', sign-flip test {"rejects" if m["signflip"] else "does not reject"}')
-                         + (f', decided at look {m["decided_at_look"]}' if m.get('decided_at_look')
-                            and m['decided_at_look'] != m['looks_used'] else ''))
+            + ('s' if m['conversations'] != 1 else '')
+        if m.get('ci95'):
+            head += f' (95% {_iv(m["ci95"])}, descriptive)'
+        if m.get('cs') and m['verdict'] != 'descriptive':
+            head += f'; anytime-valid {1 - m["alpha_pairing"]:.1%} interval {_iv(m["cs"])}'
+        if m['verdict'] != 'descriptive' and m.get('looks_used') is not None:
+            head += ', no planned look yet' if m['looks_used'] < 1 else f', look {m["looks_used"]} of {m["looks_planned"]}'
+            cap = _capital(m)
+            head += f', {cap}' if cap else ''
+            if m.get('decided_at_look') and m['decided_at_look'] != m['looks_used']:
+                head += f', decided at look {m["decided_at_look"]}'
         state = VERDICT_TEXT[m['verdict']].format(a=a, b=b, e=r.get('equiv_bb100', EQUIV_BB100))
         if m['verdict'] in DECIDED and m.get('standing') and m['standing'] != 'decided':
             state += m['standing'][len('decided'):]
         if m.get('official'):
             state += f'; official (recorded by judge {m.get("judge")})'
+            if (m.get('official_test') or {}).get('assumption_free') is False:
+                state += ', made by an earlier model-based test'
         elif m.get('retrospective'):
             state += '; retrospective (today\'s recomputation)'
         lines.append(f'{head}: {state}.')
@@ -2585,10 +3143,13 @@ def verdicts(r, labels=None) -> str:
         elif m.get('reason') and m['verdict'] != 'descriptive':
             lines.append(f'      {m["reason"]}.')
         st = (m.get('assumptions') or {}).get('status')
-        if m['verdict'] not in ('descriptive',) and st:
-            share = ((m['assumptions'].get('checks') or {}).get('conversation_share') or {}).get('value')
-            lines.append(f'      {DIAGNOSTICS[st]}' + (f' (conversation share {share}; the test is calibrated up to '
-                                                       f'{FAMILY_SHARE})' if share is not None else ''))
+        if m['verdict'] not in ('descriptive',) and st and st != 'supported':
+            lines.append(f'      {DIAGNOSTICS[st]}')
+        mb = m.get('model_based')
+        if mb and mb.get('verdict') and m['verdict'] != 'descriptive':
+            lines.append(f'      model-based (secondary, never official; assumes a family of shapes): '
+                         f'{VERDICT_TEXT.get(mb["verdict"], mb["verdict"]).format(a=a, b=b, e=r.get("equiv_bb100", EQUIV_BB100))}'
+                         + (f', t = {mb["t"]} vs bar {mb["boundary"]:.2f}' if mb.get('boundary') else ''))
         now = m.get('evidence_now')
         if now and now['status'] != 'verified':
             lines.append(f'      evidence today: {now["status"]} ({now["meaning"]}); it no longer counts towards a '
@@ -2601,22 +3162,20 @@ def verdicts(r, labels=None) -> str:
                          f'{m["observed_edge"]:+.0f}: they do not add up across pairings.')
         if m.get('deals_since_look'):
             lines.append(f'      {m["deals_since_look"]} more deals are in a round under way, not yet looked at.')
-        need = m['power']['deals_for_80pct']
+        need = (m.get('power') or {}).get('deals_for_80pct') or {}
         if m['verdict'] in ('open', 'exhausted') and need.get('50') and m['conversations'] >= 2:
-            lines.append('      deals per pairing for an 80% chance to detect a real edge of '
-                         + ', '.join(f'{e} bb/100: at least {need[e]:,}' for e in need) + ' (the t arm alone, from the '
-                         'observed spread of its conversations: the full procedure needs more; a planning number, not '
-                         'a forecast)')
+            lines.append('      deals per pairing for an 80% chance that the official test decides a real edge of '
+                         + ', '.join(f'{e} bb/100: about {need[e]:,}' for e in need if need[e]) + ' (approximate, from '
+                         'the observed spread of its conversations and their length; a planning number, not a forecast)')
     lead = [x for x in r.get('leaders') or [] if x]
     if not r.get('pooled') and (d or {}).get('registered', True):
         lines.append('Decided leader: ' + ('; '.join(f'{name(x["player"])} (won its pairing against every other '
                                                     f'player of its group: official verdicts, evidence verified today, '
-                                                    f'diagnostics passed; distribution assumptions unverified)'
-                                                    for x in lead) if lead else 'none.'))
+                                                    f'checks passed)' for x in lead) if lead else 'none.'))
         for g in r.get('groups') or []:
             if g.get('leader_outside_calibration'):
                 lines.append(f'  {name(g["leader_outside_calibration"])} won every pairing of its group, but not all '
-                             f'with their diagnostics passed, so it is not a decided leader.')
+                             f'with their checks passed, so it is not a decided leader.')
     if d and not r.get('pooled'):
         lines.append(design_line(d))
     return '\n'.join(lines)
@@ -2627,13 +3186,27 @@ def fundamentals_text(f, labels=None) -> str:
     if not f or not f.get('players'):
         return ''
     name = lambda p: (labels or {}).get(p, p)
-    lines = ['Poker fundamentals (the quiz: clear-cut spots with computed answers; reported apart from match results, '
-             'which measure winnings against these opponents):']
+    lines = ['Poker fundamentals (the quiz: decision spots with computed answers; reported apart from match results, '
+             'which measure winnings against these opponents; a fallback is never correct):']
     for p, x in sorted(f['players'].items(), key=lambda kv: -(kv[1].get('accuracy') or 0)):
-        iv = x.get('accuracy_ci95')
-        lines.append(f'  {name(p)}: {x["correct"]}/{x["answered"]} right'
-                     + (f' ({x["accuracy"]:.0%}, 95% {iv[0]:.0%}-{iv[1]:.0%})' if x.get('accuracy') is not None and iv else '')
-                     + f', {x["ev_loss_bb"]} bb lost to the best answers' + (f', {x["fallbacks"]} fallbacks' if x.get('fallbacks') else ''))
+        st = (x.get('eligibility') or {}).get('status')
+        head = f'  {name(p)}: '
+        if x.get('correct') is None:
+            lines.append(head + f'{x.get("answered")} answered, not recounted ({"; ".join(x["eligibility"]["reasons"])})')
+            continue
+        head += (f'{x["correct"]}/{x["answered"]} right in {x.get("scored_category") or "the quiz"}'
+                 + (f' ({x["valid_correct"]}/{x["valid_answers"]} of its valid answers)' if x.get('fallbacks') else '')
+                 + f', {x["ev_loss_bb"]} bb lost to the best answers'
+                 + (f', {x["fallbacks"]} fallbacks' if x.get('fallbacks') else ''))
+        if st not in ('eligible', 'bot'):
+            head += f'; {st}, not attached to a player ({"; ".join(x["eligibility"]["reasons"][:2])})'
+        lines.append(head)
+        for c, y in (x.get('categories') or {}).items():
+            if c == x.get('scored_category'):
+                continue
+            iv = y.get('interval95')
+            lines.append(f'      {c}: {y["correct"]}/{y["answered"]}' + (f' (95% {iv[0]:.0%}-{iv[1]:.0%} of its '
+                                                                          f'generator\'s spots)' if iv else ''))
     return '\n'.join(lines)
 
 

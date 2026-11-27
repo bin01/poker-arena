@@ -14,9 +14,36 @@ const store = {
 const state = { runs: [], run: null, index: [], kinds: {}, labels: {}, timer: null, mind: store.get('mind', false),
   matches: new Map(), view: null, replay: null, page: null, checked: null, showPlay: 0, carry: false,
   autoNext: store.get('autonext', true), mode: store.get('timeline', 'aligned'), listOpen: false, mapOpen: null, metric: store.get('metric', 'vpip'),
-  speed: store.get('speed', 'normal') };
+  speed: store.get('speed', 'normal'), order: store.get('order', 'decided') };
 
-const LIVE_POLL = 6000, SLOW_POLL = 60000;
+const LIVE_POLL = 6000, SLOW_POLL = 60000, PENDING_POLL = 1500, STALE_POLL = 4000;
+
+// ---- ratings: never awaited by navigation or replay ------------------------------------------------
+// The server answers from its cache at once ({cache: {fresh, computed, refreshing}}), or {pending} the first
+// time a run is ever computed. The last answer per run is kept here, so a page renders from it immediately.
+const ratingsStore = new Map();
+async function fetchRatings(run) {
+  const raw = await api('ratings', ['run', run]);
+  if (raw && raw.pending) return null;
+  ratingsStore.set(run, raw);
+  return raw;
+}
+const ratingsUpToDate = raw => !!raw && (!raw.cache || raw.cache.fresh || !!raw.cache.error);
+// Fetch in the background; when the answer is new, re-render the page in place (the replay keeps its step).
+let ratingsTimer = null;
+function ratingsLater(run, delay = 0) {
+  clearTimeout(ratingsTimer);
+  ratingsTimer = setTimeout(async () => {
+    const before = ratingsStore.get(run);
+    let raw = null;
+    try { raw = await fetchRatings(run); } catch (e) { return; }
+    if (state.run !== run) return;
+    if (!raw) { ratingsLater(run, PENDING_POLL); return; }
+    const changed = !before || (before.cache && raw.cache && before.cache.computed !== raw.cache.computed) || (!before.cache !== !raw.cache);
+    if (changed && !state.replay?.playing) route({ soft: true });
+    if (!ratingsUpToDate(raw)) ratingsLater(run, STALE_POLL);
+  }, delay);
+}
 
 // ---- formatting ---------------------------------------------------------------------------------
 const cls = x => x > 0 ? 'pos' : x < 0 ? 'neg' : '';
@@ -123,8 +150,11 @@ async function route(opts = {}) {
   if (fresh && !soft) $app.classList.add('busy');
   let cur;
   try {
-    state.runs = await api('runs');
-    state.checked = new Date();
+    const reuse = opts.nav && state.loadedAt && Date.now() - state.loadedAt < 8000;
+    if (!reuse) {
+      state.runs = await api('runs');
+      state.checked = new Date();
+    }
     if (!state.runs.length) {
       $run.parentElement.hidden = true;
       $app.innerHTML = `<div class="card-box empty"><div class="big-suits">♠ ♥ ♦ ♣</div><h2>No games yet</h2>
@@ -151,7 +181,11 @@ async function route(opts = {}) {
       a.hidden = a.dataset.tab === 'quiz' && !here.quiz;
       a.href = runLink(run, { matches: '/m', quiz: '/q' }[a.dataset.tab] || '');
     });
-    state.index = await api('index', ['run', run]);
+    if (!reuse || state.indexRun !== run) {
+      state.index = await api('index', ['run', run]);
+      state.indexRun = run;
+      state.loadedAt = Date.now();
+    }
     state.labels = {}; state.kinds = {};   // per run: an id can name another model, or level, in another run
     for (const m of state.index) { Object.assign(state.kinds, m.kinds || {}); Object.assign(state.labels, m.labels || {}); }
     sectionCount = 0;
@@ -163,7 +197,7 @@ async function route(opts = {}) {
     } else {
       state.view = null;
       const y = window.scrollY;
-      await renderBoard();
+      await renderBoard(new URLSearchParams(query || ""));
       if (soft) window.scrollTo(0, y);
     }
     cur = state.runs.find(r => r.run === run);
@@ -244,7 +278,7 @@ function historyHead(r, rt) {
 }
 
 function intro(rt) {
-  const all = rt && rt.players.length ? [...rt.players.filter(p => p.in_fit).map(p => p.player), ...rt.roster.map(x => x.player)]
+  const all = rt && rt.cohort ? rt.players.map(p => p.player) : rt && rt.players.length ? [...rt.players.filter(p => p.in_fit).map(p => p.player), ...rt.roster.map(x => x.player)]
     : state.index.flatMap(m => [m.a, m.b]);
   const seen = new Set();
   const ids = all.filter(p => !seen.has(labelText(p)) && seen.add(labelText(p)));
@@ -253,14 +287,13 @@ function intro(rt) {
     `<span class="wp">${monogram(p, 'sm')}${name(p, { effort: true })}</span>`).join('')}</div>` : '';
   const live = state.index.find(m => m.live);
   return `<div class="intro">
-    <p class="lede"><b>AI models play heads-up No-Limit Hold'em against each other.</b> Every deal is played twice with
+    <p class="lede"><b>${ids.length && !models.length ? 'Baseline bots play heads-up No-Limit Hold\'em: the fixed opponents models are measured against.' : 'AI models play heads-up No-Limit Hold\'em against each other.'}</b> Every deal is played twice with
       the seats swapped, which reduces the luck of the cards.</p>
     <a class="cta" href="${live ? matchLink(live.id) : runLink(state.run, '/m')}"><span class="cta-icon">▶</span>${live ? 'Watch the live table' : 'Watch a hand'}</a>${who}</div>`;
 }
 
 const fmtStrength = v => v == null ? '–' : signed(v, 0);
 const ciText = ci => ci ? `${signed(ci[0], 0)} to ${signed(ci[1], 0)}` : '';
-const groupName = i => 'ABCDEFGH'[i] || String(i + 1);
 const pid = x => Core.playerId(x);
 // the interval's basis at the number: "within conversations" is flagged, it leaves out between-conversation spread
 const basisTag = x => {
@@ -268,8 +301,9 @@ const basisTag = x => {
   return b ? `<span class="basis ${b.key}" title="${esc(b.long)}">${esc(b.short)}</span>` : '';
 };
 const chip = (text, tone = '', tip = '') => `<span class="chip ${tone}" ${tip ? `title="${esc(tip)}"` : ''}>${text}</span>`;
-const assumeChip = a => !a ? '' : chip(esc(a.label), a.status === 'unsupported' ? 'warn' : a.status === 'supported' ? 'ok' : 'quiet',
-  a.status === 'unsupported' ? `Outside the range the test was calibrated for${a.detail ? ` (${a.detail})` : ''}: its error rate is not established.`
+const assumeChip = a => !a ? '' : chip(esc(a.label), a.status === 'unsupported' ? 'warn' : a.status === 'supported' || a.status === 'free' ? 'ok' : 'quiet',
+  a.status === 'free' ? 'An anytime-valid test for bounded results: no assumption about the shape of the results, only that conversations (match pairs) are independent.'
+    : a.status === 'unsupported' ? `Outside the range the test was calibrated for${a.detail ? ` (${a.detail})` : ''}: its error rate is not established.`
     : a.status === 'supported' ? `The test's assumptions hold here${a.detail ? ` (${a.detail})` : ''}.` : 'Whether the test\'s assumptions hold here is not checked.');
 const voidReason = (d, reg = state.rt && state.rt.registration) => (reg && reg.status === 'void' && ((reg.reasons || []).join('; ') || 'the code changed after it was registered')) || d && (d.registration_void || (d.registration && (d.registration.status === 'void' || d.registration.void)
   && (d.registration.reason || 'the code changed after it was registered')) || (d.registered === 'void' && (d.void_reason || 'the code changed after it was registered')));
@@ -307,8 +341,9 @@ function outcomeRow(rt, g, multi, first = true) {
   } else if (g.leader) {
     kicker = '<span class="decided-badge">Decided</span>leader';
     tone = 'decided';
-    why = `Decided: it beat ${others} under the planned test. ${g.leader_assumption === 'supported'
-      ? 'The diagnostics passed; the distribution assumptions remain unverified.' : 'Whether the test\'s assumptions hold is not checked.'}`;
+    why = `Decided: it beat ${others} under the planned test. ${g.leader_assumption === 'free'
+      ? 'The test assumes nothing about the shape of the results, only that conversations are independent.'
+      : g.leader_assumption === 'supported' ? 'The diagnostics passed; the distribution assumptions remain unverified.' : 'Whether the test\'s assumptions hold is not checked.'}`;
   } else if (descriptive) {
     kicker = misfit ? 'Ahead on points, head to head' : 'Ahead on points';
     tone = 'points';
@@ -339,7 +374,7 @@ function outcomeRow(rt, g, multi, first = true) {
   const direct = misfit ? directResults(g) : '';
   return `<div class="outcome-row ${tone} ${misfit ? 'has-direct' : ''}">
     ${card}
-    <div class="o-main"><div class="o-kicker">${multi ? `<span class="o-group">Group ${groupName(g.index)}</span>` : ''}${kicker}</div>
+    <div class="o-main"><div class="o-kicker">${multi ? `<span class="o-group">${esc(groupName(g))}</span>` : ''}${kicker}</div>
       ${p && !(misfit && !g.leader && !g.qualified_leader) ? `<div class="o-who">${monogram(who, 'lg')}<div class="o-name">${name(who)}</div></div>` : ''}
       ${misfit && !g.leader && !g.qualified_leader ? '<div class="o-lead">The matchups don\'t line up in one order, so here is each one directly.</div>' : ''}</div>
     ${num}
@@ -398,6 +433,13 @@ function planPanel(rt) {
   if (rt.pooled) test = 'Pooled across runs, each stopped by its own rule, so nothing here is decided: every order and number is <b>ahead on points</b>.';
   else if (v) test = `This run's test plan is void (${esc(v)}), so nothing in it is decided: every order and verdict is <b>ahead on points</b>.`;
   else if (rt.unregistered) test = 'This run was played before its test plan was recorded, so nothing in it is decided: every order and verdict is <b>ahead on points</b>, and any sample size quoted is retrospective.';
+  else if (d.round_deals && officialFree(rt)) {
+    const t = officialFree(rt);
+    test = `Each matchup is checked after every ${d.round_deals} deals, at most ${plural(d.max_rounds, 'time')}${d.min_conversations ? `, never before ${plural(d.min_conversations, 'independent conversation')} (match pairs)` : ''}.
+    The <b>official verdict</b> comes from an anytime-valid sequential test for bounded results${t.name ? ` (${esc(t.name)})` : ''}: at every check, the chance of any wrong verdict across all
+    ${plural(d.n_pairings || rt.pairings.length, 'matchup')} is at most ${Math.round((d.alpha || 0.05) * 100)}%, assuming only that conversations are independent, and nothing about the shape of the results${t.bound != null ? `; each conversation's result is bounded by ±${approx(t.bound)} bb/100` : ''}.
+    The earlier <b>model-based</b> test (whose error rate rests on distribution assumptions) is still shown beside a verdict, labelled secondary; it never decides.`;
+  }
   else if (d.round_deals) test = `Each matchup is checked after every ${d.round_deals} deals, at most ${plural(d.max_rounds, 'time')}${d.min_conversations ? `, never before ${plural(d.min_conversations, 'independent conversation')} (match pairs)` : ''}.
     A matchup is <b>decided</b> when its edge clears a bar set for at most a ${Math.round((d.alpha || 0.05) * 100)}% chance of any wrong verdict across all ${plural(d.n_pairings || rt.pairings.length, 'matchup')},
     <b>under the test's assumptions</b>. Where its diagnostics pass, the verdict says so, but the distribution assumptions behind the error bound remain unverified;
@@ -407,12 +449,14 @@ function planPanel(rt) {
   const summary = rt.pooled ? 'Pooled across runs: described, never decided'
     : v ? 'Test plan void: described, never decided'
     : rt.unregistered ? 'No recorded test plan: described, never decided'
+    : d.round_deals && officialFree(rt) ? `Assumption-free sequential test · ${Math.round((d.alpha || 0.05) * 100)}% error bound if conversations are independent`
     : d.round_deals ? `Planned sequential test · ${Math.round((d.alpha || 0.05) * 100)}% error bound under stated assumptions` : 'How results are decided';
   const notes = (rt.notes || []).map(n => `<li>${esc(n)}</li>`).join('');
   return `<details class="plan-panel" ${open ? 'open' : ''}><summary><span class="pp-title">How this is judged</span><span class="pp-sum">${summary}</span></summary>
     <div class="pp-body">
       <p>${test}</p>
       ${target}
+      ${populationLine(rt) ? `<p class="pop-line">${populationLine(rt)}</p>` : ''}
       <dl>
         <dt>Decided</dt><dd>A result of the planned test above. Only these carry the badge.</dd>
         <dt>Ahead on points</dt><dd>Everything else: the current estimate, recomputed as hands finish. It shows who leads, not who is better.</dd>
@@ -420,7 +464,7 @@ function planPanel(rt) {
           (matchups with more deals weigh more); <b>0</b> is average. Where a matchup disagrees with what the strengths predict, the matchup's own result is the evidence.</dd>
         <dt>95% range</dt><dd><b>across conversations</b>: resamples whole match pairs; <b>within conversations</b>: resamples blocks of deals inside single match pairs,
           so it leaves out how much fresh matches differ, and the real uncertainty is larger.</dd>
-        <dt>Group</dt><dd>Players linked by games. Players in different groups never met, so they are not compared.</dd>
+        <dt>Players who met</dt><dd>Strengths compare only players linked by games; players who never met (for example the baseline bots and a model-only tournament) are shown separately, picked above the results.</dd>
         <dt>Identity</dt><dd><b>model confirmed</b>: the model's own tool reported which model answered, and it is the one asked for; <b>wrong model</b>: it reported
           a different one; <b>model unconfirmed</b>: it reported none, so only the configured name is known.</dd>
         <dt>Fit</dt><dd><b>off the fit</b>: a matchup's result disagrees with what the strengths predict; <b>insufficient evidence to assess fit</b>: too few
@@ -429,6 +473,29 @@ function planPanel(rt) {
       </dl>
       ${notes ? `<div class="pp-notes"><b>Notes from the ratings</b><ul>${notes}</ul></div>` : ''}
     </div></details>`;
+}
+
+// The official test when it is the assumption-free one (from the design, or every decided pairing), else null.
+function officialFree(rt) {
+  const t = Core.testOf(null, rt.design);
+  if (t.free) return t;
+  const ps = rt.pairings.filter(p => p.verdict !== 'descriptive');
+  const ts = ps.map(p => Core.testOf(p, rt.design));
+  return ts.length && ts.every(x => x.free) ? ts[0] : null;
+}
+
+// Which hands a figure covers, in words: verified committed results, or provisional live play.
+function populationLine(rt, what = 'standings') {
+  const pop = Core.populationOf(rt);
+  const rej = pop.rejected ? `; ${plural(pop.rejected, 'hand')} rejected by the verifier ${pop.rejected === 1 ? 'is' : 'are'} left out` : '';
+  if (what === 'stats') {
+    const st = pop.stats;
+    if (st && /commit|verif/i.test(st.kind || st.population || st.label || '')) return `Counts only verified, committed hands${st.hands != null ? ` (${st.hands.toLocaleString()})` : ''}${rej}; hands still being played are left out.`;
+    if (st) return `Counts: ${esc(st.label || st.kind || st.population)}.`;
+    return `Counts every finished hand on record, including hands still waiting for their other play${pop.rejected ? ', and any the verifier rejected' : ''}: these are descriptive, not checked results.`;
+  }
+  const hands = pop.committed ?? (rt.deals ? 2 * rt.deals : null);
+  return hands ? `Counts ${hands.toLocaleString()} verified, committed hands (both plays of each deal replayed and checked)${rej}${pop.provisional ? `; ${plural(pop.provisional, 'live hand')} not counted yet` : ''}.` : '';
 }
 
 // The run's audit in one line: the aside of its folded section.
@@ -496,9 +563,14 @@ function auditSection(rt) {
     { id: 'audit', fold: true });
 }
 
-async function renderBoard() {
+async function renderBoard(query) {
   const r = state.runs.find(x => x.run === state.run);
-  const raw = await api('ratings', ['run', state.run]);
+  let raw = ratingsStore.get(state.run) || null;
+  if (!raw) {
+    try { raw = await fetchRatings(state.run); } catch (e) { raw = null; if (!ratingsStore.has(state.run)) throw e; }
+  } else ratingsLater(state.run);
+  if (!raw) { renderBoardPending(r); ratingsLater(state.run, PENDING_POLL); return; }
+  if (!ratingsUpToDate(raw)) ratingsLater(state.run, STALE_POLL);
   Object.assign(state.labels, raw.labels || {});
   Object.assign(state.kinds, raw.kinds || {});
   const rt = normalize(raw, { pooled: !!r?.all });
@@ -519,8 +591,11 @@ async function renderBoard() {
   }
   state.rt = rt;
   for (const p of rt.players) if (p.kind) state.kinds[p.player] = p.kind;
-  let html = runHead(r, rt) + intro(rt);
-  const waiting = rt.roster.filter(x => !rt.players.some(p => p.player === x.player));
+  const all = Core.cohorts(rt, { label: labelText, kind: p => state.kinds[p] });
+  const cohort = all.length > 1 ? all.find(c => c.key === query?.get('c')) || all[0] : null;
+  const view = cohort ? cohortView(rt, cohort) : rt;
+  let html = runHead(r, rt) + staleNote(raw) + intro(view) + (cohort ? cohortBar(all, cohort) : '');
+  const waiting = cohort && cohort !== all[0] ? [] : rt.roster.filter(x => !rt.players.some(p => p.player === x.player));
   if (!rt.players.length) {
     html += `<div class="card-box empty"><div class="big-suits">♠ ♥ ♦ ♣</div><h2>The cards are in the air</h2>
       <p>A deal counts once both of its plays are finished. ${state.index.some(m => m.started) ? `Watch the first ones on the <a href="${runLink(state.run, '/m')}"><u>games</u></a> page.` : ''}</p>
@@ -529,19 +604,25 @@ async function renderBoard() {
     bindBoard();
     return;
   }
-  html += outcomes(rt);
+  html += outcomes(view);
+  html += referenceSection(view, rt);
   html += `<div class="under-outcome">${planPanel(rt)}</div>`;
-  html += standings(rt, waiting);
-  html += pairingsSection(rt);
+  html += standings(view, waiting);
+  html += pairingsSection(view);
   if (r?.quiz) html += await quizTeaser();
   html += `<div class="deep-head"><span>More detail</span><small>the full grid, play style and audit, folded away</small></div>`;
-  html += headToHead(rt);
-  html += styleTable(rt);
+  html += headToHead(view);
+  html += styleTable(view);
   html += auditSection(rt);
   $app.innerHTML = html;
   bindBoard();
 }
 function bindBoard() {
+  $app.querySelectorAll('[data-order]').forEach(b => b.onclick = () => {
+    state.order = b.dataset.order;
+    store.set('order', state.order);
+    route({ soft: true });
+  });
   $app.querySelector('.plan-panel')?.addEventListener('toggle', e => store.set('plan-open', e.target.open));
   $app.querySelectorAll('details.fold[data-fold]').forEach(d => d.addEventListener('toggle', () => store.set('fold.' + d.dataset.fold, d.open)));
   $app.querySelectorAll('.th-def').forEach(b => b.onclick = () => {
@@ -558,6 +639,93 @@ function bindBoard() {
   });
 }
 
+// Before a run's ratings exist (the first visit after it is played), the page still shows the run, the players
+// and the raw score of each matchup at once, clearly unchecked, and fills in when the ratings arrive.
+function renderBoardPending(r) {
+  const none = { roster: [], design: null, players: [], runs: [] };
+  const pairs = pairingsOf(state.index).filter(P => P.deals).sort((x, y) => Math.abs(y.netA / y.deals) - Math.abs(x.netA / x.deals));
+  const rows = pairs.map(P => {
+    const up = P.netA >= 0, lead = up ? P.a : P.b, trail = up ? P.b : P.a;
+    const rate = Math.abs(P.netA) / (2 * P.deals) * 100;
+    return `<a class="pend-row" href="${matchLink(P.latest.id)}">${monogram(lead, 'sm')}<span class="dr-n">${short3(lead)}</span><i>${P.netA ? 'ahead of' : 'level with'}</i>
+      <span class="dr-n">${short3(trail)}</span><b>${trim(Math.round(rate))}<small> bb/100</small></b><small class="soft">${plural(P.deals, 'deal')}</small></a>`;
+  }).join('');
+  $app.innerHTML = runHead(r, none) + intro(null) + `<div class="card-box pending-board" aria-live="polite">
+    <div class="deal-in-suits" aria-hidden="true"><span>♠</span><span class="red">♥</span><span class="red">♦</span><span>♣</span></div>
+    <h2>Checking every hand and working out the standings</h2>
+    <p>Each hand is replayed from its seed and checked before it counts. For a big run that takes a few seconds the first time; this page fills in by itself. Meanwhile, the raw chip score of each matchup (unchecked, and not a verdict):</p>
+    ${rows ? `<div class="pend-list">${rows}</div>` : ''}
+    <a class="cta" href="${runLink(state.run, '/m')}"><span class="cta-icon">▶</span>Watch the hands meanwhile</a></div>`;
+}
+
+const staleNote = raw => raw && raw.cache && raw.cache.error
+  ? `<div class="stale-note bad" role="status">These standings are from ${raw.cache.computed ? ago(raw.cache.computed) : 'an earlier check'}: working them out again failed (${esc(raw.cache.error)}), so they may miss recent hands.</div>`
+  : raw && raw.cache && !raw.cache.fresh
+  ? `<div class="stale-note" aria-live="polite"><span class="spin" aria-hidden="true">♣</span>${raw.cache.reason === 'code' ? 'The arena\'s code changed since these standings were worked out' : 'New hands have finished since these standings were worked out'}${raw.cache.computed ? ` (${ago(raw.cache.computed)})` : ''}: updating in the background.</div>` : '';
+
+// A cohort: the players of one group (who all met each other), or the earlier variants left out of the fit.
+function cohortView(rt, c) {
+  const set = new Set(c.group ? c.group.players : c.members);
+  if (c.kind === 'history') return { ...rt, groups: [], players: rt.players.filter(p => set.has(p.player)), pairings: rt.pairings.filter(p => set.has(p.a) || set.has(p.b)), cohort: c };
+  return { ...rt, groups: [c.group], players: rt.players.filter(p => set.has(p.player) && p.in_fit), pairings: c.group.pairings, cohort: c };
+}
+function cohortBar(all, cur) {
+  const link = c => runLink(state.run, c === all[0] ? '' : `?c=${c.key}`);
+  const chip = c => {
+    const n = Core.cohortName(c, labelText);
+    const count = c.kind === 'history' ? plural(c.members.length, 'player') : `${plural(c.members.length, 'player')} · ${plural(c.deals, 'deal')}`;
+    return `<a role="tab" class="cohort ${c === cur ? 'on' : ''} k-${c.kind}" aria-selected="${c === cur}" href="${link(c)}" title="${esc(n.title)}">
+      <span class="cb-mono">${c.members.slice(0, 4).map(p => monogram(p, 'xs')).join('')}</span>
+      <span class="cb-t">${esc(c === all[0] && c.kind !== 'bots' ? n.title : n.short)}</span><small>${esc([n.sub, count].filter(Boolean).join(' · '))}</small></a>`;
+  };
+  return `<div class="cohort-bar"><span class="cb-k">${all[0].kind === 'models' && cur === all[0] ? 'Current models' : 'Players'}<small>who played each other</small></span>
+    <div class="cohorts" role="tablist" aria-label="Which players">${all.map(chip).join('')}</div></div>`;
+}
+const groupName = g => {
+  const c = Core.cohorts({ groups: [g], players: [] }, { label: labelText, kind: p => state.kinds[p] })[0];
+  return c ? Core.cohortName(c, labelText).short : '';
+};
+
+// The fixed yardstick: each player's result against the versioned reference bot, and what the reference is
+// and is not. Its own record against the baselines comes from this run's matchups.
+const REF_LIMITS = 'A fixed, versioned heuristic: tight-aggressive, position-aware, equity and pot-odds based, with a fixed bluff frequency. It is not a solver and does not adapt, so beating it shows sound play against a simple fixed policy, not optimal play.';
+function referenceSection(view, rt) {
+  const ref = rt.players.map(p => p.player).find(isReference) || Object.keys(state.kinds).find(isReference);
+  const vs = view.players.filter(p => p.vs_reference && !isReference(p.player));
+  const models = view.players.filter(p => !isBot(p.player));
+  if (!vs.length) {
+    if (!models.length || view.cohort?.kind === 'history') return '';
+    return `<div class="ref-none card-box"><span class="suit">♣</span><div><b>No fixed yardstick in this group.</b> These strengths compare these models only with each other.
+      To say how good they are at poker, add the reference bot (<code>bot = "reference"</code>) to the plan; the fundamentals quiz measures that separately.</div></div>`;
+  }
+  const info = rt.reference && typeof rt.reference === 'object' ? rt.reference : {};
+  const pairOf = (x, y) => rt.pairings.find(q => (q.a === x && q.b === y) || (q.a === y && q.b === x));
+  const ax = axisFor(vs.map(p => ({ strength: p.vs_reference.edge, strength_ci95: p.vs_reference.ci95 })));
+  const rows = [...vs].sort((x, y) => (isBot(x.player) - isBot(y.player)) || (y.vs_reference.edge ?? 0) - (x.vs_reference.edge ?? 0)).map(p => {
+    const v = p.vs_reference, ci = v.ci95;
+    const pr = pairOf(p.player, v.reference || ref);
+    const vd = pr ? verdict(pr, plain) : null;
+    const full = pr ? matchupId(pr) : null;
+    return `<div class="prow ref-row ${isBot(p.player) ? 'bot' : 'model'}">${player(p.player, '', { details: false })}
+      <div class="edge"><b class="${cls(v.edge)}">${signed(v.edge, 0)}</b><small>bb/100${ci ? ` · ${ciText(ci)}` : ''}</small></div>
+      <div class="edge-bar"><div class="whisker"><span class="zero"></span>${ci ? `<span class="range" style="left:${ax.x(ci[0])};width:calc(${ax.x(ci[1])} - ${ax.x(ci[0])})"></span>` : ''}
+        <span class="point ${v.edge > 0 ? 'pos' : ''}" style="left:${ax.x(v.edge)}"></span></div></div>
+      <div class="vcell">${vd ? verdictCell(pr, vd, { compact: true }) : ''}<small>${plural(v.deals || pr?.deals || 0, 'deal')}</small></div>
+      ${full ? `<a class="watch" href="${matchLink(full)}">Watch ›</a>` : '<span></span>'}</div>`;
+  }).join('');
+  const record = rt.pairings.filter(q => (q.a === ref || q.b === ref) && q.deals).map(q => {
+    const other = q.a === ref ? q.b : q.a, e = q.a === ref ? q.edge : -q.edge;
+    return `${short3(other)} ${signed(e, 0)}`;
+  });
+  const limits = [].concat(info.limits || []).map(esc);
+  const results = Array.isArray(info.results) ? info.results.map(x => `${short3(x.opponent || x.player)} ${signed(x.edge, 0)}`) : record;
+  return section('Against the reference bot', 'the fixed yardstick: bb/100 won against it, so above 0 beats it',
+    `<div class="ref-list">${rows}</div>`,
+    `<b>What the reference is.</b> ${esc(info.description || REF_LIMITS)}${limits.length ? ` Limits: ${limits.join('; ')}.` : ''}
+     ${results.length ? `<br><b>Its own record${info.results ? '' : ' in this run'}:</b> ${results.join(' · ')} bb/100 (its edge over each).` : ''}
+     ${info.version ? ` Version ${esc(info.version)}.` : ''}`, { id: 'reference' });
+}
+
 function axisFor(players) {
   const vals = players.flatMap(p => [p.strength, ...(p.strength_ci95 || [])]).filter(v => v != null && isFinite(v));
   const m = Math.max(10, ...vals.map(Math.abs));
@@ -572,26 +740,39 @@ function standings(rt, waiting) {
   let out = '';
   const shown = rt.groups.filter(g => g.members.length);
   shown.forEach((g, k) => {
-    const ps = g.members.map(p => by[p]).sort((x, y) => (y.strength ?? -1e9) - (x.strength ?? -1e9));
-    const ax = axisFor(ps);
-    const ranked = ps.some(p => p.rank_kind === 'decided' && p.rank != null);
-    const rows = ps.map(p => standingRow(rt, g, p, ax, ranked)).join('');
+    const members = g.members.map(p => by[p]).filter(Boolean);
+    const blocks = Core.standingBlocks(members);
+    const ranked = blocks.some(b => b.kind === 'decided');
+    const points = !ranked || state.order === 'points';
+    const ax = axisFor(members);
+    const range = b => !b.range ? '–' : b.range[0] === b.range[1] ? String(b.range[0]) : `${b.range[0]}–${b.range[1]}`;
+    const rows = points
+      ? Core.standingBlocks(members.map(p => ({ ...p, rank_kind: 'descriptive' })))[0].players.map(p => standingRow(rt, g, by[p.player], ax, ranked)).join('')
+      : blocks.map(b => b.kind === 'decided' ? b.players.map(p => standingRow(rt, g, p, ax, true)).join('')
+        : `<div class="unres" role="group" aria-label="Order not decided"><div class="unres-head"><span class="rank prov">${range(b)}</span>
+            <span>${b.range ? `Places ${range(b)}: ` : ''}the order of these ${b.players.length === 2 ? 'two' : b.players.length} is <b>not decided</b> · listed by points</span></div>
+            ${b.players.map(p => standingRow(rt, g, p, ax, true, true)).join('')}</div>`).join('');
     const extra = k === shown.length - 1 ? waitingRows(waiting, ranked) : '';
-    const title = multi ? `Group ${groupName(g.index)}` : ranked ? 'Standings' : 'Order on points';
-    const aside = ranked ? 'a numeral is a decided rank; the rest are on points' : 'provisional: no rank here is decided';
+    const title = multi ? groupName(g) : ranked ? 'Standings' : 'Order on points';
+    const control = ranked ? `<div class="order-bar" role="group" aria-label="Order"><span>Order</span>
+        <button class="toggle" data-order="decided" aria-pressed="${!points}" title="Decided ranks first; players whose order is not decided are grouped">Decided</button>
+        <button class="toggle" data-order="points" aria-pressed="${points}" title="Everyone by fitted strength: descriptive, not a ranking">By points</button></div>` : '';
+    const aside = !ranked ? 'provisional: no rank here is decided'
+      : points ? 'sorted by points (descriptive); a numeral is a decided rank'
+      : 'decided ranks first; the rest grouped where their order is not decided';
     const misfit = g.misfits ? ` <span class="flag" title="Some matchups disagree with what these strengths predict; see Matchups">${g.misfits} off the fit</span>` : '';
-    out += section(title, `${multi ? `${plural(ps.length, 'player')} who played each other · ` : ''}${aside}${multi ? '' : ` · ${plural(rt.deals, 'duplicate deal')}`}${misfit}`,
-      `<div class="board-list ${ranked ? '' : 'unranked'}"><div class="board-head">${ranked ? '<span title="Decided rank"><span class="hide-xs">Rank</span><span class="show-xs">#</span></span>' : ''}<span>${ranked ? 'Player' : 'Player, by points'}</span>
+    out += section(title, `${aside}${multi ? '' : ` · ${plural(rt.deals, 'duplicate deal')}`}${misfit}`,
+      `${control}<div class="board-list ${ranked ? '' : 'unranked'}"><div class="board-head">${ranked ? '<span title="Decided rank"><span class="hide-xs">Rank</span><span class="show-xs">#</span></span>' : ''}<span>${ranked ? 'Player' : 'Player, by points'}</span>
          <span class="r" title="Big blinds won per 100 hands against the average opponent in this group">Strength</span>
          <span class="axis-head"><span>${signed(-ax.lim, 0)}</span><span>0</span><span>${signed(ax.lim, 0)}</span></span>
          <span class="r hide-sm">Net</span><span class="r hide-sm" title="Share of 10-deal sessions won (secondary; not used to rank)">Sessions</span></div>
        ${rows}${extra}</div>`,
-      multi && k === 0 ? 'No games connect these groups, so each is ordered on its own.' : '');
+      points && ranked ? 'Sorted by fitted strength, which describes results and decides nothing: a numeral is a rank the matchups decided.' : '');
   });
   if (!out && waiting.length) out = section('Standings', '', `<div class="board-list unranked">${waitingRows(waiting, false)}</div>`);
   const out_ = rt.players.filter(p => !p.in_fit);
   if (out_.length) {
-    out += section('Not in the standings', 'played, but left out of the fit', `<div class="board-list unranked left-out">${out_.map(p => `<div class="brow quarantined">
+    out += section(rt.cohort?.kind === 'history' ? 'Earlier variants' : 'Not in the standings', 'played, but left out of the fit', `<div class="board-list unranked left-out">${out_.map(p => `<div class="brow quarantined">
       ${player(p.player, `<div class="small soft why-out">${esc(p.unrated_reason || p.quarantine_reason || 'none of its opponents is rated')}</div>`)}
       <span class="r strength soft">${p.hands ? `<small>${plural(p.hands, 'hand')}</small>` : ''}</span><span class="axis"></span>
       <span class="r hide-sm soft">${p.net_bb != null ? signed(p.net_bb, 0) + ' bb' : ''}</span><span class="hide-sm"></span></div>`).join('')}</div>`,
@@ -611,7 +792,7 @@ function identityFlag(rt, p) {
   return `<span class="flag ${st === 'mismatch' ? 'bad' : 'quiet'}" title="${esc(tip)}">${esc(Core.IDENTITY[st])}</span>`;
 }
 
-function standingRow(rt, g, p, ax, ranked) {
+function standingRow(rt, g, p, ax, ranked, inBlock = false) {
   const ci = p.strength_ci95;
   const decided = p.rank_kind === 'decided' && p.rank != null;
   const tied = (p.rank_tied_with || []).filter(x => x !== p.player && g.members.includes(x));
@@ -619,7 +800,7 @@ function standingRow(rt, g, p, ax, ranked) {
   if (!p.identity_resolved) notes.push(`<span class="flag" title="${esc(p.quarantine_reason || '')}">identity unresolved</span>`);
   const idf = identityFlag(rt, p);
   if (idf) notes.push(idf);
-  if (tied.length && tied.length < g.members.length - 1) notes.push(`<span class="small soft">difference with ${tied.map(plain).join(', ')} unresolved</span>`);
+  if (!inBlock && tied.length && tied.length < g.members.length - 1) notes.push(`<span class="small soft">difference with ${tied.map(plain).join(', ')} unresolved</span>`);
   const mob = `<div class="mob-line small soft">${p.net_bb != null ? `<span class="${cls(p.net_bb)}">${signed(p.net_bb, 0)} bb</span> · ` : ''}${plural(p.hands || 0, 'hand')}</div>`;
   const leader = g.leader === p.player;
   const b = Core.basisOf(p);
@@ -630,7 +811,7 @@ function standingRow(rt, g, p, ax, ranked) {
       <small>Elo ${p.session_elo}${p.session_elo_ci95 ? ` · ${p.session_elo_ci95[0]}–${p.session_elo_ci95[1]}` : ''}</small>` : '';
   const half = ci ? Math.round((ci[1] - ci[0]) / 2) : null;
   return `<div class="brow ${leader ? 'lead' : ''}">
-    ${ranked ? `<span class="rank ${decided ? 'sep' : 'prov'}" title="${decided ? 'Rank decided by the matchups' : 'Not decided: placed on points only'}">${decided ? p.rank : '–'}</span>` : ''}
+    ${ranked ? `<span class="rank ${decided ? 'sep' : 'prov'}" title="${decided ? 'Rank decided by the matchups' : 'Not decided: placed on points only'}">${decided ? p.rank : inBlock ? '' : '–'}</span>` : ''}
     ${player(p.player, `${notes.length ? `<div class="row-notes">${notes.join(' ')}</div>` : ''}${mob}`)}
     <span class="r strength"><b>${fmtStrength(p.strength)}</b>${ci ? `<small title="${b ? esc(b.long) : '95% range'}">±${half}${b && b.key !== 'across' ? `<i class="basis-mark ${b.key}">${b.key === 'within' ? ' within conv.' : ' partly within'}</i>` : ''}</small>` : '<small>no range yet</small>'}</span>
     <span class="axis">${whisker}</span>
@@ -661,6 +842,8 @@ function verdictCell(p, v, { compact = false } = {}) {
   bits.push(`<span class="verdict ${v.tone}" title="${esc(v.long)}">${esc(v.short)}</span>`);
   if (v.decided) bits.push(assumeChip(p.assumption));
   if (!compact && src) bits.push(chip(src.short, src.kind === 'official' ? 'ok' : 'quiet', src.text));
+  if (v.secondary && !compact) bits.push(chip(`model-based: ${esc(v.secondary.short.toLowerCase())}`, 'quiet secondary',
+    'The older model-based test (a t / sign-flip gate whose error rate rests on distribution assumptions). Shown for comparison only: it never decides.'));
   return bits.join('');
 }
 
@@ -724,7 +907,7 @@ function headToHead(rt) {
   const multi = rt.groups.filter(g => g.ranked.length).length > 1;
   const legend = ns => `<div class="mx-legend">${ns.map(n => `<span>${monogram(n, 'xs')}${short(n)}</span>`).join('')}</div>`;
   const tables = rt.groups.map(g => g.ranked.filter(p => paired.has(p))).filter(ns => ns.length >= 3)
-    .map((ns, i, all) => `${all.length > 1 || multi ? `<div class="mx-group">Group ${groupName(rt.groups.findIndex(g => g.ranked.includes(ns[0])))}</div>` : ''}<div class="mx-wrap">${matrix(ns)}</div>${legend(ns)}`);
+    .map((ns, i, all) => `${all.length > 1 || multi ? `<div class="mx-group">${esc(groupName(rt.groups.find(g => g.ranked.includes(ns[0]))))}</div>` : ''}<div class="mx-wrap">${matrix(ns)}</div>${legend(ns)}`);
   if (!tables.length) return '';
   const descriptive = rt.pooled || rt.unregistered;
   const anyOutside = rt.pairings.some(p => Core.isDecided(p) && p.assumption && p.assumption.status === 'unsupported');
@@ -778,7 +961,7 @@ function styleTable(rt) {
   const byOpp = splitOf('by_opponent', o => `<span class="soft small">vs</span> ${player(o, '', { details: false })}`);
   return section('How they play', 'tendencies, not quality', pick + `<div class="scroll">${table(rows)}</div>`,
     `<span class="def-line" aria-live="polite">Tap a column name for what it counts.</span> Each figure is how often it did something, with the count out of its chances beneath.
-    These describe style, pooled over opponents and seats; they do not say who plays better. Rows under 100 hands are dimmed.`,
+    These describe style, pooled over opponents and seats; they do not say who plays better. Rows under 100 hands are dimmed. <b>${populationLine(rt, 'stats')}</b>`,
     { id: 'style', fold: true, after: block('Split by seat: on the button or in the big blind', bySeat) + block('Split by opponent', byOpp) });
 }
 
@@ -793,10 +976,26 @@ const answerText = (a, bb) => {
 };
 const answerKey = a => (typeof a === 'string' ? a : a && a.action) || null;
 const lostOf = a => a ? a.ev_lost_bb ?? a.ev_loss_bb ?? a.regret_bb ?? null : null;
-const KIND_WORD = { pot_odds: 'pot odds', all_in: 'all-in call', shove: 'shove or fold', equity: 'equity', bluff_catch: 'bluff catcher' };
+const KIND_WORD = { pot_odds: 'pot odds', all_in: 'all-in call', shove: 'shove or fold', equity: 'equity', bluff_catch: 'bluff catcher',
+  close_ev: 'close EV', multi_street: 'multi-street line', range: 'range reading', range_inference: 'range reading', sizing: 'bet sizing' };
+const catWord = k => KIND_WORD[k] || String(k).replace(/_/g, ' ');
+const PROV = {
+  eligible: ['ok', 'provenance checked', 'The answers kept their raw output, the model that answered matches the one asked for, and the protocol, code and CLI versions are recorded.'],
+  ineligible: ['bad', 'ineligible', 'This score fails the provenance check, so it is shown but not counted.'],
+  unrecorded: ['warn', 'provenance not recorded', 'This quiz run did not keep the evidence needed to check the score (raw output, which model answered, protocol, code and CLI versions): read it as unverified.'],
+};
+const provChip = x => {
+  const pv = x.provenance;
+  if (!pv || pv.status === 'bot' || !PROV[pv.status]) return '';
+  const [tone, word, tip] = PROV[pv.status];
+  const more = [pv.reasons.join('; '), pv.identity ? `identity ${pv.identity}` : '', pv.facts.join(' · ')].filter(Boolean).join(' · ');
+  return chip(word, tone, tip + (more ? ` (${more})` : ''));
+};
 
+const quizStore = new Map();
 async function loadQuiz() {
-  const raw = await api('quiz', ['run', state.run]);
+  const raw = quizStore.get(state.run) || await api('quiz', ['run', state.run]);
+  quizStore.set(state.run, raw);
   Object.assign(state.labels, raw.labels || {});
   Object.assign(state.kinds, raw.kinds || {});
   return Core.quizOf(raw);
@@ -809,10 +1008,10 @@ async function quizTeaser() {
   if (!q || !q.players.length) return '';
   const models = q.players.filter(x => !x.reference);
   const ref = q.players.find(x => x.reference);
-  const scores = models.map(x => `<b>${plain(x.player)}</b> ${x.correct ?? '–'}/${x.total ?? '–'}`).join(' · ');
+  const scores = models.map(x => `<b>${plain(x.player)}</b> ${x.correct ?? '–'}/${x.total ?? '–'}${x.fallbacks ? ` (${plural(x.fallbacks, 'fallback')})` : ''}${x.provenance?.status === 'unrecorded' ? '<span class="soft"> (unverified)</span>' : x.provenance?.status === 'ineligible' ? '<span class="neg"> ineligible</span>' : ''}`).join(' · ');
   const ceiling = models.length > 1 && models.filter(x => x.correct === x.total).length >= 2;
   return `<a class="quiz-teaser card-box" href="${quizLink()}"><span class="qt-k">Poker fundamentals</span>
-    <span class="qt-body">A separate quiz of ${plural(q.spots.length, 'textbook spot')} with worked-out answers: ${scores}${ref ? ` · ${plain(ref.player)} (reference) ${ref.correct ?? '–'}/${ref.total ?? '–'}` : ''}${ceiling ? '<span class="soft"> · several perfect scores: these spots are too easy to separate these models</span>' : ''}</span>
+    <span class="qt-body">A separate quiz of ${plural(q.spots.length, 'spot')}${q.categories.length > 1 ? ` in ${plural(q.categories.length, 'category', 'categories')}` : ''} with worked-out answers: ${scores}${ref ? ` · ${plain(ref.player)} (reference) ${ref.correct ?? '–'}/${ref.total ?? '–'}` : ''}${ceiling ? '<span class="soft"> · several perfect scores: these spots are too easy to separate these models</span>' : ''}</span>
     <span class="al-go">See every spot ›</span></a>`;
 }
 
@@ -834,28 +1033,47 @@ function quizScores(q) {
   const maxLost = Math.max(1e-9, ...q.players.map(x => x.ev_lost_bb || 0));
   const rows = q.players.map(x => {
     const share = x.score != null ? x.score : 0;
-    return `<div class="qrow ${x.reference ? 'ref' : ''}">${player(x.player, '', { details: false })}
-      <span class="q-score"><b>${x.correct ?? '–'}</b><small>/${x.total ?? '–'} right</small></span>
+    const valid = x.valid != null && x.total ? `<small class="q-valid" title="Right out of the answers that were valid: a fallback (no valid answer after every retry) is never counted right">${x.valid_accuracy != null ? `${Math.round(x.valid_accuracy * 100)}% of ${plural(x.valid, 'valid answer')}` : 'no valid answers'}${x.fallbacks ? ` · <b class="neg">${plural(x.fallbacks, 'fallback')}, no credit</b>` : ''}</small>` : '';
+    return `<div class="qrow ${x.reference ? 'ref' : ''}">${player(x.player, `<div class="q-prov">${provChip(x)}</div>`, { details: false })}
+      <span class="q-score"><b>${x.correct ?? '–'}</b><small>/${x.total ?? '–'} right</small>${valid}</span>
       <span class="q-bar" title="${Math.round(share * 100)}% right"><span style="width:${(share * 100).toFixed(1)}%"></span></span>
       <span class="q-lost" title="Expected big blinds given up against the best answer, added over every spot">${x.ev_lost_bb != null
         ? `<b class="${x.ev_lost_bb > 0 ? 'neg' : ''}">${trim(Math.round(x.ev_lost_bb * 10) / 10)}</b><small> bb lost</small><span class="q-lostbar"><span style="width:${(100 * (x.ev_lost_bb || 0) / maxLost).toFixed(1)}%"></span></span>` : '<span class="dim">–</span>'}</span></div>`;
   }).join('');
   const ref = q.players.filter(x => x.reference);
-  const caption = `Right: the share of spots answered with the best action. Bb lost: the expected big blinds given up against the best answer,
-    added over every spot, so a near miss costs little and a big blunder costs a lot.${ref.length ? ` <b>${ref.map(x => plain(x.player)).join(', ')}</b> is a fixed, versioned
-    reference policy (solid, position-aware, pot-odds based): the yardstick. A model below it misses spots a simple rule gets right.` : ''}`;
-  return section('Scores', 'fewer bb lost is better', `<div class="qlist">${rows}</div>`, caption);
+  const caption = `Right: spots answered with the best action, out of all spots; a fallback (no valid answer after every retry, so the game folded or checked for it)
+    never counts as right, even where folding happened to be best. Beneath it, the share right among valid answers only. Bb lost: the expected big blinds given up against
+    the best answer, added over every spot.${ref.length ? ` <b>${ref.map(x => plain(x.player)).join(', ')}</b> is a fixed, versioned
+    reference policy (solid, position-aware, pot-odds based): the yardstick. A model below it misses spots a simple rule gets right.` : ''}
+    ${q.population || q.estimand ? ` Population: ${esc(q.population || q.estimand)}.` : ' These are counts on this fixed set of spots, not estimates for poker in general, so no error ranges are given.'}`;
+  return section('Scores', 'fewer bb lost is better', `<div class="qlist">${rows}</div>`, caption) + quizCategories(q);
+}
+
+// Per category: each player's right answers out of the category's spots, fallbacks marked.
+function quizCategories(q) {
+  if (q.categories.length < 2) return '';
+  const count = c => q.spots.filter(s => (s.category || s.kind || 'other') === c).length;
+  const head = `<thead><tr><th>Player</th>${q.categories.map(c => `<th class="num" title="${plural(count(c), 'spot')}">${esc(catWord(c))}<small class="nof">${count(c)}</small></th>`).join('')}</tr></thead>`;
+  const rows = q.players.map(x => `<tr><td class="who-cell">${player(x.player, '', { details: false })}</td>${q.categories.map(c => {
+    const k = (x.by_category || {})[c];
+    if (!k || !k.total) return '<td class="num"><span class="dim">–</span></td>';
+    const r = (k.correct ?? 0) / k.total;
+    return `<td class="num qcat ${r === 1 ? 'full' : r < 0.5 ? 'low' : ''}">${k.correct ?? 0}<small class="nof">/${k.total}${k.fallbacks ? ` · ${k.fallbacks} fb` : ''}</small></td>`;
+  }).join('')}</tr>`).join('');
+  return section('By category', 'harder categories separate players that the easy ones cannot', `<div class="scroll"><table class="style-t qcat-t">${head}<tbody>${rows}</tbody></table></div>`,
+    'Right answers out of the category\'s spots; fb: fallbacks, which never count as right.');
 }
 
 function quizSpots(q) {
   const rows = q.spots.map(s => {
     const marks = q.players.map(x => {
       const a = x.answers[s.id];
-      const ok = a ? a.correct ?? (answerKey(a) === answerKey(s.best)) : null;
-      return `<span class="qmark ${ok == null ? 'none' : ok ? 'ok' : 'bad'}" title="${plain(x.player)}: ${a ? esc(answerText(a, s.bb)) : 'no answer'}${ok == null ? '' : ok ? ' (best)' : ' (not best)'}">${monogram(x.player, 'xs')}<i>${ok == null ? '·' : ok ? '✓' : '✗'}</i></span>`;
+      const fb = Core.isFallback(a);
+      const ok = !a ? null : fb ? false : a.correct ?? (answerKey(a) === answerKey(s.best));
+      return `<span class="qmark ${ok == null ? 'none' : fb ? 'fb' : ok ? 'ok' : 'bad'}" title="${plain(x.player)}: ${a ? esc(answerText(a, s.bb)) : 'no answer'}${fb ? ' (fallback: no valid answer, no credit)' : ok == null ? '' : ok ? ' (best)' : ' (not best)'}">${monogram(x.player, 'xs')}<i>${ok == null ? '·' : fb ? '!' : ok ? '✓' : '✗'}</i></span>`;
     }).join('');
     return `<a class="spot-row" href="${quizLink(s.id)}"><span class="sp-cards">${PokerTable.cards(s.hole || [], 2, 'sm')}</span>
-      <span class="sp-main"><b>${esc(s.title || s.id)}</b><small>${esc(KIND_WORD[s.kind] || (s.kind || '').replace(/_/g, ' '))}${s.street ? ` · ${esc(s.street)}` : ''} · best: ${esc(answerText(s.best, s.bb))}</small></span>
+      <span class="sp-main"><b>${esc(s.title || s.id)}</b><small>${esc(catWord(s.category || s.kind || ''))}${s.variant != null ? ` · variant ${esc(s.variant)}` : ''}${s.street ? ` · ${esc(s.street)}` : ''} · best: ${esc(answerText(s.best, s.bb))}</small></span>
       <span class="sp-marks">${marks}</span><span class="al-go">›</span></a>`;
   }).join('');
   return section('Spots', 'open one to see the table, the answer and every player\'s choice', `<div class="spot-list">${rows}</div>`);
@@ -877,12 +1095,13 @@ function spotView(q, s) {
   ].filter(Boolean).map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
   const answers = q.players.map(x => {
     const a = x.answers[s.id];
-    const ok = a ? a.correct ?? (answerKey(a) === answerKey(s.best)) : null;
+    const fb = Core.isFallback(a);
+    const ok = !a ? null : fb ? false : a.correct ?? (answerKey(a) === answerKey(s.best));
     const lost = lostOf(a);
     const why = a && (a.reasoning || a.say) ? `<details class="q-why"><summary>why?</summary><div>${esc(a.reasoning || a.say)}</div></details>` : '';
     return `<div class="qans ${ok == null ? '' : ok ? 'ok' : 'bad'} ${x.reference ? 'ref' : ''}">${player(x.player, '', { details: false })}
       <span class="qa-act">${a ? esc(answerText(a, bb)) : '<span class="dim">no answer</span>'}</span>
-      <span class="qa-ok">${ok == null ? '' : ok ? '✓ best' : '✗ not best'}</span>
+      <span class="qa-ok">${ok == null ? '' : fb ? `<span title="No valid answer after every retry, so the game played a fallback for it: never credited${a.credited ? ', though the fallback happened to be the best action' : ''}">! fallback, no credit</span>` : ok ? '✓ best' : '✗ not best'}</span>
       <span class="qa-lost">${lost != null ? (lost > 0 ? `<b class="neg">${trim(Math.round(lost * 10) / 10)}</b> bb lost` : '0 bb lost') : ''}</span>${why}</div>`;
   }).join('');
   return `<div class="spot-nav"><a href="${quizLink()}">‹ All spots</a><span>Spot ${i + 1} of ${q.spots.length}</span>
@@ -966,14 +1185,15 @@ function matchNav(P, cur, rt) {
   return `<div class="pgroup ${active ? 'active' : ''} ${P.started.length ? '' : 'planned'}">${head}${rounds}</div>`;
 }
 
-async function ratingsForRun() {
+// The replay never waits for the ratings: it shows the last ones known and asks for news in the background.
+function ratingsForRun() {
   if (state.run === '*') return null;
-  try {
-    const raw = await api('ratings', ['run', state.run]);
-    const rt = normalize(raw);
-    rt.audit = raw.run_audit || null;
-    return rt;
-  } catch (e) { return null; }
+  const raw = ratingsStore.get(state.run);
+  if (!raw || !ratingsUpToDate(raw)) ratingsLater(state.run);
+  if (!raw) return null;
+  const rt = normalize(raw);
+  rt.audit = raw.run_audit || null;
+  return rt;
 }
 
 async function renderMatches(id, params, soft) {
@@ -989,7 +1209,7 @@ async function renderMatches(id, params, soft) {
   }
   cur = cur || started.find(m => m.live) || started[0] || state.index[0];
   Object.assign(state.labels, cur.labels || {});
-  const rt = await ratingsForRun();
+  const rt = ratingsForRun();
   const pairs = pairingsOf(state.index);
   const groups = [['Playing now', pairs.filter(P => P.live)], ['Played', pairs.filter(P => !P.live && P.started.length)],
     ['Not started', pairs.filter(P => !P.started.length)]];
@@ -1039,7 +1259,7 @@ async function renderMatches(id, params, soft) {
 function go(cur, k) {
   if (!state.view || k < 0 || k >= state.view.total || !state.view.played.has(k)) return;
   history.replaceState(null, '', matchLink(cur.id, k));
-  route();
+  route({ nav: true });
 }
 
 function chipColor(v, max) {
@@ -1049,7 +1269,7 @@ function chipColor(v, max) {
   return `color-mix(in srgb, ${base} ${Math.round(35 + 65 * t)}%, #24302a)`;
 }
 
-const timelineMode = () => narrow() ? 'sequence' : state.mode;
+const timelineMode = () => state.mode;
 
 async function matchBody(cur, params, rt, P) {
   const [ma, mb] = await Promise.all(cur.matches.map(x => loadMatch(x.id)));
@@ -1085,7 +1305,7 @@ async function matchBody(cur, params, rt, P) {
   const which = multi ? `Round ${cur.round}${P.reps.length > 1 ? ` · replicate ${cur.replicate} of ${P.reps.length}` : ''}` : '';
   const roundLine = multi ? `<div class="score-round"><b>${which}</b>: ${done.length
       ? (roundLead ? `${short(roundLead)} up ${trim(Math.abs(Math.round(roundNet * 10) / 10))} bb` : 'even') + ` · deals won ${wins}–${losses}` : 'no deals finished'} · ${done.length} of ${total} played</div>`
-    : `<div class="score-cap">deals won ${wins}–${losses}${done.length - wins - losses ? ` · ${done.length - wins - losses} even` : ''} · ${done.length} of ${total} played</div>`;
+    : `<div class="score-cap" title="Counts only deals whose two plays have both finished; a deal still being played is provisional">deals won ${wins}–${losses}${done.length - wins - losses ? ` · ${done.length - wins - losses} even` : ''} · ${done.length} of ${total} finished</div>`;
   const big = cumDeals ? (leader ? `<div class="score-who">${plain(leader)} is up</div><div class="score-big">${trim(Math.abs(Math.round(cumBB * 10) / 10))}<small>bb</small></div>
       <div class="score-rate">${trim(Math.abs(Math.round(rate * 10) / 10))} bb/100 hands</div>` : '<div class="score-big even">Even</div>') : '<div class="score-who">No deals finished yet</div>';
   const scoreboard = `<div class="scoreboard card-box">
@@ -1159,8 +1379,12 @@ async function matchBody(cur, params, rt, P) {
   const swingBtns = swings.map(x => `<button class="jump swing ${x.deal === pick ? 'on' : ''}" data-deal="${x.deal}" title="Deal ${x.deal + 1}: ${plain(x.net > 0 ? cur.a : cur.b)} won ${trim(Math.abs(x.net) / bb)} bb over both plays">
       ${x.deal + 1}<b class="${cls(x.net)}">${signedBB(x.net, bb)}</b></button>`).join('');
   const jumps = diffBtn || swingBtns ? `<div class="jumps">${diffBtn}${swingBtns ? `<span class="jump-k">Big swings</span><span class="jump-list">${swingBtns}</span>` : ''}</div>` : '';
+  const leaf = cur.id.split('/').pop();
+  const rejected = (rt?.rejected || []).some(x => x && typeof x === 'object' && String(x.matchup || x.match || x.folder || x.id || '').includes(leaf) && (x.deal ?? x.hand) === pick);
+  const popTag = rejected ? '<span class="chip bad" title="The verifier could not reproduce this deal from its seed and actions, so it counts nowhere">rejected · not counted</span>'
+    : !(pick in nets) ? '<span class="chip warn" title="Live play: shown as it happens, counted only once both plays finish and are checked">live · provisional</span>' : '';
   const controls = `<div class="controls card-box" role="group" aria-label="Replay">
-    <div class="deal-title"><h2>${multi ? `<span class="round">${which}</span>` : ''}Deal ${pick + 1}<small> of ${total}</small></h2>
+    <div class="deal-title"><h2>${multi ? `<span class="round">${which}</span>` : ''}Deal ${pick + 1}<small> of ${total}</small></h2>${popTag}
       <span class="nav"><button data-deal="${order[i - 1]}" ${i > 0 ? '' : 'disabled'} aria-label="Previous deal" title="Previous deal (←)">←</button>
       <button data-deal="${order[i + 1]}" ${i < order.length - 1 ? '' : 'disabled'} aria-label="Next deal" title="Next deal (→)">→</button></span></div>
     <div class="ctls">
@@ -1175,8 +1399,8 @@ async function matchBody(cur, params, rt, P) {
   const viewBar = `<div class="view-bar">
     <span class="play-switch" role="group" aria-label="Which play">${plays.map(p => `<button class="toggle" data-show="${p.j}" aria-pressed="${state.showPlay === p.j}">${p.j ? 'Play 2<span class="hide-xs"> · swapped</span>' : 'Play 1'}</button>`).join('')}</span>
     <span class="mode-switch" role="group" aria-label="How the two plays move">
-      <button class="toggle" data-mode="aligned" aria-pressed="${state.mode === 'aligned'}" title="Both plays reach the flop, turn, river and result together">Streets side by side</button>
-      <button class="toggle" data-mode="sequence" aria-pressed="${state.mode === 'sequence'}" title="Play 1 from start to end, then Play 2">Play 1, then Play 2</button></span>
+      <button class="toggle" data-mode="aligned" aria-pressed="${state.mode === 'aligned'}" title="Both plays reach the flop, turn, river and result together"><span class="hide-xs">Streets </span>side by side</button>
+      <button class="toggle" data-mode="sequence" aria-pressed="${state.mode === 'sequence'}" title="Play 1 from start to end, then Play 2"><span class="hide-xs">Play 1, then Play 2</span><span class="show-xs">one after the other</span></button></span>
     <span class="seq-note small soft">Play 1 plays out, then Play 2, then the next deal</span>
     <span class="spacer"></span>
     <label class="speed" title="How long each step stays on screen while playing"><span>Speed</span><select id="speed" aria-label="Playback speed">${Object.entries(SPEEDS).map(([k, x]) =>
@@ -1184,7 +1408,10 @@ async function matchBody(cur, params, rt, P) {
     <button class="toggle" id="auto-toggle" aria-pressed="${state.autoNext}" title="When a deal ends, go on to the next one">Auto-next<span class="hide-xs"> deal</span></button>
     <button class="toggle" id="mind-toggle" aria-pressed="${state.mind}" title="Show every decision's reasoning (r)">Reasoning</button></div>`;
 
-  const body = `${scoreboard}${dealMap}${controls}${viewBar}
+  const sync = plays.length === 2 ? `<div class="sync" role="group" aria-label="Both plays at this moment">
+    ${plays.map(p => `<button class="sync-row" data-sync="${p.j}" aria-pressed="${state.showPlay === p.j}"><span class="sync-k">${p.j ? 'Play 2 · swapped' : 'Play 1'}</span><span class="sync-now"></span></button>`).join('')}
+    <span class="sync-tag"></span></div>` : '';
+  const body = `${scoreboard}${dealMap}${controls}${viewBar}${sync}
     <div class="pair ${state.mind ? 'show-mind' : ''}" data-show="${state.showPlay}">${plays.map(p => playPanel(p, cur, bb)).join('')}</div>
     <p class="omni small soft">Hand names under each seat use both players' cards, which the players themselves never see.</p>
     ${comparePanel(plays, cur, bb)}`;
@@ -1219,6 +1446,7 @@ async function matchBody(cur, params, rt, P) {
       store.set('autonext', state.autoNext);
       e.currentTarget.setAttribute('aria-pressed', String(state.autoNext));
     });
+    $app.querySelectorAll('.sync [data-sync]').forEach(b => b.onclick = () => showPlay(Number(b.dataset.sync)));
     $app.querySelectorAll('.play-switch [data-show]').forEach(b => b.onclick = () => {
       const j = Number(b.dataset.show);
       showPlay(j);
@@ -1243,6 +1471,7 @@ async function matchBody(cur, params, rt, P) {
 function showPlay(j) {
   state.showPlay = j;
   $app.querySelector('.pair')?.setAttribute('data-show', j);
+  $app.querySelectorAll('.sync [data-sync]').forEach(x => x.setAttribute('aria-pressed', String(Number(x.dataset.sync) === j)));
   $app.querySelectorAll('.play-switch [data-show]').forEach(x => x.setAttribute('aria-pressed', String(Number(x.dataset.show) === j)));
 }
 
@@ -1351,7 +1580,7 @@ function playPanel(p, cur, bb) {
     `<span class="lbl">${shortName(Number(i))}</span><div>${esc(n)}</div>`).join('')}</details>` : '';
   const button = btn != null ? `${shortName(btn)} on the button` : '';
   return `<div class="card-box play" data-play="${j}"><div class="play-head"><h3>${title}</h3><span class="small soft">${button}</span></div>
-    <div class="table-slot">${PokerTable.html(seats)}</div><div class="log">${log}</div>${noteBlock}</div>`;
+    <div class="table-slot">${PokerTable.html(seats)}</div><div class="now-line" aria-live="polite"></div><div class="log">${log}</div>${noteBlock}</div>`;
 }
 
 // One decision's record: which model answered (attested or not), whether its turn was audited, and every
@@ -1373,6 +1602,34 @@ function recordOf(t, pid, fmt) {
   const tries = (t.retries || []).map((r, k) => `<li>Try ${k + 1}${r.requested && r.requested.action ? `: asked <b>${esc(Core.actText(r.requested, fmt))}</b>` : ''}
     → ${esc(TRY_WORD[r.kind] || 'rejected')}${r.error ? `: ${esc(r.error)}` : ''}</li>`).join('');
   return `<span class="lbl">Record</span><span class="record">${bits.join(' · ')}</span>${tries ? `<ol class="tries">${tries}</ol>` : ''}`;
+}
+
+// What just happened in a play at step k, with the price it faced: the line beside the table.
+const NOW_VERB = { fold: 'folds', check: 'checks', call: 'calls', bet: 'bets', raise: 'raises to', all_in: 'goes all in' };
+function nowText(p, k, bb, long) {
+  if (k < 0) return '<span class="soft">not dealt yet</span>';
+  const fmt = c => bbs(c, bb);
+  const st = p.steps[k];
+  const next = long && st && st.toAct != null ? `<span class="next">Next: <b>${esc(nameParts(labelText(p.m.config.players[st.toAct]))[0])}</b> ${st.toCall
+    ? `must put in ${fmt(st.toCall)} to call: it pays if it wins ${Math.round(st.potOdds * 100)}% of the time` : 'can check'}</span>` : '';
+  return lastText(p, k, fmt, long) + next;
+}
+function lastText(p, k, fmt, long) {
+  const e = [...p.log].reverse().find(x => x.step <= k && x.kind !== 'runout');
+  if (!e) return '';
+  const who = i => esc(nameParts(labelText(p.m.config.players[i]))[0]);
+  if (e.kind === 'start') return long ? `Blinds posted: ${e.blinds.map(b => `${who(b.seat)} ${fmt(b.amount)}`).join(', ')}` : 'Blinds posted';
+  if (e.kind === 'board') return `<b>${esc(SEG_NAME[e.street] || e.street)}</b> ${PokerTable.cards(e.cards, 0, 'xs')}`;
+  if (e.kind === 'showdown') return '<b>Showdown</b>: both hands are shown';
+  if (e.kind === 'result') {
+    const w = e.winners;
+    return w.length > 1 ? `Split pot${e.showdown ? ' at showdown' : ''}` : `<b>${who(w[0])}</b> takes <b class="gold">${fmt(e.pot)}</b>${e.showdown ? ' at showdown' : ''}`;
+  }
+  const amt = ['call', 'bet', 'raise'].includes(e.action) ? ` ${fmt(e.amount)}` : '';
+  const f = e.facing;
+  const price = !f ? '' : e.action === 'raise' || e.action === 'all_in' || e.action === 'bet' ? `facing ${fmt(f.toCall)}`
+    : `facing ${fmt(f.toCall)} into ${fmt(f.pot)}: a call needs ${Math.round(f.odds * 100)}%`;
+  return `${long ? monogram(p.m.config.players[e.seat], 'xs') : ''}<b>${who(e.seat)}</b> <span class="verb ${e.action}">${NOW_VERB[e.action] || esc(e.action)}${amt}</span>${price ? `<span class="price"> · ${price}</span>` : ''}`;
 }
 
 // ---- replay: one timeline of frames drives both plays (see PokerTable.timeline) ---------------------
@@ -1406,6 +1663,23 @@ function applyStep(mode) {
       el.classList.toggle('now', k === mine && moving && s < rp.last);
     });
   });
+  const at = v.plays.map(p => p.steps.length ? Math.min(f.at[p.j] ?? 0, p.steps.length - 1) : -1);
+  v.plays.forEach(p => {
+    const el = $app.querySelector(`.play[data-play="${p.j}"] .now-line`);
+    if (el) el.innerHTML = nowText(p, at[p.j], v.bb, true);
+    const row = $app.querySelector(`.sync [data-sync="${p.j}"] .sync-now`);
+    if (row) row.innerHTML = nowText(p, at[p.j], v.bb, false);
+  });
+  const tag = $app.querySelector('.sync-tag');
+  if (tag && v.plays.length === 2) {
+    const seg = f.seg === 'end' ? null : f.seg;
+    const sig = (p, k) => p.log.filter(e => e.kind === 'action' && e.step <= k && (!seg || e.street === seg)).map(e => `${e.seat}:${e.action}:${e.amount ?? ''}`);
+    const a = sig(v.plays[0], at[0]), b = sig(v.plays[1], at[1]);
+    const n = Math.min(a.length, b.length);
+    const same = a.slice(0, n).join() === b.slice(0, n).join();
+    tag.className = `sync-tag ${!n ? '' : same ? 'same' : 'diff'}`;
+    tag.textContent = !n ? (seg ? `${SEG_NAME[seg]}: no choices yet` : '') : same ? `${SEG_NAME[seg] || 'So far'}: same choices with the same cards` : `${SEG_NAME[seg] || 'So far'}: they chose differently`;
+  }
   $app.querySelectorAll('.cmp-cell[data-play]').forEach(cell => {
     const j = Number(cell.dataset.play), p = v.plays[j];
     const mine = p && p.steps.length ? Math.min(f.at[j] ?? 0, p.steps.length - 1) : -1;

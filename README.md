@@ -59,11 +59,15 @@ git clone https://github.com/bin01/poker-arena && cd poker-arena
 python3 -m venv .venv && . .venv/bin/activate      # Python 3.11+
 pip install -e '.[dev]'
 python -m pytest -q                                  # engine, evaluator, bots, ratings, a full stand-in model match
-# where the system temp folder is read-only: pytest's capture is set to sys (pyproject), which needs no temp file,
-# and tests/conftest.py falls back to tests/.tmp; to choose the folder yourself (and skip .pytest_cache):
-#   mkdir -p tests/.tmp && TMPDIR=tests/.tmp python -m pytest -q -p no:cacheprovider
+# In a sandbox where the only writable place is tests/.tmp (kept in the repository) and TMPDIR is unset or
+# read-only, run exactly this from the repository root:
+#   python -m pytest -q -p no:cacheprovider
+# pytest's capture is sys (pyproject.toml), which needs no temp file, and tests/conftest.py, loaded before any test,
+# points Python's and pytest's temp folders (tmp_path included) at tests/.tmp when TMPDIR, /tmp and /var/tmp are
+# not writable. -p no:cacheprovider skips .pytest_cache.
 
-# Poker fundamentals: 32 clear-cut decision spots with computed answers, asked of each player -> runs/quiz/quiz.json
+# Poker fundamentals, asked of each player -> runs/quiz/quiz.json: the 32 basics plus four harder, separately
+# scored categories of 24 generated spots each (close, multistreet, inference, sizing); --category and --limit pick
 python -m poker_arena quiz reference claude-haiku-5-5-high --out quiz
 
 # Free and instant: the bots against each other, then the viewer
@@ -113,120 +117,143 @@ python -m poker_arena view runs/pilot                                 # follows 
 ```
 
 `tournament` resumes: rerun the same command after a crash or a stop, and each match continues after its last
-finished hand. Write your own plan with `python -m poker_arena plan A B C --deals 50 --out runs/mine --write plans/mine.json`.
+finished hand. Write your own preregistered plan with `python -m poker_arena plan A B C reference --out runs/mine --write plans/mine.json`
+(one deal per conversation by default; `--deals N` for longer conversations, at the cost it prints).
 
 ### How sure the results are
 
 Only the sequential test decides anything; the standings beside it describe. Even with duplicate deals one deal
 swings a lot (in the first model runs the result per deal had a spread of about 340 bb/100), and a model's
 conversations can differ from each other, so the test treats each conversation (a fresh pair of matches) as one
-unit: a verdict needs at least 8 conversations, and never comes from conversations that don't differ at all.
+independent unit, and its mean edge as one observation.
 
-A plan carries a **design** (`ratings.normalize_design`): rounds of `round_deals` deals (50), each
-round `replicates` conversations per pairing (`plan` defaults to 4), a family error `alpha` of 5% split over the
-pairings (Bonferroni), a **target edge** (50 bb/100 unless `--target-edge`) and as many rounds as the target needs.
-The power a plan states is the **complete adjudicator's**, simulated (`ratings.procedure`): the chance that the
-better player gets a decided verdict that *counts*, after both tests, the minimum number of conversations, every
-look and the diagnostics a verdict needs. It is planned with a conversation effect (`--assumed-icc`, 0.01) and
-memory between deals (`--assumed-ar1`, 0.2), shown under no dependence, the assumed one and a worse one;
-`--budget-deals` caps the size, marking the plan *underpowered*. For a round robin it also gives the chance that
-the true best player ends up the **decided leader**:
+**The official test assumes nothing about the shape of the results.** A conversation's mean edge can never be
+beyond what the stacks allow: each of a duplicate deal's two plays wins or loses at most one stack, so with
+100-big-blind stacks every result lies within ±10,000 bb/100 (`ratings.outcome_bound`, from the game settings).
+The test is a **betting confidence sequence** for bounded outcomes (Waudby-Smith and Ramdas): for each player a
+bettor stakes part of its capital on each new conversation, using only the earlier ones, never more than it can
+lose without going broke; with no real edge its capital is a fair game, and it reaches the bar of 2 / alpha per
+pairing with chance at most alpha / 2, by Ville's inequality. So with no real edge the chance of any false
+verdict in the whole tournament stays under 5%, **for any distribution of results, at every look and whenever
+play stops**, given only that conversations are independent (fresh memories, no deal repeated). *even* (within
+±15 bb/100) has the same guarantee. Each verdict reports those checks, its bettors' capital against the bar and
+an anytime-valid interval for the edge. Round 6's t and sign-flip gate, which a rare-loss distribution inside the
+chip bounds fooled 45% of the time, is still shown beside it as a **model-based** result: secondary, never
+official, never counted.
+
+**What it costs.** Needing nothing has a price set by the bound: a pairing needs about log(2 / alpha per
+pairing) × 10,000 / edge independent conversations, however long each is (about 1,450 to detect 50 bb/100 among
+3 models). So `plan` now defaults to **one duplicate deal per conversation** (`--deals 1`, 25 conversations per
+round): about as many deals as round 6's design (1,475 per pairing for 3 models, 2,150 for 9), but each
+conversation is a fresh session, and the run measures play hand by hand rather than what a model learns about
+its opponent over a match. Longer conversations measure that, at many more deals (`plan` prints the table: 55,600
+deals per pairing at 50 deals per conversation). Shallower stacks (`--stack`) shrink the bound and the cost with
+it, but change the game.
+
+A plan carries a **design** (`ratings.normalize_design`): rounds of `round_deals` deals, each round `replicates`
+conversations per pairing, a family error `alpha` of 5% split over the pairings (Bonferroni), a **target edge**
+(50 bb/100 unless `--target-edge`) and as many rounds as the target needs. The power a plan states is the
+official test's, simulated look by look (`ratings.procedure`). It is planned with a conversation effect
+(`--assumed-icc`, 0.01) and memory between deals (`--assumed-ar1`, 0.2), shown under no dependence, the assumed
+one and a worse one, which barely changes it (and never the error rate); `--budget-deals` caps the size, marking
+the plan *underpowered*. For a round robin it also gives the chance that the true best player ends up the
+**decided leader**:
 
 ```
-Planned to detect a 50 bb/100 edge: up to 10 rounds of 4 conversations of 50 deals (2,000 deals per pairing), a
-verdict from 12 conversations on. Chance that a pairing whose better player is ahead by the target gets a decided
-verdict that counts (the complete adjudicator, simulated; per-deal spread 350): 83% with the assumed dependence
-(ICC 0.01, AR(1) 0.2), 99% with none, 60% if it is worse (ICC 0.02, AR(1) 0.3). Chance of naming the true best
-of the 3 players the decided leader, assumed dependence: 69% if it is 50 bb/100 better than each other player
-and they are equal, 71% if it is 100 bb/100 better than each other player, 70% if the players are evenly spaced
-50 bb/100 apart.
+Planned to detect a 50 bb/100 edge: up to 59 rounds of 25 conversations of 1 deal (1,475 deals per pairing), a
+verdict possible from 9 conversations on. The official test is assumption-free: conversation means bounded by
++-10,000 bb/100 (the stacks), a verdict when a bettor's capital reaches 120. Chance that a pairing whose better
+player is ahead by the target is decided (simulated; per-deal spread 350): 82% with the assumed dependence (ICC
+0.01, AR(1) 0.2), 82% with none, 82% if it is worse; dependence changes only the power, never the error rate.
+Chance of naming the true best of the 3 players the decided leader, assumed dependence: 67% if it is 50 bb/100
+better than each other player and they are equal, >99% if it is 100 bb/100 better than each other player, 82% if
+the players are evenly spaced 50 bb/100 apart.
 ```
 
-Read the last sentence before planning a big round robin: with 9 models (36 pairings) the same defaults give
-83% per pairing but only 22% (one best by 50) to 40% (by 100) for a decided leader, because a large edge is decided
-at the first possible look, where the diagnostics are noisy and fail about one time in six
-(docs/methodology.md, *Planning*). Through `adjudicate` itself the 3-model numbers come out at 82% (assumed
-dependence), 99% and 59%.
+With 9 models (36 pairings) the same defaults give 81% per pairing and 19% for a decided leader when one model is
+50 bb/100 better than the rest (every one of its 8 pairings must be decided), more than 99% at twice that.
 
 `plan` also warns when the plan has no **reference** player (`bot = "reference"`): the fixed, versioned bot that
 gives every run a common opponent.
 
 **Registered before play.** When a tournament starts, the runner writes a `registration` into the run's
 `plan.json` before the first hand: the design, the judge that will decide it (the hash of `ratings.py`), the
-calibration of its bars and the CLI versions. Only a run with a valid registration is a test. Nothing recomputes
-it: a plan that says `registered: false`, a registration written after play began, a design changed after it, a
-code change accepted with `--allow-code-change`, or a CLI version other than the pinned one anywhere in the run
-all leave the run descriptive, and the output says why.
+calibration id of its test and the CLI versions. Only a run with a valid registration is a test. Nothing
+recomputes it: a plan that says `registered: false`, a registration written after play began, a design changed
+after it, a code change accepted with `--allow-code-change`, or a CLI version other than the pinned one anywhere
+in the run all leave the run descriptive, and the output says why.
 
 **One judge for stopping, recording and reporting.** After each round the runner asks `ratings.adjudicate` about
-each pairing, stops on its verdict and records it in `decisions.json`, with the hash of the verified hands it
-judged. The ratings, the command line and the viewer show that recorded decision as **official**, with the judge
-that made it. If today's code would judge the same deals differently, that is shown beside it as a retrospective
-recomputation and never replaces it.
+each pairing, stops on its verdict and records it in `decisions.json`, with the hash of the verified records it
+judged (hands, events, call records and raw backend output). The ratings, the command line and the viewer show
+that recorded decision as **official**, with the judge that made it (a verdict recorded by an earlier,
+model-based judge says so). If today's code would judge the same deals differently, that is shown beside it as a
+retrospective recomputation and never replaces it.
 
 **Every counted hand is replayed.** A deal counts only if both of its plays replay from their seeds through the
 engine's record verifier: the deal is dealt again, the recorded actions are replayed as legal moves, and the
 cards, board, pots, payouts and events must match. A hand edited after the fact (a duplicated ace, a payout no
-stack could cover) is rejected, here and in the history, and the pairing can't be decided.
+stack could cover) is rejected, here, in the history and in the style statistics, and the pairing can't be
+decided. One reader (`ratings.read_conversation`) says which hands are verified results and which are still
+provisional; everything that counts uses it.
 
 **An official verdict counts only while its evidence stands.** Every refresh checks each official decision
-against today's folders: the hands it judged must all be there, replay, hash as they did, and their records
-(decision coverage, audit, identity) must pass today's checks. If not, the verdict stays shown as recorded but
-stops counting towards a decided rank or leader, with the reason: evidence *lost*, *changed*, *invalid* or
-*altered* (a record edited so that the same judge no longer reproduces it), or *fails today* (the same records,
-judged by checks that are stricter now).
+against today's folders: the records it judged must all be there, replay, hash as they did, and pass today's
+checks (decision coverage, audit, identity). If not, the verdict stays shown as recorded but stops counting
+towards a decided rank or leader, with the reason: evidence *lost*, *changed*, *invalid* or *altered* (a record
+edited so that the same judge no longer reproduces it), or *fails today* (the same records, judged by checks
+that are stricter now).
 
 **Eligibility.** A pairing can only be decided when both players' model identity is resolved and **matched**
 (the CLI reported the model that answered and `ratings.same_model` says it is the one requested; reporting some
 model is not enough; Codex can't report it, so the default design allows it and shows it as *unattested*), every
 model action has exactly one decision record with its calls, every used reply was audited for tool use (the plain
-`command` backend can't be, so it is never decided unless a design allows it), each player's settings are the
-same in every match, and every duplicate pair checks out and replays. Otherwise the pairing stops as
-**ineligible**, with the reasons.
+`command` backend can't be, so it is never decided unless a design allows it; where decisions are linked to
+their calls and raw output by a decision id, the judge derives each one's audit from those links), each player's
+settings are the same in every match, every duplicate pair checks out and replays, and no deal is beyond the
+bound. Otherwise the pairing stops as **ineligible**, with the reasons.
 
-After each round a winner needs two tests to agree on the conversations so far: a t-test on conversation means,
-against a bar calibrated by simulation for exactly that schedule and for skewed results (a conversation effect of
-normal, exponential, lognormal or rare-large-loss shape, holding up to half the spread of a conversation's mean),
-and a sign-flip randomization test that is exact for any results symmetric about the true edge. **If either
-assumption holds**, then with no real edge the chance of any false verdict in the whole tournament stays under
-5%. Beyond both (a pairing whose conversations are mostly small wins and now and then a loss nine times as large,
-bigger than the card noise) the error grows to several times the stated rate, and no test of this size can
-prevent that; docs/methodology.md has the table. So every verdict reports **diagnostics**: *diagnostics passed;
-distribution assumptions unverified* (the data show no sign of leaving the calibrated family, which is not proof
-that they are in it), *diagnostics failed* (they are outside it) or *diagnostics incomplete*. A decided verdict
-whose diagnostics failed never makes a decided leader. `tests/test_calibration.py` checks the false-winner rate on
-every test run for normal, heavy-tailed, skewed and poker-like results, with memory, conversation effects of each
-shape, symmetric results of any size, pairings that share their cards, and the counterexamples of earlier
-reviews, the false-*even* rate at the ±15 margin, the advertised power against `adjudicate` itself, and the
-coverage of the strength intervals. A pairing ends with one of these verdicts:
+`tests/test_calibration.py` checks the false-winner rate on every test run: the round 6 counterexample (which it
+keeps as a regression: it fails on the old gate, 450 of 1,000, and passes on the official test, 0), normal,
+heavy-tailed, skewed and poker-like deals, memory, conversation effects of every shape and size, the least
+favourable distribution at the bound, pairings that share their cards, false *even* at the ±15 margin, the
+coverage of the anytime-valid interval, the advertised power against `decide` itself, and the coverage of the
+strength intervals. A pairing ends with one of these verdicts:
 
-- **a is better / b is better** (decided): both tests rejected at a planned look.
-- **even** (decided): the edge is shown to be within ±15 bb/100 (an equivalence test, each side calibrated so that
-  a true edge of ±15 or more is called even at most alpha / n_pairings of the time, skewed results included). At
-  the default spread this is out of reach of the default design.
+- **a is better / b is better** (decided): that player's bettor reached the bar.
+- **even** (decided): the edge is shown to be within ±15 bb/100; out of reach of the default design at 100 big
+  blinds.
 - **undecided after every planned look**: the data can't tell the two apart at this size. That is *not*
   evidence that they are equally good.
-- **undecided so far** (more rounds to come) or **too early** (fewer conversations than a verdict needs).
+- **undecided so far** (more rounds to come) or **too early** (fewer conversations than any verdict needs).
 - **ineligible** (stopped): an eligibility rule failed; the reasons are listed.
 - **descriptive** (no test): pooled across runs, or a run that isn't preregistered (its sample sizes are
   labelled *retrospective*).
 
-Each pairing also reports the deals it would need to detect an edge of 20, 50 or 100 bb/100 from its own
-observed spread of conversation means (`power.deals_for_80pct`), a planning number rather than a forecast.
-Repeated deals (the same pair on the same cards in another run) are averaged, not counted twice. Players that
-never met, directly or through others, are summarized in separate groups, each from its own data. A strength
-is one number per player fitted to all its pairings, weighted by how many deals each has; every pairing shows
-the edge the strengths imply next to the edge it actually had, and a warning when they disagree by more than
-their uncertainty. The direct pairwise results come first.
+Each pairing also reports the deals the official test would need to detect an edge of 20, 50 or 100 bb/100 from
+its own observed spread (`power.deals_for_80pct`), a planning number rather than a forecast. Repeated deals (the
+same pair on the same cards in another run) are averaged, not counted twice. Players that never met, directly or
+through others, are summarized in separate groups, each from its own data. A strength is one number per player
+fitted to all its pairings, weighted by how many deals each has; every pairing shows the edge the strengths imply
+next to the edge it actually had, and a warning when they disagree by more than their uncertainty. The direct
+pairwise results come first.
 
 **Winning here and being good at poker are reported apart.** Strengths and verdicts are relative to the players
-met. Each player's direct edge against the reference bot (`vs_reference`) is shown when the group has one, and
-`python -m poker_arena quiz` scores **poker fundamentals** (clear-cut spots with computed answers); `ratings`
-prints those scores as their own section and never mixes them into the standings.
+met. Each player's direct edge against the reference bot (`vs_reference`) is shown when the group has one; the
+reference is a fixed heuristic, not a solver, measured against the other bots (+408 bb/100 against random, +290
+against the calling station, +169 against the rule bot, though it wins only half what the rule bot does from
+random), and the ratings output carries those limits (`reference`). `python -m poker_arena quiz` scores **poker
+fundamentals** (spots with computed answers, in separately scored categories: the clear-cut basics, close calls,
+multi-street lines, range inference from a described line, and bet sizing among 3+ options); `ratings` recounts
+them from the answers (a fallback is never correct, valid-answer accuracy apart), attaches a score to a run's
+player only with its provenance (quiz version, protocol, implementation, CLI version) and when its answers are
+eligible (attested model, verified against raw output), gives the fixed basics counts rather than intervals, and
+prints them as their own section, never mixed into the standings.
 
 **How long it takes.** A model makes about 2–3 decisions per hand, and a CLI call takes roughly 5–30 seconds,
 so 100 hands take 30–90 minutes per model seat. The pilot is about 6,000 model calls: most of a day at
-`--concurrency 3`, longer if usage limits pause it. Start with `plans/smoke.json`.
+`--concurrency 3`, longer if usage limits pause it. A preregistered 3-model tournament at the defaults is up to
+8,850 hands. Start with `plans/smoke.json`.
 
 ## What a match leaves behind
 
@@ -265,7 +292,7 @@ version, is a different player, and so is one from before protocols were recorde
 a change took effect, even in the middle of a match (a CLI upgraded between a stop and a resume, or a code change
 accepted with `--allow-code-change`): deals before it, after it, and deals whose two plays straddle it are three
 different players. Every hand is replayed from its seed when it is indexed; one that doesn't replay is listed as
-rejected and never pooled. When a code change is shown
+rejected and never pooled, and the style counts it stores are of verified results only. When a code change is shown
 not to affect play, list the implementations as equivalent in `runs/equivalences.json`
 (`{"implementations": [["5e6f7a8b", "9a0b1c2d"]], "reason": "..."}`) and they pool; the leaderboard says so. A player without an exact model version (no `model`, or a bare alias like `sonnet`) is listed but not
 rated, since two runs of it may not be the same model; so are a run's deals in which a different model answered
@@ -292,9 +319,12 @@ by the CLI that runs them. A player whose model wasn't recorded shows as, say, "
 
 Results never claim more than the evidence. **Decided** (a gold badge) marks only what the planned sequential test
 settled: a matchup's *wins* or *even*, a rank, or a group's leader with a decided win over every other player in its
-group. Every decided verdict carries its assumption status beside it (*diagnostics passed; distribution assumptions
-unverified*, *outside calibrated range* or *assumptions unchecked*), and the page never states the test's error bound
-without its assumptions. A
+group. Every decided verdict carries its assumption status beside it, and the page never states the test's error bound
+without its assumptions. When the official verdict comes from the assumption-free test (an anytime-valid test for
+bounded results, valid if conversations are independent), the chip says *no distribution assumption; conversations
+independent*, and the older model-based gate's verdict is shown beside it as a dashed, secondary *model-based: ...*
+chip that never decides. Verdicts from the model-based gate alone say *diagnostics passed; distribution assumptions
+unverified*, *outside calibrated range* or *assumptions unchecked*. A
 leader whose wins include one outside the calibrated range is shown as *Leader, outside the calibrated range*, not as a
 decided leader. A matchup the judge may not decide (identity, audit, protocol or registration) shows **Ineligible**
 with its reasons. A verdict recorded by the run's registered judge is marked *official*; a recomputation by today's
@@ -306,6 +336,10 @@ registration says so with its reason): nothing in it is decided, and any sample-
 
 - **Standings.** The first screen answers four questions in plain words: who is playing (every model, then the bots,
   by name), who is ahead, whether that is decided, and a **Watch a hand** button (the live table when one is playing).
+  - **Players who met.** When the run (or the all-runs history) holds groups of players who never played each other,
+    a compact selector picks one, named by its participants and protocol ("Gemini 4 Neon · Claude Sonnet 5.5 · GPT-6
+    Luna · High reasoning · 50-hand conversations", "Baseline bots", "Earlier variants"). The current model cohort
+    comes first and is shown by default; `?c=` in the address keeps the choice.
   - **Outcome row**, one per group of players who have met: the decided leader (an ace), or who is ahead on points
     (a face-down card), one sentence on whether it is decided and why ("Not decided yet: 1 of 3 matchups has a
     result, and play continues"), its strength with the 95% range and the range's basis, and chips for the run's
@@ -313,13 +347,20 @@ registration says so with its reason): nothing in it is decided, and any sample-
     matchups don't fit one number per player (an additivity *warning*), the row leads with the **direct results**
     ("Rule bot beat Random bot · 801 bb/100 · Decided") and shows the fitted strength only as a secondary, qualified
     number.
+  - **Against the reference bot**: each player's bb/100 against the fixed, versioned reference policy with its range
+    and verdict, models first, and what the reference is and is not (a heuristic, not a solver), with its own record
+    against the baselines. A model-only group says plainly that it has no fixed yardstick.
   - **How this is judged**, folded: the test and its assumptions, the target edge ("Planned to detect a 50 bb/100
     edge: ~N deals per matchup; the matchups have M", or *retrospective*), power under the optimistic, moderate and
     pessimistic dependence assumptions, the words used on the page, and the ratings' notes. Caveats live here once.
   - **Standings**, per group: strength in bb/100 against the average opponent with its 95% range on a shared axis.
     A range that rests on blocks of deals inside single conversations is marked *within conversations* at the number
-    (hatched on the axis): it leaves out how much fresh matches differ. A numeral is shown only for a decided rank; a
-    group with none is titled **Order on points**. Flags: *identity unresolved*, *model unconfirmed* (the model's tool
+    (hatched on the axis): it leaves out how much fresh matches differ. The **decided order** comes first: decided
+    ranks in order, then the players whose order is not decided, grouped by the places they share ("Places 3–4: the
+    order of these two is not decided", listed by points within). An **Order: By points** control shows everyone by
+    fitted strength instead, labelled descriptive. A numeral is shown only for a decided rank; a group with none is
+    titled **Order on points**. The standings and matchups count only verified, committed hands (both plays replayed
+    and checked); the style table says which hands it counts. Flags: *identity unresolved*, *model unconfirmed* (the model's tool
     never reported which model answered), *wrong model* or *partly confirmed*. A reference policy is tagged
     *reference*: it is the yardstick, not a contestant.
   - **Matchups**, the direct evidence: each pair's edge with its 95% range and basis, its verdict with what it rests
@@ -339,10 +380,12 @@ registration says so with its reason): nothing in it is decided, and any sample-
     recorded, else the reported model compared with the requested one by `ratings.same_model`. *Model confirmed*
     means the reported model is the one asked for; a backend's bare "attested" (some model was reported) is never
     shown as confirmed.
-- **Fundamentals** (only for a run with `quiz.json`): every player answers the same textbook spots (call or fold at a
-  price, all-in calls, shove or fold), each with an answer worked out from the cards. Per player: spots answered
-  best and big blinds of expected value lost against the best answer; the reference policy is called out as the
-  yardstick. Each spot opens on the same table component (the deciding seat's cards up, the opponent's down), with
+- **Fundamentals** (only for a run with `quiz.json`): every player answers the same spots, each with an answer worked
+  out from the cards. Per player: spots answered best, the share right among valid answers, fallbacks (no valid
+  answer after every retry: never counted right, even where folding was best), big blinds of expected value lost, and
+  a provenance chip (*provenance checked*, *ineligible* with reasons, or *provenance not recorded*). A **By category**
+  table scores each category separately. No error ranges are shown unless the quiz defines its sampling population.
+  The reference policy is called out as the yardstick. Each spot opens on the same table component (the deciding seat's cards up, the opponent's down), with
   the pot, price, break-even share, equity, best answer and every player's choice, its EV lost and its reasoning.
   This is separate from the standings: fundamentals, not winnings against these opponents. A quiz file marked
   `"fixture": true` is labelled as made-up layout data (`tests/fixtures/quiz.json` is one).
@@ -358,9 +401,12 @@ registration says so with its reason): nothing in it is decided, and any sample-
   **The two plays, street by street** puts each street's choices side by side and marks where the model holding the
   same cards chose differently; it fills in as the replay goes. On a wide screen they sit side by side
   and move either **street by street** (both reach the flop, turn, river and result together; the one with fewer
-  actions waits) or **Play 1, then Play 2**; on a narrow one a **Play 1 / Play 2** switch shows one, and playback
-  plays Play 1 to its end, then Play 2, then the next deal. On a phone, pressing play folds the scoreboard to one
-  line and brings the table up. The deal's controls stay on screen while scrolling. Under them, **Where they differ**
+  actions waits) or **Play 1, then Play 2**; on a narrow one the same two modes apply with
+  one table on screen at a time. On a narrow screen a two-line strip shows **both plays at
+  the same moment** (what each just did and whether the same cards drew the same choices on this street); tapping a
+  line shows that play's table. Beside each table, a large line says the action just taken with the price it faced,
+  and who acts next and what a call needs. On a phone, pressing play folds the scoreboard to one line and brings the
+  table up, and a compact control bar (deal arrows, step, play, scrubber) stays pinned at the top. Under them, **Where they differ**
   jumps to the first decision where the two models, holding the same cards, chose differently, and **Big swings**
   lists the deals with the largest results (ringed on the deal map). **Speed** (slow, normal, fast) sets how long each
   step stays on screen; opening a decision's **why?** pauses playback. The table marks whose turn it is (**to act**)
@@ -377,7 +423,11 @@ registration says so with its reason): nothing in it is decided, and any sample-
   playing refreshes every 6 seconds, an unfinished but quiet one every minute. A refresh never interrupts a replay.
   The server recomputes a run's ratings whenever any of its record files changes: hands, events and calls, and the
   `plan.json`, `decisions.json`, `tournament.json`, `config.json` and `quiz.json` files (so a verdict-only change shows
-  at once), plus the players file; for all runs these same files are the history's inputs.
+  at once), plus the players file; for all runs these same files are the history's inputs. Ratings are never on a
+  page's critical path: they are computed in a separate process, kept in `runs/.viewer-cache/` and served from there
+  at once (marked *updating* while a newer version is computed), and the server warms every run when it starts. The
+  replay never waits for them. A run computed for the first time shows its players and raw, unchecked matchup scores
+  until its standings arrive a few seconds later.
 
 The table (`viewer/table.js`) is its own component: it builds one snapshot per step from a hand's events and
 shows any snapshot, for two or three seats, with a seat's cards optionally face down, so a human seat can reuse it.

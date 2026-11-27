@@ -15,11 +15,13 @@ PLAYER_KEYS = {'player', 'identity', 'kind', 'component', 'strength', 'strength_
                'rank_tied_with', 'position', 'in_fit', 'identity_resolved', 'net_bb', 'hands', 'deals', 'session_elo',
                'session_elo_ci95', 'session_elo_basis', 'sessions', 'session_w', 'session_t', 'session_l',
                'quarantined', 'quarantine_reason', 'inferential'}
-DECIDE_KEYS = {'deals', 'blocks', 'edge', 'ci95', 't', 'boundary', 'verdict', 'looks_used', 'looks_planned', 'power',
-               'conversations', 'basis', 'df', 'min_conversations', 'signflip', 'decided_at_look', 'conversation_share'}
+DECIDE_KEYS = {'deals', 'blocks', 'edge', 'ci95', 't', 'verdict', 'looks_used', 'looks_planned', 'power',
+               'conversations', 'basis', 'df', 'min_conversations', 'decided_at_look', 'decided_at_conversation',
+               'conversation_share', 'cs', 'cs_level', 'capital', 'official_test', 'assumption_free', 'bound_bb100',
+               'out_of_bound', 'model_based'}
 GROUP_KEYS = {'id', 'players', 'leader', 'front_runner', 'front_runner_margin', 'ci95', 'power', 'headline'}
 DESIGN_KEYS = {'alpha', 'round_deals', 'max_rounds', 'max_rounds_basis', 'block', 'replicates', 'n_pairings',
-               'alpha_pairing', 'nominal_alpha', 'target_edge_bb100', 'prior_sd_bb100', 'deals_needed', 'deals_planned',
+               'alpha_pairing', 'outcome_bound_bb100', 'official_test', 'threshold', 'target_edge_bb100', 'prior_sd_bb100', 'deals_needed', 'deals_planned',
                'max_deals', 'power_at_max', 'min_conversations', 'conversations_needed', 'power_scenarios',
                'assumed_icc', 'assumed_ar1', 'underpowered', 'sd_conversation_bb100', 'allow_unattested',
                'allow_opaque', 'outside_calibration'}
@@ -28,10 +30,15 @@ ADJUDICATE_KEYS = DECIDE_KEYS | {'eligible', 'ineligible_reasons', 'assumptions'
                                  'judge', 'calibration_id', 'registered_judge', 'official'}
 
 
+GAME = {'stack': 20}         # 10 big blinds: the official test's bound is then +-1,000 bb/100 (R.outcome_bound)
+BOUND = 1000.0
+
+
 def deals_between(a, b, edge, n, rng, sd=300.0, rounds=1, seed0=1000, run='', planned=None, reps=1, effects=None):
-    """`rounds` x `reps` conversations of n duplicate deals in which a beats b by `edge` bb/100 on average
-    (bb = 2), plus a per-conversation effect from `effects` (one value per conversation, in play order), on the
-    same slates for every pairing (round r, replicate j deals seeds seed0 + ((r - 1) reps + j - 1) n ...)."""
+    """`rounds` x `reps` conversations of n duplicate deals in which a beats b by about `edge` bb/100 on average
+    (bb = 2; each deal kept within the bound of GAME's stacks), plus a per-conversation effect from `effects`
+    (one value per conversation, in play order), on the same slates for every pairing (round r, replicate j
+    deals seeds seed0 + ((r - 1) reps + j - 1) n ...)."""
     out = []
     c = 0
     for r in range(1, rounds + 1):
@@ -39,18 +46,18 @@ def deals_between(a, b, edge, n, rng, sd=300.0, rounds=1, seed0=1000, run='', pl
             u = effects[c] if effects is not None else 0.0
             c += 1
             for k in range(n):
-                x = edge + u + sd * rng.standard_normal()
+                x = float(np.clip(edge + u + sd * rng.standard_normal(), -BOUND + 1, BOUND - 1))
                 seed = seed0 + ((r - 1) * reps + j - 1) * n + k
                 name = f'{run}{a}__vs__{b}' + (f'__x{j}' if j > 1 else '') + (f'__r{r}' if r > 1 else '')
                 out.append({'a': a, 'b': b, 'matchup': name, 'deal': k, 'bb': 2, 'net_a': x * 4 / 100, 'seed': seed,
                             'fp': f'{seed}:{k % 2}', 'planned': planned or n, 'round': r, 'replicate': j,
-                            'evidence': f'{name}:{k}:{x:.6f}'})
+                            'evidence': f'{name}:{k}:{x:.6f}', 'evidence_linked': f'{name}:{k}:{x:.6f}:linked'})
     return out
 
 
 def plan(players, n, rounds, reps=1, **kw):
     pairs = [[a, b] for i, a in enumerate(players) for b in players[i + 1:]]
-    return {'players': players, 'matchups': kw.pop('matchups', pairs), 'deals': n,
+    return {'players': players, 'matchups': kw.pop('matchups', pairs), 'deals': n, 'game_config': GAME,
             'design': {'max_rounds': rounds, **kw.pop('design', {})}, 'replicates': reps, **kw}
 
 
@@ -103,13 +110,13 @@ def run(deals, p, boot=50, who=None, registered=True, **kw):
 class TestInference(unittest.TestCase):
     def test_decided_leader_and_ranks(self):
         rng = np.random.default_rng(0)
-        true = {'x': 100.0, 'y': 0.0, 'z': -100.0}
+        true = {'x': 350.0, 'y': 0.0, 'z': -350.0}
         deals = []
         for a, b in (('x', 'y'), ('x', 'z'), ('y', 'z')):
-            deals += deals_between(a, b, true[a] - true[b], 50, rng, sd=100, rounds=4, reps=2)
-        r = run(deals, plan(['x', 'y', 'z'], 50, 4, reps=2))
+            deals += deals_between(a, b, true[a] - true[b], 10, rng, sd=50, rounds=6, reps=4)
+        r = run(deals, plan(['x', 'y', 'z'], 10, 6, reps=4))
         self.assertTrue(all(m['verdict'] == 'a' for m in r['pairings']), [m['verdict'] for m in r['pairings']])
-        self.assertTrue(all(m['signflip'] and m['inferential'] for m in r['pairings']))
+        self.assertTrue(all(m['cs'][0] > 0 and m['inferential'] and m['assumption_free'] for m in r['pairings']))
         self.assertEqual([(p['player'], p['rank'], p['rank_kind']) for p in r['players']],
                          [('x', 1, 'decided'), ('y', 2, 'decided'), ('z', 3, 'decided')])
         self.assertEqual(r['leader']['player'], 'x')
@@ -140,21 +147,22 @@ class TestInference(unittest.TestCase):
     def test_too_few_conversations_is_early(self):
         """Below min_conversations a completed look gives 'early', however large the edge (R3-#1)."""
         rng = np.random.default_rng(10)
-        deals = deals_between('x', 'y', 500, 50, rng, sd=50, rounds=3, reps=2)
+        deals = deals_between('x', 'y', 900, 50, rng, sd=20, rounds=3, reps=2)
         r = run(deals, plan(['x', 'y'], 50, 6, reps=2))
         [m] = r['pairings']
-        self.assertEqual((m['verdict'], m['conversations'], m['looks_used'], m['min_conversations']), ('early', 6, 3, 8))
-        self.assertIn('at least 8', m['reason'])
+        need = R.min_conversations(0.05)
+        self.assertEqual((m['verdict'], m['conversations'], m['looks_used'], m['min_conversations']), ('early', 6, 3, need))
+        self.assertIn(f'fewer than {need}', m['reason'])
         self.assertIsNone(r['leader'])
-        self.assertTrue(any('at least 8 conversations' in n for n in r['notes']))
+        self.assertTrue(any(f'fewer than {need} conversations' in n for n in r['notes']))
 
     def test_partial_order(self):
         """x beat y and z (decided); y vs z undecided: x has a decided rank, y and z share 2-3."""
         rng = np.random.default_rng(2)
-        deals = deals_between('x', 'y', 300, 50, rng, sd=100, rounds=4, reps=2) \
-            + deals_between('x', 'z', 300, 50, rng, sd=100, rounds=4, reps=2) \
-            + deals_between('y', 'z', 0, 50, rng, rounds=4, reps=2)
-        r = run(deals, plan(['x', 'y', 'z'], 50, 4, reps=2))
+        deals = deals_between('x', 'y', 600, 10, rng, sd=50, rounds=4, reps=4) \
+            + deals_between('x', 'z', 600, 10, rng, sd=50, rounds=4, reps=4) \
+            + deals_between('y', 'z', 0, 10, rng, rounds=4, reps=4)
+        r = run(deals, plan(['x', 'y', 'z'], 10, 4, reps=4))
         s = {p['player']: p for p in r['players']}
         self.assertEqual((s['x']['rank'], s['y']['rank'], s['z']['rank']), (1, None, None))
         self.assertEqual(s['y']['rank_range'], [2, 3])
@@ -163,13 +171,14 @@ class TestInference(unittest.TestCase):
 
     def test_groups_have_their_own_summaries(self):
         rng = np.random.default_rng(3)
-        deals = deals_between('a', 'b', 300, 50, rng, sd=100, rounds=3, reps=3) \
-            + deals_between('c', 'd', 30, 50, rng, rounds=3, reps=3)
-        r = run(deals, plan(['a', 'b', 'c', 'd'], 50, 3, reps=3, matchups=[['a', 'b'], ['c', 'd']]))
-        self.assertEqual(r['components'], [['a', 'b'], ['c', 'd']])
-        self.assertEqual([g['leader'] for g in r['groups']], ['a', None])
-        self.assertEqual(r['groups'][1]['front_runner'] in ('c', 'd'), True)
-        self.assertNotIn('a', r['groups'][1]['headline'].split())
+        deals = deals_between('a', 'b', 600, 10, rng, sd=50, rounds=4, reps=4) \
+            + deals_between('c', 'd', 30, 10, rng, rounds=4, reps=4)
+        r = run(deals, plan(['a', 'b', 'c', 'd'], 10, 4, reps=4, matchups=[['a', 'b'], ['c', 'd']]))
+        self.assertEqual(sorted(r['components']), [['a', 'b'], ['c', 'd']])
+        self.assertEqual(sorted(g['leader'] or '-' for g in r['groups']), ['-', 'a'])
+        cd = next(g for g in r['groups'] if 'c' in g['players'])
+        self.assertEqual(cd['front_runner'] in ('c', 'd'), True)
+        self.assertNotIn('a', cd['headline'].split())
         self.assertTrue(any('groups' in n for n in r['notes']))
 
     def test_one_conversation_gives_no_verdict(self):
@@ -213,9 +222,9 @@ class TestInference(unittest.TestCase):
         """A served-model mismatch stops the pairing as 'ineligible' at its first look, through the same
         adjudicator the runner stops on, and keeps the player out of every decided result (R3-#8, R4-#3)."""
         rng = np.random.default_rng(12)
-        deals = deals_between('good', 'swapped', 300, 50, rng, sd=100, rounds=4, reps=2) \
-            + deals_between('good', 'bot', 300, 50, rng, sd=100, rounds=4, reps=2) \
-            + deals_between('swapped', 'bot', 0, 50, rng, sd=100, rounds=4, reps=2)
+        deals = deals_between('good', 'swapped', 600, 10, rng, sd=50, rounds=4, reps=4) \
+            + deals_between('good', 'bot', 600, 10, rng, sd=50, rounds=4, reps=4) \
+            + deals_between('swapped', 'bot', 0, 10, rng, sd=100, rounds=4, reps=4)
         meta = {'good': {'identity': 'claude:claude-x-1:high', 'kind': 'model', 'quarantine_reason': None,
                          'identity_resolved': True},
                 'swapped': {'identity': 'codex:gpt-y:high', 'kind': 'model', 'identity_resolved': True,
@@ -223,7 +232,7 @@ class TestInference(unittest.TestCase):
                 'bot': {'identity': 'bot:rule', 'kind': 'bot', 'quarantine_reason': None, 'identity_resolved': True}}
         who = {'good': MODEL, 'swapped': {**MODEL, 'backend': 'codex', 'requested_model': 'gpt-y',
                                           'identity': 'mismatch', 'observed_models': ['gpt-old']}}
-        r = run(deals, plan(['good', 'swapped', 'bot'], 50, 4, reps=2), boot=30, meta=meta, who=who)
+        r = run(deals, plan(['good', 'swapped', 'bot'], 10, 4, reps=4), boot=30, meta=meta, who=who)
         v = {frozenset((m['a'], m['b'])): m for m in r['pairings']}
         clean = v[frozenset(('good', 'bot'))]
         self.assertEqual((clean['verdict'], clean['inferential'], clean['official']), ('a', True, True))
@@ -388,40 +397,43 @@ THREE = [['a', 'b'], ['a', 'c'], ['b', 'c']]
 
 class TestDesign(unittest.TestCase):
     def test_default_design_meets_its_power_target(self):
-        """max_rounds comes from the target: the moderate scenario reaches 80%, and every scenario is reported
-        (R3-#2, #3)."""
-        p = {'deals': 50, 'design': {}, 'replicates': 4, 'matchups': THREE}
+        """max_rounds comes from the target: the moderate scenario reaches 80% under the official test, and
+        every scenario is reported (R3-#2, #3; R6-#1). The command line's default: one deal per conversation."""
+        p = {'deals': 1, 'design': {}, 'replicates': 25, 'matchups': THREE}
         d = R.normalize_design(p)
         self.assertLessEqual(DESIGN_KEYS, set(d))
         self.assertEqual((d['max_rounds_basis'], d.get('registered'), d['underpowered']), ('power', None, False))
-        self.assertEqual(d['min_conversations'], R.first_verdict(d['alpha_pairing'], d['max_rounds'], 4))
-        self.assertTrue(d['min_conversations'] >= R.MIN_CONVERSATIONS and d['min_conversations'] % 4 == 0)
+        self.assertEqual(d['min_conversations'], R.min_conversations(d['alpha_pairing']))
+        self.assertEqual((d['outcome_bound_bb100'], d['assumption_free'], d['official_test']['assumption_free']),
+                         (10000.0, True, True))
+        self.assertAlmostEqual(d['threshold'], 2 / d['alpha_pairing'], places=2)
         self.assertGreaterEqual(d['power_at_max'], 0.8)
         self.assertEqual(d['deals_needed'], d['max_deals'])
         sc = {x['scenario']: x for x in d['power_scenarios']}
         self.assertEqual(set(sc), {'optimistic', 'moderate', 'pessimistic'})
         self.assertEqual(sc['moderate']['power'], d['power_at_max'])
-        self.assertGreater(sc['optimistic']['power'], sc['moderate']['power'])
-        self.assertGreater(sc['moderate']['power'], sc['pessimistic']['power'])
         self.assertEqual((sc['moderate']['assumed_icc'], sc['moderate']['assumed_ar1']), (0.01, 0.2))
         fewer = R.normalize_design({**p, 'design': {'max_rounds': d['max_rounds'] - 1}})
         self.assertLess(fewer['power_at_max'], 0.8)                        # the fewest rounds that reach it
         self.assertEqual(R.normalize_design({**p, 'design': d}), d)       # idempotent: a stored plan reads the same
         self.assertIn('Planned to detect a 50 bb/100 edge', R.design_line(d))
-        self.assertIn('if it is worse', R.design_line(d))
+        self.assertIn('assumption-free', R.design_line(d))
 
-    def test_dependence_raises_the_deals_needed(self):
-        base = {'deals': 50, 'replicates': 4, 'matchups': THREE}
+    def test_dependence_barely_moves_the_deals_needed(self):
+        """The bound, not the spread, sets the cost: dependence inside a conversation changes the deals needed
+        by little, and never the error rate."""
+        base = {'deals': 10, 'replicates': 25, 'matchups': THREE}
         light = R.normalize_design({**base, 'design': {'assumed_icc': 0.0, 'assumed_ar1': 0.0}})
         heavy = R.normalize_design({**base, 'design': {'assumed_icc': 0.015, 'assumed_ar1': 0.3}})
-        self.assertLess(light['deals_needed'], heavy['deals_needed'])
+        self.assertLessEqual(light['deals_needed'], heavy['deals_needed'])
+        self.assertLess(heavy['deals_needed'], 1.15 * light['deals_needed'])
         self.assertAlmostEqual(R.sd_conversation(350, 50, 0, 0), 350 / np.sqrt(50))
         self.assertGreater(R.design_effect(0.3, 50), 1.7)
 
     def test_budget_cap_is_underpowered(self):
-        p = {'deals': 50, 'design': {'budget_deals': 600}, 'replicates': 4, 'matchups': THREE}
+        p = {'deals': 1, 'design': {'budget_deals': 600}, 'replicates': 25, 'matchups': THREE}
         d = R.normalize_design(p)
-        self.assertEqual((d['max_rounds'], d['max_rounds_basis'], d['underpowered'], d['max_deals']), (3, 'budget', True, 600))
+        self.assertEqual((d['max_rounds'], d['max_rounds_basis'], d['underpowered'], d['max_deals']), (24, 'budget', True, 600))
         self.assertGreater(d['deals_needed'], 600)
         self.assertIn('Underpowered', R.design_line(d))
         given = R.normalize_design({**p, 'design': {'max_rounds': 6}, 'replicates': 2})
@@ -433,8 +445,9 @@ class TestDesign(unittest.TestCase):
         d = R.normalize_design(p)
         self.assertEqual((d['replicates'], d['n_pairings'], d['target_edge_bb100'], d['max_deals']), (2, 3, 50, 600))
         self.assertAlmostEqual(d['alpha_pairing'], 0.05 / 3)
-        self.assertLess(d['nominal_alpha'], d['alpha_pairing'] / 2)
         self.assertEqual(R.normalize_design({**p, 'design': d}), d)
+        self.assertEqual(R.normalize_design({**p, 'game_config': GAME})['outcome_bound_bb100'], BOUND)
+        self.assertEqual(R.normalize_design({**p, 'game_config': {'stack': 300, 'bb': 3}})['outcome_bound_bb100'], 10000)
         self.assertIsNone(R.normalize_design({'deals': 20, 'seed': 0}))
         legacy = R.normalize_design({'deals': 20, 'until_decided': 60, 'seed': 0})
         self.assertEqual((legacy['max_rounds'], legacy['registered']), (3, False))
@@ -477,34 +490,49 @@ class TestContract(unittest.TestCase):
 
     def test_decide(self):
         rng = np.random.default_rng(8)
-        d = R.normalize_design({'deals': 50, 'design': {'max_rounds': 6}, 'replicates': 2, 'matchups': [[1, 2]] * 1})
-        g = lambda c: np.repeat(np.arange(c), 50)
-        v = R.decide(list(350 * rng.standard_normal(100)), d, 3, 1, groups=g(2))
+        d = R.normalize_design({'deals': 10, 'design': {'max_rounds': 10}, 'replicates': 2, 'game_config': GAME,
+                                'matchups': THREE})
+        g = lambda c: np.repeat(np.arange(c), 10)
+        need = R.min_conversations(d['alpha_pairing'])
+        v = R.decide(list(300 * rng.standard_normal(20)), d, 3, 1, groups=g(2))
         self.assertLessEqual(DECIDE_KEYS, set(v))
-        self.assertEqual((v['verdict'], v['looks_used'], v['looks_planned'], v['conversations']), ('early', 1, 6, 2))
-        v = R.decide(list(350 * rng.standard_normal(400)), d, 3, 4, groups=g(8))
-        self.assertEqual((v['verdict'], v['min_conversations']), ('early', 10))   # 8: no sign-flip verdict possible yet
-        v = R.decide(list(350 * rng.standard_normal(500)), d, 3, 5, groups=g(10))
+        self.assertEqual((v['verdict'], v['looks_used'], v['looks_planned'], v['conversations'], v['min_conversations']),
+                         ('early', 1, 10, 2, need))
+        v = R.decide(list(np.clip(300 * rng.standard_normal(100), -999, 999)), d, 3, 5, groups=g(10))
         self.assertEqual(v['verdict'], 'open')
         n = v['power']['deals_for_80pct']
         self.assertGreater(n['20'], n['50'])
         self.assertGreater(n['50'], n['100'])
         self.assertEqual(R.decide([1.0] * 5, d, 3, 1)['verdict'], 'early')
-        self.assertEqual(R.decide(list(400 + 50 * rng.standard_normal(500)), d, 3, 5, groups=g(10))['verdict'], 'a')
-        self.assertEqual(R.decide(list(-400 + 50 * rng.standard_normal(500)), d, 3, 5, groups=g(10))['verdict'], 'b')
-        self.assertEqual(R.decide(list(350 * rng.standard_normal(600)), d, 3, 6, groups=g(12))['verdict'], 'exhausted')
-        self.assertEqual(R.decide(list(350 * rng.standard_normal(80)), d, 3, 0)['verdict'], 'open')
+        win = R.decide(list(700 + 50 * rng.standard_normal(160)), d, 3, 8, groups=g(16))
+        self.assertEqual(win['verdict'], 'a')
+        self.assertGreaterEqual(win['decided_at_conversation'], need)
+        self.assertGreaterEqual(win['capital']['a'], d['threshold'])
+        self.assertGreater(win['cs'][0], 0)
+        self.assertEqual(R.decide(list(-700 + 50 * rng.standard_normal(160)), d, 3, 8, groups=g(16))['verdict'], 'b')
+        self.assertEqual(R.decide(list(np.clip(300 * rng.standard_normal(200), -999, 999)), d, 3, 10,
+                                  groups=g(20))['verdict'], 'exhausted')
+        self.assertEqual(R.decide(list(300 * rng.standard_normal(80)), d, 3, 0)['verdict'], 'open')
         self.assertEqual(R.decide([1.0, 2.0] * 10, groups=['m1'] * 5 + ['m2'] * 15)['blocks'], 3)
+        beyond = R.decide([1500.0] + [10.0] * 159, d, 3, 8, groups=g(16))
+        self.assertEqual(beyond['out_of_bound'], 1)
 
-    def test_both_arms_are_needed(self):
-        """The sign-flip arm alone can veto a t crossing: eight conversations of which one carries the whole
-        edge cannot reject symmetry even when the t is large."""
-        d = R.normalize_design({'deals': 50, 'design': {'max_rounds': 4}, 'replicates': 2, 'matchups': THREE})
-        means = [400.0, 40.0, 38.0, 42.0, 41.0, 39.0, 40.5, 39.5]
-        xs = np.repeat(means, 50) + np.tile(np.linspace(-1, 1, 50), 8)
-        v = R.decide(list(xs), d, 3, 4, groups=np.repeat(np.arange(8), 50))
-        self.assertGreater(v['t'], 1)
-        self.assertEqual(v['verdict'], 'exhausted')
+    def test_model_based_is_secondary(self):
+        """The round 6 gate still runs beside the official test for designs it was calibrated for, but it never
+        decides: twelve conversations of a steady small win are 'a' for it and undecided for the official test,
+        and nothing counts."""
+        d = R.normalize_design({'deals': 50, 'design': {'max_rounds': 10}, 'replicates': 4, 'matchups': THREE})
+        xs = np.repeat(40.0 + np.linspace(-1, 1, 12), 50) + np.tile(np.linspace(-1, 1, 50), 12)
+        v = R.adjudicate({'a': 'x', 'b': 'y', 'xs': list(xs), 'groups': list(np.repeat(np.arange(12), 50)),
+                          'rejected': [], 'evidence_hash': 'h'}, d, 3, 3,
+                         facts(R.registration(d, 0), 'xy'))
+        self.assertEqual(v['model_based']['verdict'], 'a')
+        self.assertFalse(v['model_based']['official'])
+        self.assertIn('never official', v['model_based']['label'])
+        self.assertEqual(v['verdict'], 'open')
+        self.assertFalse(v['counts_toward_leader'])
+        short = R.normalize_design({'deals': 1, 'design': {'max_rounds': 10}, 'replicates': 25, 'matchups': THREE})
+        self.assertIsNone(R.decide(list(xs[:250]), short, 3, 10, groups=list(range(250)))['model_based'])
 
     def test_no_misleading_language(self):
         rng = np.random.default_rng(9)
@@ -516,9 +544,10 @@ class TestContract(unittest.TestCase):
             self.assertNotIn(bad, text)
         self.assertIn('not evidence that they are equal', text)
         self.assertIn('descriptive', text)
-        self.assertIn('symmetric', text)
-        self.assertIn('if its assumptions hold', text)
-        self.assertNotRegex(text, r'(?<!assumptions hold, )at most 5% chance')
+        self.assertIn('assumption-free', text)
+        self.assertIn('given independent conversations', text)
+        self.assertNotIn('if its assumptions hold', text)
+        self.assertNotIn('calibrated range', text)
 
 
 if __name__ == '__main__':

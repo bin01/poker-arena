@@ -23,19 +23,25 @@ def cmd_play(args):
     print(summary(ratings(args.out, boot=100)))
 
 
-def _power_table(d) -> str:
-    from .ratings import LEADER_SCENARIO, _pct
+def _power_table(d, lengths=False) -> str:
+    from .ratings import LEADER_SCENARIO, _pct, length_tradeoff
     rows = [f'  {x["scenario"]:12} ICC {x["assumed_icc"]:<5} AR(1) {x["assumed_ar1"]:<4} spread of a conversation '
-            f'{x["sd_conversation_bb100"]:>5.1f} bb/100   counting verdict {_pct(x["power"])} '
-            f'(decided {_pct(x.get("power_decided"))})' for x in d.get('power_scenarios') or []]
-    out = ['Chance that the better player gets a decided verdict that counts, at the target edge (the complete '
-           'adjudicator, simulated: both arms, the minimum, every look, the diagnostics), by how dependent the deals '
-           'turn out to be:'] + rows
+            f'{x["sd_conversation_bb100"]:>5.1f} bb/100   decided {_pct(x["power"])}, after about '
+            f'{x["conversations_used"]:,.0f} conversations' for x in d.get('power_scenarios') or []]
+    out = ['Chance that the better player is decided at the target edge (the official test, simulated look by look as '
+           'the runner stops), by how dependent the deals turn out to be; the error rate does not depend on it:'] + rows
     if d.get('power_by_edge'):
         out.append('  assumed dependence, by edge: ' + ', '.join(f'{e} bb/100 {_pct(p)}' for e, p in d['power_by_edge'].items()))
     for x in d.get('leader_chances') or []:
         out.append(f'  decided leader is the true best player {_pct(x["p_leader"])} if '
                    f'{LEADER_SCENARIO[x["scenario"]].format(e=x["edge_bb100"])} (pairings taken as independent)')
+    if lengths:
+        out.append('Deals per pairing the official test needs for 80% at the target, by conversation length (the bound '
+                   'of the stacks, not the spread, sets the number of conversations, so short conversations cost far '
+                   'fewer deals; long ones also measure what a model learns about its opponent within a match):')
+        out += [f'  {x["round_deals"]:>3} deal{"s" if x["round_deals"] != 1 else " "} per conversation: about '
+                + (f'{x["deals"]:,} deals ({x["conversations"]:,} conversations)' if x['deals'] else 'out of reach')
+                for x in length_tradeoff(d)]
     return '\n'.join(out)
 
 
@@ -46,7 +52,8 @@ def cmd_plan(args):
                                 ('assumed_icc', args.assumed_icc), ('assumed_ar1', args.assumed_ar1),
                                 ('budget_deals', args.budget_deals)) if v is not None}
     plan = make_plan(args.players_list, deals=args.deals, seed=args.seed, out=args.out, players_file=args.players,
-                     concurrency=args.concurrency, design=design, replicates=args.replicates)
+                     concurrency=args.concurrency, design=design, replicates=args.replicates,
+                     game_config={'stack': args.stack} if args.stack else None)
     if args.max_rounds is None:
         plan['design'].pop('max_rounds', None)          # from the power target, not a fixed default
     d = normalize_design(plan)
@@ -57,22 +64,23 @@ def cmd_plan(args):
         n = len(plan['matchups'])
         per_round = 2 * n * args.deals * d['replicates']
         print(f'wrote {args.write}: {n} pairings, {per_round:,} hands per round, at most {d["max_rounds"]} rounds '
-              f'({per_round * d["max_rounds"]:,} hands); a pairing stops once decided or ineligible. If the test\'s '
-              f'assumptions hold, at most {d["alpha"]:.0%} chance of any false verdict over all pairings '
-              f'(docs/methodology.md says which assumptions; each verdict reports its diagnostics, and passing them '
-              f'does not verify the assumptions).')
+              f'({per_round * d["max_rounds"]:,} hands); a pairing stops once decided or ineligible. At most '
+              f'{d["alpha"]:.0%} chance of any false verdict over all pairings, for any distribution of results, given '
+              f'independent conversations (fresh memories): the official test is a betting confidence sequence on '
+              f'conversation means bounded by the stacks (+-{d["outcome_bound_bb100"]:,.0f} bb/100), valid at every '
+              f'look (docs/methodology.md).')
         print(f'The design is registered in {plan["out"]}/plan.json when the tournament starts, before its first '
               f'hand; only then are its verdicts official. Change the plan after that and nothing in the run is a test.')
         print(design_line(d))
-        print(_power_table(d))
+        print(_power_table(d, lengths=True))
         if d['underpowered']:
             if d.get('deals_needed'):
                 print(f'To reach 80% with the assumed dependence, allow about {d["deals_needed"]:,} deals per '
                       f'pairing: drop --max-rounds/--budget-deals, or --max-rounds '
                       f'{-(-d["deals_needed"] // (args.deals * d["replicates"]))} with --replicates {d["replicates"]}.')
             else:
-                print('80% at this target is out of reach of any plan of this shape: the diagnostics a verdict needs '
-                      'to count fail too often, or the edge is too small; raise --target-edge or shorten --deals.')
+                print('80% at this target is out of reach of this plan\'s shape: shorten --deals (fewer deals per '
+                      'conversation), raise --replicates or --target-edge, or play shallower stacks (--stack).')
         try:
             specs = load_players(args.players)
         except (OSError, ValueError):
@@ -125,7 +133,7 @@ def cmd_ratings(args):
     print(summary(r))
     reg = r.get('registration') or {}
     if (r.get('design') or {}).get('registered'):
-        test = (f'the official decisions of the preregistered sequential test on {r["objective"]}, recorded when '
+        test = (f'the official decisions of the preregistered, assumption-free sequential test on {r["objective"]}, recorded when '
                 f'play stopped by the registered judge {reg.get("judge_fingerprint")} (this judge: '
                 f'{r.get("judge_fingerprint")}; anything it recomputes differently is retrospective), each counting '
                 f'only while its evidence still verifies today')
@@ -258,7 +266,12 @@ def main(argv=None):
 
     p = sub.add_parser('plan', help='write a round-robin tournament plan')
     p.add_argument('players_list', nargs='+')
-    p.add_argument('--deals', type=int, default=50)
+    p.add_argument('--deals', type=int, default=1,
+                   help='duplicate deals per conversation (default 1: the official test needs a number of independent '
+                        'conversations set by the stacks, so one deal each needs the fewest deals; longer conversations '
+                        'also measure adaptation within a match, at the cost `plan` prints)')
+    p.add_argument('--stack', type=int, help='chips per stack (default 200: 100 big blinds); the official test\'s bound, '
+                                             'and so the conversations it needs, scale with it')
     p.add_argument('--seed', type=int, default=1000)
     p.add_argument('--out', default='runs/pilot')
     p.add_argument('--players', default='players.toml')
@@ -275,9 +288,9 @@ def main(argv=None):
                                                      'planning (default 0.2)')
     p.add_argument('--alpha', type=float, help='chance of naming any false winner across the whole tournament (default 0.05)')
     p.add_argument('--block', type=int, help='deals per block in the within-conversation intervals (default 10)')
-    p.add_argument('--replicates', type=int, default=4,
+    p.add_argument('--replicates', type=int, default=25,
                    help='independent duplicate pairs (conversations) per pairing per round, each with fresh memories '
-                        '(default 4; a verdict needs at least 8 conversations, more when few are added per look)')
+                        '(default 25; the official test is valid at every look, so this sets only how often it looks)')
     p.add_argument('--target-edge', type=float, help='the edge in bb/100 the plan is powered to detect (default 50)')
     p.set_defaults(fn=cmd_plan)
 
@@ -294,7 +307,7 @@ def main(argv=None):
                    help='resume a run started by other code (the change is recorded in the run)')
     p.set_defaults(fn=cmd_tournament)
 
-    p = sub.add_parser('ratings', help='verdicts per pairing (the sequential test), descriptive strengths (bb/100) and '
+    p = sub.add_parser('ratings', help='verdicts per pairing (the assumption-free sequential test), descriptive strengths (bb/100) and '
                                        'session Elo from every finished duplicate deal under a folder')
     p.add_argument('root', nargs='?', default='runs')
     p.add_argument('--boot', type=int, default=300, help='bootstrap resamples (default 300)')
@@ -333,13 +346,16 @@ def main(argv=None):
     p.add_argument('--players', default='players.toml')
     p.set_defaults(fn=cmd_doctor)
 
-    p = sub.add_parser('quiz', help='poker fundamentals: clear-cut decision spots with computed answers, asked of '
-                                    'each player through its backend; writes runs/<out>/quiz.json')
+    p = sub.add_parser('quiz', help='poker fundamentals: decision spots with computed answers, in separately scored '
+                                    'categories (basics, close, multistreet, inference, sizing), asked of each player '
+                                    'through its backend; writes runs/<out>/quiz.json')
     p.add_argument('ids', nargs='+')
     p.add_argument('--out', default='quiz')
     p.add_argument('--players', default='players.toml')
     p.add_argument('--effort', help='reasoning level for every model (default: each player\'s own, else high)')
-    p.add_argument('--limit', type=int, help='only the first N spots')
+    p.add_argument('--category', action='append', choices=['basics', 'close', 'multistreet', 'inference', 'sizing'],
+                   help='only this category (repeat for more; default: all)')
+    p.add_argument('--limit', type=int, help='only the first N spots of each category')
     p.add_argument('--concurrency', type=int, default=4, help='spots asked at once per player (default 4)')
     p.set_defaults(fn=lambda a: __import__('poker_arena.quiz', fromlist=['main']).main(a))
 

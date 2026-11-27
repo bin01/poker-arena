@@ -19,8 +19,9 @@ def registered(p, created=0):
     return {**p, 'registration': R.registration(R.normalize_design(p), created=created)}
 
 
-def strong(rng, a='x', b='y', edge=300, rounds=4, reps=2, effects=None):
-    return deals_between(a, b, edge, 50, rng, sd=100, rounds=rounds, reps=reps, effects=effects)
+def strong(rng, a='x', b='y', edge=900, rounds=4, reps=2, effects=None):
+    """A win the official test decides in 8 conversations: near the bound of GAME's 10-big-blind stacks."""
+    return deals_between(a, b, edge, 50, rng, sd=20, rounds=rounds, reps=reps, effects=effects)
 
 
 def data(xs_by_conv):
@@ -94,7 +95,7 @@ class TestAdjudicate(unittest.TestCase):
         self.p = registered(plan(['x', 'y'], 50, 4, reps=2))
         self.d = R.normalize_design(self.p)
         rng = np.random.default_rng(3)
-        self.win = data([list(300 + 100 * rng.standard_normal(50)) for _ in range(8)])
+        self.win = data([list(900 + 20 * rng.standard_normal(50)) for _ in range(8)])
 
     def judge(self, who=None, pairing=None, design=None, reg='keep'):
         e = facts(self.p['registration'] if reg == 'keep' else reg, 'xy', who)
@@ -230,52 +231,52 @@ class TestOfficial(unittest.TestCase):
 
 
 class TestAssumptions(unittest.TestCase):
-    """R4-#2: every verdict carries its assumption status; outside the calibrated range a decided verdict never
-    makes a decided leader unless the design preregistered that it should."""
+    """R4-#2, R6-#1: every verdict carries the checks its guarantee needs. The official test needs no assumption
+    on the shape of the results, so conversations that differ far more than their cards explain still decide
+    (only the model-based gate's diagnostics fail); deals repeated across conversations fail the independence
+    check, and such a verdict never makes a decided leader unless the design preregistered that it should."""
 
-    def deals(self, rng):
-        swings = [60.0, -60.0] * 4
-        return (strong(rng, 'x', 'y', 300, effects=swings) + strong(rng, 'x', 'z', 300)
-                + deals_between('y', 'z', 0, 50, rng, sd=100, rounds=4, reps=2))
-
-    def test_outside_the_calibrated_range(self):
+    def test_conversation_effects_do_not_matter(self):
         rng = np.random.default_rng(6)
-        deals = self.deals(rng)
-        r = run(deals, plan(['x', 'y', 'z'], 50, 4, reps=2), boot=20)
-        v = {frozenset((m['a'], m['b'])): m for m in r['pairings']}
-        wide = v[frozenset('xy')]
-        self.assertEqual((wide['verdict'], wide['official'], wide['calibrated']), ('a', True, False))
-        self.assertGreater(wide['conversation_share'], R.FAMILY_SHARE)
-        self.assertEqual(wide['assumptions']['status'], 'unsupported')
-        self.assertEqual(wide['assumptions']['checks']['conversation_share']['limit'], R.FAMILY_SHARE)
-        self.assertEqual(wide['standing'], 'decided (diagnostics failed: outside the calibrated family)')
-        self.assertFalse(wide['counts_toward_leader'])
-        self.assertIsNone(r['leader'])
-        self.assertEqual(r['groups'][0]['leader_outside_calibration'], 'x')
-        self.assertTrue(any('Diagnostics failed (outside the calibrated family)' in n for n in r['notes']))
-        self.assertIn('diagnostics failed: the data are outside the calibrated family', R.summary(r))
-        for m in r['pairings']:
-            self.assertIn(m['assumptions']['status'], ('supported', 'unsupported', 'unknown'))
+        deals = strong(rng, 'x', 'y', 850, effects=[100.0, -100.0] * 4)
+        r = run(deals, plan(['x', 'y'], 50, 4, reps=2), boot=20)
+        [m] = r['pairings']
+        self.assertGreater(m['conversation_share'], R.FAMILY_SHARE)
+        self.assertEqual((m['verdict'], m['official'], m['calibrated'], m['counts_toward_leader']), ('a', True, True, True))
+        self.assertEqual(m['assumptions']['status'], 'supported')
+        self.assertEqual(r['leader']['player'], 'x')
 
-        counted = run(deals, plan(['x', 'y', 'z'], 50, 4, reps=2, design={'outside_calibration': 'count'}), boot=20)
-        self.assertEqual(counted['leader']['player'], 'x')
+    def test_repeated_deals_do_not_count(self):
+        p = registered(plan(['x', 'y'], 50, 4, reps=2))
+        d = R.normalize_design(p)
+        rng = np.random.default_rng(7)
+        win = data([list(900 + 20 * rng.standard_normal(50)) for _ in range(8)])
+        win['fps'] = [f'same:{k}' for _ in range(8) for k in range(50)]   # every conversation on the same cards
+        v = R.adjudicate(win, d, 1, 4, facts(p['registration'], 'xy'))
+        self.assertEqual((v['verdict'], v['eligible'], v['calibrated']), ('a', True, False))
+        self.assertEqual(v['assumptions']['checks']['independent_deals']['status'], 'unsupported')
+        self.assertEqual(v['standing'], 'decided (checks failed: conversations not shown independent)')
+        self.assertFalse(v['counts_toward_leader'])
+        counted = R.normalize_design({**p, 'design': {**p['design'], 'outside_calibration': 'count'}})
+        self.assertTrue(R.adjudicate(win, counted, 1, 4, facts(R.registration(counted, 0), 'xy'))['counts_toward_leader'])
 
-    def test_wording_states_the_assumptions(self):
+    def test_wording_states_the_guarantee(self):
         rng = np.random.default_rng(7)
         r = run(strong(rng), plan(['x', 'y'], 50, 4, reps=2), boot=20)
-        self.assertIn('if the test\'s assumptions hold', r['guarantee'])
-        self.assertIn('symmetric', r['guarantee'])
+        self.assertIn('for any distribution of results', r['guarantee'])
+        self.assertIn('conversations are independent', r['guarantee'])
+        self.assertIn('never official', r['guarantee'])
         text = R.summary(r)
-        self.assertIn('diagnostics passed; distribution assumptions unverified', text)
-        self.assertNotIn('within the calibrated range', text)
-        self.assertNotIn('within calibrated range', text)
-        self.assertEqual(r['pairings'][0]['assumptions']['summary'], 'diagnostics passed; distribution assumptions unverified')
-        self.assertNotIn('at most 5% chance of any false verdict over', text.split('if its assumptions hold, ')[0])
+        self.assertIn('assumption-free', text)
+        self.assertNotIn('calibrated range', text)
+        self.assertEqual(r['pairings'][0]['assumptions']['summary'], R.DIAGNOSTICS['supported'])
 
     def test_repeated_deals_are_unsupported(self):
-        v = R.assumptions({'conversations': 8, 'min_conversations': 8, 'conversation_share': 0.1},
+        v = R.assumptions({'conversations': 8, 'min_conversations': 8, 'out_of_bound': 0},
                           ['f1', 'f2', 'f1'], ['m1', 'm1', 'm2'])
         self.assertEqual((v['status'], v['checks']['independent_deals']['value']), ('unsupported', 1))
+        self.assertEqual(R.assumptions({'conversations': 8, 'min_conversations': 8, 'out_of_bound': 2})
+                         ['checks']['bounded']['status'], 'unsupported')
 
 
 def match(root, name, a, b, nets, *, seeds=None, b_players=None, b_seeds=None, b_fp=None, b_net=None):

@@ -19,6 +19,7 @@ from poker_arena import history, ratings as R, stats
 from poker_arena.runner import make_plan, run_plan
 from test_adjudicate import stand_in
 from test_history import SPECS, write_matchup
+from test_adjudicate import registered
 from test_ratings import MODEL, deals_between, facts, plan, run
 
 PLAYERS = '[players.rule]\nbot = "rule"\nsims = 30\n[players.station]\nbot = "station"\n'
@@ -33,8 +34,9 @@ def write_rows(p: Path, xs):
 
 
 class RealRun(unittest.TestCase):
-    """A registered tournament of two bots, played once: rule against a calling station, decided at its first
-    deciding look (12 conversations of 10 deals). Each test works on its own copy."""
+    """A registered tournament of two bots, played once: rule against a calling station at 10-big-blind stacks
+    (so the official test's bound is +-1,000 bb/100 and a verdict takes a few dozen conversations of 10 deals),
+    decided before its last look. Each test works on its own copy."""
 
     _played = None
 
@@ -45,7 +47,8 @@ class RealRun(unittest.TestCase):
             root = Path(base.name)
             (root / 'players.toml').write_text(PLAYERS)
             p = make_plan([], deals=10, out=str(root / 'run'), players_file=str(root / 'players.toml'),
-                          matchups=[['rule', 'station']], design={'max_rounds': 4}, replicates=4)
+                          matchups=[['rule', 'station']], design={'max_rounds': 14}, replicates=5,
+                          game_config={'stack': 20})
             asyncio.run(run_plan(p, log=lambda *a: None))
             RealRun._played = base
             unittest.addModuleCleanup(base.cleanup)
@@ -211,12 +214,37 @@ class TestRecordVerifier(RealRun):
         self.assertIn(k, [x[0] for x in bad])
         self.assertLessEqual(big, 400)
 
+    def test_style_totals_count_verified_results_only(self):
+        """R6-#10: one reader decides which hands are results; the style statistics use it, so a tampered hand
+        never reaches a style total, and each player's stats say which population they cover."""
+        before = stats.collect(self.run_dir)['rule']
+        self.tamper()
+        R._VERIFIED.clear()
+        after = stats.collect(self.run_dir)['rule']
+        self.assertEqual(after['hands'], before['hands'] - 2)          # the hand, in both plays of its deal
+        self.assertEqual(after['population']['rejected_hands'], 2)
+        self.assertIn('verified results only', after['population']['counted'])
+        v = R.verified_hands(self.folder(1, 2) / 'a-first')
+        self.assertNotIn(3, v['verified'])
+        self.assertEqual(v['rejected'], [3])
+
     def test_uncommitted_rows_do_not_count(self):
         d = self.folder(1, 1) / 'a-first'
         state = json.loads((d / 'state.json').read_text())
         state['hands_committed'] = 5
         (d / 'state.json').write_text(json.dumps(state))
         self.assertEqual(sorted(x['deal'] for x in R.load_deals(self.folder(1, 1))), [0, 1, 2, 3, 4])
+
+    def test_uncommitted_rows_are_provisional(self):
+        d = self.folder(1, 1) / 'a-first'
+        state = json.loads((d / 'state.json').read_text())
+        state['hands_committed'] = 5
+        (d / 'state.json').write_text(json.dumps(state))
+        conv = R.read_conversation(self.folder(1, 1))
+        self.assertEqual(conv['verified'], [0, 1, 2, 3, 4])
+        self.assertEqual(conv['provisional']['a-first'], [5, 6, 7, 8, 9])
+        self.assertEqual(conv['provisional']['b-first'], [5, 6, 7, 8, 9])
+        self.assertEqual(stats.collect(self.folder(1, 1))['rule']['population']['provisional_hands'], 10)
 
     def test_a_missing_verifier_fails_closed(self):
         with mock.patch('poker_arena.games.holdem.Holdem.verify', side_effect=RuntimeError('broken')):
@@ -236,6 +264,68 @@ class TestRecordVerifier(RealRun):
         self.assertTrue(any('not verified' in x for x in v['ineligible_reasons']))
         self.assertEqual(R.adjudicate({**data, 'xs': [], 'groups': [], 'evidence_hash': 'h'}, R.normalize_design(p), 1,
                                       4, facts(p['registration'], 'xy'))['verdict'], 'ineligible')
+
+
+class TestLinkedAudit(unittest.TestCase):
+    """R6-#3, judge side: each accepted decision's audit is derived from the records that carry its
+    decision_id (the action, every call attempt, the raw output rows), and the evidence an official decision is
+    bound to covers the call and raw records too."""
+    CFG = {'players': ['m', 'bot'], 'specs': {'m': {'backend': 'claude', 'model': 'claude-x-1'}, 'bot': {'bot': 'rule'}}}
+
+    def records(self):
+        events = [{'kind': 'thought', 'episode': 0, 'data': {'seat': 0, 'player': 'm', 'decision_id': 'd1', 'audit': 'verified'}},
+                  {'kind': 'action', 'episode': 0, 'data': {'seat': 0, 'decision_id': 'd1'}},
+                  {'kind': 'thought', 'episode': 0, 'data': {'seat': 1, 'player': 'bot'}},
+                  {'kind': 'action', 'episode': 0, 'data': {'seat': 1}}]
+        calls = [{'hand': 0, 'seat': 0, 'player': 'm', 'decision_id': 'd1', 'attempt': 0, 'audit': 'unverified'},
+                 {'hand': 0, 'seat': 0, 'player': 'm', 'decision_id': 'd1', 'attempt': 1, 'audit': 'verified'}]
+        raw = [{'hand': 0, 'seat': 0, 'decision_id': 'd1', 'attempt': 0, 'stdout': '...'},
+               {'hand': 0, 'seat': 0, 'decision_id': 'd1', 'attempt': 1, 'stdout': '...'}]
+        return events, calls, raw
+
+    def test_derived_from_linked_attempts(self):
+        events, calls, raw = self.records()
+        self.assertEqual(R.linked_audit(self.CFG, 0, events, calls, raw)[0],
+                         {'decisions': 1, 'linked': 1, 'verified': 1, 'opaque': 0, 'problems': []})
+        x = R.linked_audit(self.CFG, 0, events, calls, raw[:1] + [{**raw[1], 'failed_try': 0}])[0]   # only a failed try's
+        self.assertEqual((x['verified'], len(x['problems'])), (0, 1))
+        x = R.linked_audit(self.CFG, 0, events, [{**c, 'decision_id': 'other'} for c in calls], raw)[0]
+        self.assertEqual(x['linked'], 0)
+        self.assertNotIn(1, R.linked_audit(self.CFG, 0, events, calls, raw))   # bots make no audited decisions
+        bad = R.linked_status([{'audit': {'m': x}}])['m']
+        self.assertEqual(bad['status'], 'incomplete')
+        legacy = R.linked_status([{'audit': {'m': {'decisions': 3, 'linked': 0, 'verified': 0, 'opaque': 0, 'problems': []}}}])
+        self.assertEqual(legacy['m']['status'], 'legacy')
+
+    def test_adjudicate_rejects_an_unlinked_audit(self):
+        p = registered(plan(['m', 'y'], 50, 4, reps=2))
+        d = R.normalize_design(p)
+        rng = np.random.default_rng(3)
+        win = {'a': 'm', 'b': 'y', 'xs': list(900 + 20 * rng.standard_normal(400)),
+               'groups': list(np.repeat(np.arange(8), 50)), 'rejected': [], 'evidence_hash': 'h',
+               'linked_audit': {'m': {'status': 'incomplete', 'problems': ['hand 0 decision d1: no raw output row']}}}
+        v = R.adjudicate(win, d, 1, 4, facts(p['registration'], ('m', 'y'), {'m': MODEL}))
+        self.assertEqual((v['verdict'], v['test_verdict']), ('ineligible', 'a'))
+        self.assertTrue(any('linked call records' in r for r in v['ineligible_reasons']))
+        ok = R.adjudicate({**win, 'linked_audit': {'m': {'status': 'complete'}}}, d, 1, 4,
+                          facts(p['registration'], ('m', 'y'), {'m': MODEL}))
+        self.assertEqual(ok['verdict'], 'a')
+
+    def test_the_evidence_covers_calls_and_raw_output(self):
+        with tempfile.TemporaryDirectory() as t:
+            d = Path(t)
+            events, calls, raw = self.records()
+            write_rows(d / 'calls.jsonl', calls)
+            write_rows(d / 'raw.jsonl', raw)
+            hand = {'hand': 0, 'net': [1, -1]}
+            cfg = {**self.CFG, 'seeds': [7]}
+            with mock.patch.object(R, 'verify_hand', lambda *a: {'ok': True, 'errors': []}):
+                first = R.verify_play(d, cfg, {0: hand})[0]
+                write_rows(d / 'raw.jsonl', raw[:1])
+                R._VERIFIED.clear()
+                second = R.verify_play(d, cfg, {0: hand})[0]
+        self.assertEqual(first['digest'], second['digest'])                   # version 1 cannot see it
+        self.assertNotEqual(first['digest_linked'], second['digest_linked'])  # version 2 does
 
 
 class TestPinnedVersions(RealRun):
@@ -264,19 +354,49 @@ class TestFundamentals(unittest.TestCase):
     mixed into strengths or verdicts; plans are told to include the reference bot."""
 
     def test_separate_section(self):
+        """R6-#4, #5: scores are recounted from the answers (a fallback never counts, even where folding was
+        best; valid-answer accuracy apart), carry their provenance, attach to a run's player only when eligible,
+        and the fixed basics get counts, not population intervals."""
+        call = {'attempt': 0, 'raw': {'stdout': '{}'}, 'identity_match': 'match'}
+        ans = lambda spot, executed, outcome='valid', cat='basics': {
+            'spot': spot, 'category': cat, 'executed': executed, 'outcome': outcome, 'fallback': outcome != 'valid',
+            'correct': executed == 'fold', 'ev_loss_bb': 0.0 if executed == 'fold' else 1.0, 'identity_match': 'match',
+            'audit': 'verified', 'calls': [call]}
+        answers = [ans('b1', 'fold'), ans('b2', 'fold', 'fallback'), ans('b3', 'call'), ans('c1', 'fold', cat='close')]
+        doc = {'version': 'quiz-2', 'spots_hash': 'h', 'spots': [{'id': k, 'correct': 'fold'} for k in ('b1', 'b2', 'b3', 'c1')],
+               'categories': {'basics': {'population': None}, 'close': {'population': 'generated', 'estimand': 'share'}},
+               'players': {
+                   'opus': {'spec': {'backend': 'claude', 'model': 'claude-x-1', 'effort': 'high'}, 'kind': 'model',
+                            'answered': 3, 'correct': 2, 'answers': answers, 'protocol': {'fingerprint': 'p1'},
+                            'implementation': {'fingerprint': 'i1'}, 'cli_version': '2.0',
+                            'eligibility': {'status': 'eligible', 'reasons': []}},
+                   'old': {'spec': {'backend': 'claude', 'model': 'claude-z-1', 'effort': 'high'}, 'answered': 30,
+                           'correct': 24, 'accuracy': 0.8, 'ev_loss_bb': 12.5, 'fallbacks': 0}}}
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            (root / 'quiz.json').write_text(json.dumps({'version': 'quiz-1', 'spots_hash': 'h', 'players': {
-                'opus': {'spec': {'backend': 'claude', 'model': 'claude-x-1', 'effort': 'high'}, 'answered': 30,
-                         'correct': 24, 'accuracy': 0.8, 'ev_loss_bb': 12.5, 'mean_ev_loss_bb': 0.417, 'fallbacks': 0}}}))
-            f = R.fundamentals(root, {'m1': 'claude:claude-x-1:high#abcd1234@ffff0000'})
+            (root / 'quiz.json').write_text(json.dumps(doc))
+            f = R.fundamentals(root, {'m1': 'claude:claude-x-1:high#abcd1234@ffff0000',
+                                      'm2': 'claude:claude-z-1:high#abcd1234@ffff0000'})
+            bad = json.loads(json.dumps(doc))
+            bad['players']['opus']['answers'][0]['identity_match'] = 'mismatch'
+            (root / 'quiz.json').write_text(json.dumps(bad))
+            g = R.fundamentals(root, {'m1': 'claude:claude-x-1:high#abcd1234@ffff0000'})
         self.assertEqual(f['label'], 'poker fundamentals')
         x = f['players']['m1']
-        self.assertEqual((x['quiz_player'], x['correct'], x['answered']), ('opus', 24, 30))
-        self.assertTrue(x['accuracy_ci95'][0] < 0.8 < x['accuracy_ci95'][1])
+        self.assertEqual((x['quiz_player'], x['attached'], x['correct'], x['answered'], x['fallbacks']), ('opus', True, 1, 3, 1))
+        self.assertEqual((x['valid_correct'], x['valid_answers'], x['valid_accuracy']), (1, 2, 0.5))
+        self.assertIsNone(x['categories']['basics']['interval95'])
+        self.assertIsNotNone(x['categories']['close']['interval95'])
+        self.assertEqual(x['provenance']['implementation'], 'i1')
+        self.assertEqual(x['eligibility']['status'], 'eligible')
+        self.assertNotIn('m2', f['players'])                               # no answers kept: not attached
+        self.assertEqual(f['players']['old']['eligibility']['status'], 'unverified')
+        self.assertNotIn('m1', g['players'])
+        self.assertEqual(g['players']['opus']['eligibility']['status'], 'ineligible')
         text = R.fundamentals_text(f)
         self.assertIn('apart from match results', text)
-        self.assertIn('24/30', text)
+        self.assertIn('1/3', text)
+        self.assertNotIn('95%', text.split('close')[0])
         self.assertIsNone(R.fundamentals(Path(tempfile.gettempdir()) / 'no-such-run'))
 
     def test_reference_edge_and_warning(self):
@@ -289,6 +409,8 @@ class TestFundamentals(unittest.TestCase):
         self.assertEqual(m['vs_reference']['reference'], 'ref')
         self.assertGreater(m['vs_reference']['edge'], 0)
         self.assertTrue(r['groups'][0]['has_reference'])
+        self.assertEqual(m['vs_reference']['reference_version'], R.REFERENCE['version'])
+        self.assertTrue(any('not a solver' in n and '+408' in n for n in r['notes']), r['notes'])
         no = R.rate(deals_between('m', 'n', 0, 50, rng, sd=100, rounds=2, reps=2), boot=20, pooled=True)
         self.assertTrue(any('reference' in n and 'quiz' in n for n in no['notes']))
 
@@ -306,7 +428,7 @@ class TestFundamentals(unittest.TestCase):
                     cli.main(['plan', *players, '--players', str(pf), '--write', str(Path(d) / 'plan.json'),
                               '--out', str(Path(d) / 'run')])
                 self.assertEqual('No reference player' in out.getvalue(), warned)
-                self.assertIn('complete adjudicator', out.getvalue())
+                self.assertIn('official test', out.getvalue())
                 self.assertIn('decided leader', out.getvalue())
 
 

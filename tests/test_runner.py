@@ -331,10 +331,12 @@ class TestTempFolder(unittest.TestCase):
         import os
         import conftest
         env = {'TMPDIR': '/nonexistent-read-only/tmp', 'TEMP': '', 'TMP': ''}
-        with mock.patch.dict(os.environ, env), mock.patch.object(tempfile, 'gettempdir', side_effect=FileNotFoundError):
+        real = conftest._writable
+        system_read_only = lambda d: 'read-only' if str(d) in ('/tmp', '/var/tmp') else real(d)
+        with mock.patch.dict(os.environ, env), mock.patch.object(conftest, '_writable', system_read_only):
             self.assertEqual(Path(conftest._choose()), Path(__file__).resolve().parent / '.tmp')
         with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {'TMPDIR': d}):
-            self.assertEqual(conftest._choose(), d)                          # TMPDIR first when writable
+            self.assertEqual(conftest._choose(), str(Path(d).resolve()))     # TMPDIR first when writable
 
 
 if __name__ == '__main__':

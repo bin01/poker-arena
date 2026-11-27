@@ -1,5 +1,7 @@
 """How each player plays, and how its backend behaved: poker style stats from hands.jsonl and operational
-stats from calls.jsonl and events.jsonl, over every match under a folder.
+stats from calls.jsonl and events.jsonl, over every match under a folder, counting only verified results (the
+hands `ratings.read_conversation` accepts: committed by both plays, validated as a duplicate pair, replayed
+from their seeds). `population` says so, with the provisional and rejected hands left out.
 
 Style (standard poker tracking definitions, per hand dealt):
     vpip   voluntarily put money in preflop (called or raised; checking the big blind doesn't count)
@@ -50,15 +52,28 @@ def _ratio(a, b):
     return None if not b else a / b
 
 
-def tally(d: Path) -> tuple[dict, dict]:
-    """Raw counts per player for one match folder: ({player: {count: n}}, {player: {served models}}).
+def tally(d: Path, hands=None) -> tuple[dict, dict]:
+    """Raw counts per player for one match folder: ({player: {count: n}}, {player: {served models}}), over its
+    verified results only (`ratings.verified_hands`: hands both plays committed, validated as a duplicate pair
+    and replayed from their seeds; or the hand indices `hands` gives). Hands written but not yet results
+    (`provisional_hands`) and hands that failed validation (`rejected_hands`) are counted, never tallied.
     Counts add up across matches; `summarize` turns them into rates."""
+    from .ratings import verified_hands
     c = defaultdict(lambda: defaultdict(float))
     served = defaultdict(set)
     d = Path(d)
     cfg = json.loads((d / 'config.json').read_text())
     players = cfg.get('players', [])
-    for h in _lines(d / 'hands.jsonl'):
+    v = verified_hands(d) if hands is None else {'verified': set(hands), 'provisional': [], 'rejected': []}
+    keep = v['verified']
+    rows = _lines(d / 'hands.jsonl')
+    for p in players:
+        c[p]['provisional_hands'] += len(v['provisional'])
+        c[p]['rejected_hands'] += len({h.get('hand') for h in rows} - keep - set(v['provisional'])) \
+            if v['rejected'] == 'all' else len(v['rejected'])
+    for h in rows:
+        if h.get('hand') not in keep:
+            continue
         acts = h.get('actions', [])
         contenders = {int(k) for k in (h.get('best') or {})}
         for seat, p in enumerate(players):
@@ -85,10 +100,15 @@ def tally(d: Path) -> tuple[dict, dict]:
                     s[pre_ + k] += v
             s['corrected'] += sum(bool(a.get('note')) for a in mine)
     for e in _lines(d / 'events.jsonl'):
-        if e.get('kind') == 'thought':
+        if e.get('kind') == 'thought' and e.get('episode') in keep:
             x = e['data']
             c[x['player']]['fallbacks'] += bool(x.get('fallback'))
     for call in _lines(d / 'calls.jsonl'):
+        for k in ('served_model', 'observed_model'):     # which model answered: from every call, result or not
+            if call.get(k):
+                served[call['player']].add(call[k])
+        if call.get('hand') not in keep:
+            continue
         s = c[call['player']]
         s['calls'] += 1
         s['retries'] += call.get('attempt', 0) > 0
@@ -98,10 +118,6 @@ def tally(d: Path) -> tuple[dict, dict]:
         s['tokens_in'] += (u.get('input_tokens') or 0) + (u.get('cache_read_input_tokens') or 0) \
             + (u.get('cache_creation_input_tokens') or 0)
         s['tokens_out'] += u.get('output_tokens') or 0
-        if call.get('served_model'):
-            served[call['player']].add(call['served_model'])
-        if call.get('observed_model'):
-            served[call['player']].add(call['observed_model'])
         for k, v in audit_counts(call, (cfg.get('specs') or {}).get(call['player'], {}).get('model')).items():
             s[k] += v
     return {p: dict(v) for p, v in c.items()}, {p: set(v) for p, v in served.items()}
@@ -177,6 +193,9 @@ def summarize(s: dict, served=()) -> dict:
         'latency_mean': _ratio(g('latency'), g('calls')), 'latency_max': g('slowest') or None,
         'tokens_in': int(g('tokens_in')) or None, 'tokens_out': int(g('tokens_out')) or None,
         'served_models': sorted(served),
+        'population': {'counted': 'verified results only: hands both plays committed, validated as duplicate '
+                                  'pairs and replayed from their seeds', 'hands': int(g('hands')),
+                       'provisional_hands': int(g('provisional_hands')), 'rejected_hands': int(g('rejected_hands'))},
         'audit': {k: int(g(f'audit:{k}')) for k in AUDIT},
         'identity': {k: int(g(f'identity:{k}')) for k in IDENTITY},
         'identity_match': {k: int(g(f'identity:{k}')) for k in IDENTITY},

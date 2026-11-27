@@ -23,16 +23,22 @@ such a reply). `meta['audit']` says how far the turn could be checked: 'verified
 the turn was read in full), 'unverified' (a record should exist but couldn't be read: the seat rejects the reply
 and asks again, as for tool use; gemini output without tool counts is one) or 'opaque' (this backend never exposes
 one; its protocol says so, and the judge never counts such turns towards a decided result unless the design
-preregistered it). Every reply also says who answered: `requested_model`, `observed_model` (claude: the init
-event's model; agy: the transcript's; gemini: its stats' only model; openai_compat: the response's; codex and
-command: none), `identity_reported` and `identity_match` ('match' | 'mismatch' | 'unattested', by
-ratings.same_model; the field every consumer judges identity by) and the older `identity` (only whether a model
-was named). `state()` / `restore()` let a stopped match resume; `rebuild()` starts a CLI conversation over
+preregistered it). Every reply also says who answered: `observed_models`, every model the backend's own output
+names as answering the turn (claude: each assistant message's model, with the init event's model as supplementary
+evidence that must agree; agy: each transcript step's; gemini: every model in its stats; openai_compat: the
+response's; codex and command: none), `observed_model` (the one model when they agree), `identity_reported` and
+`identity_match` ('match' only when every named model is the requested one, by ratings.same_model; 'mismatch' when
+any is another; 'unattested' when none is named; the field every consumer judges identity by) and the older
+`identity` (only whether a model was named). `evidence(raw)` re-derives a call's text, tool use, models and audit
+from its retained raw output alone, and `verify_call` checks a recorded call against it. Every launch re-checks
+the CLI it runs (`cli_artifact`: resolved path, version, sha256 of the file) and records it as `meta['cli']`; a
+change from the pinned artifact (`cli_pin`) is kept in `cli_transitions`. `state()` / `restore()` let a stopped match resume; `rebuild()` starts a CLI conversation over
 from the turns the match committed, for when the CLI's own conversation may hold turns the record dropped.
 `protocol()` is what a player's results depend on, for its identity across runs.
 """
 from __future__ import annotations
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -52,33 +58,64 @@ class BackendError(RuntimeError):
     pass
 
 
-_VERSIONS: dict = {}
+_ARTIFACTS: dict = {}
+
+
+def cli_artifact(exe: str | None) -> dict | None:
+    """The CLI `exe` resolves to now: {exe, path (symlinks resolved), version (`--version`, first line), sha256}.
+    Re-checked on every call: the file is re-hashed and asked its version only when its stat changed."""
+    if not exe:
+        return None
+    path = shutil.which(exe)
+    if not path:
+        return {'exe': exe, 'path': None, 'version': None, 'sha256': None}
+    real = os.path.realpath(path)
+    try:
+        st = os.stat(real)
+    except OSError:
+        return {'exe': exe, 'path': real, 'version': None, 'sha256': None}
+    key = (st.st_size, st.st_mtime_ns, st.st_ino, st.st_ctime_ns)
+    cached = _ARTIFACTS.get(real)
+    if not cached or cached[0] != key:
+        digest = hashlib.sha256()
+        try:
+            with open(real, 'rb') as f:
+                for chunk in iter(lambda: f.read(1 << 20), b''):
+                    digest.update(chunk)
+            sha = digest.hexdigest()
+        except OSError:
+            sha = None
+        version = None
+        try:
+            out = subprocess.run([real, '--version'], capture_output=True, text=True, timeout=30,
+                                 stdin=subprocess.DEVNULL)
+            lines = (out.stdout.strip() or out.stderr.strip()).splitlines()
+            version = lines[0][:200] if lines else None
+        except (OSError, subprocess.SubprocessError):
+            pass
+        cached = _ARTIFACTS[real] = (key, {'path': real, 'version': version, 'sha256': sha})
+    return {'exe': exe, **cached[1]}
+
+
+def artifact_changed(old: dict | None, new: dict | None) -> bool:
+    return bool(old and new) and any(old.get(k) != new.get(k) for k in ('path', 'version', 'sha256'))
 
 
 def cli_version(exe: str | None) -> str | None:
-    """`<exe> --version`, first line, asked once per process."""
-    if not exe:
-        return None
-    if exe not in _VERSIONS:
-        path, version = shutil.which(exe), None
-        if path:
-            try:
-                out = subprocess.run([path, '--version'], capture_output=True, text=True, timeout=30)
-                lines = (out.stdout.strip() or out.stderr.strip()).splitlines()
-                version = lines[0][:200] if lines else None
-            except (OSError, subprocess.SubprocessError):
-                pass
-        _VERSIONS[exe] = version
-    return _VERSIONS[exe]
+    """`<exe> --version`, first line, re-checked whenever the resolved file changes."""
+    a = cli_artifact(exe)
+    return a['version'] if a else None
 
 
 def identity_fields(requested, observed) -> dict:
-    """{identity_reported, identity_match} for one reply (see Backend.identity)."""
+    """{identity_reported, identity_match} for one reply (see Backend.identity). `observed` is one model or every
+    model the output named: all of them must be the requested one."""
     from .ratings import same_model
-    if not observed:
+    models = [m for m in (observed if isinstance(observed, (list, tuple, set)) else [observed]) if m]
+    if not models:
         return {'identity_reported': False, 'identity_match': 'unattested'}
     return {'identity_reported': True,
-            'identity_match': 'match' if requested and same_model(requested, observed) else 'mismatch'}
+            'identity_match': 'match' if requested and all(same_model(requested, m) for m in models) else 'mismatch'}
 
 
 def backend_exe(spec: dict) -> str | None:
@@ -102,7 +139,8 @@ class Reply:
 class Backend:
     stateful = False
     exe: str | None = None   # the CLI this backend runs, for the version in the match's config
-    PRIVATE = {'system', 'turns', 'session', 'workdir', 'label', 'key', 'rebuilding', 'last_call'}
+    PRIVATE = {'system', 'turns', 'session', 'workdir', 'label', 'key', 'rebuilding', 'last_call', 'cli_pin',
+               'cli_transitions'}
     NOT_PROTOCOL = {'timeout', 'rate_limit_wait', 'max_wait', 'print_timeout'}   # settings that don't change play
     TOOLS = 'none offered'   # how this CLI keeps tools away from the model (tool_policy)
     AUDIT = 'verified'       # what a turn's record shows by default (see the module docstring)
@@ -121,6 +159,8 @@ class Backend:
         self.workdir: str | None = None    # one empty folder per seat, kept for the match (CLIs key sessions by folder)
         self.rebuilding = False            # the next turn opens a new conversation that replays self.turns
         self.last_call: dict = {}
+        self.cli_pin: dict | None = None   # the CLI artifact this seat must keep running (set by the runner)
+        self.cli_transitions: list = []    # [{t, exe, from, to}] every launch that found another artifact
 
     def describe(self) -> dict:
         """Effective settings, defaults included (never the system prompt, conversation or keys)."""
@@ -235,27 +275,46 @@ class Backend:
                 self.rebuilding = False
             reply.meta = {**meta, **reply.meta}
             reply.meta.setdefault('audit', self.AUDIT)
-            reply.meta.update(self.identity(reply.meta.get('observed_model')))
+            if self.last_call.get('cli'):
+                reply.meta['cli'] = self.last_call['cli']
+            models = reply.meta.get('observed_models') or ([reply.meta['observed_model']]
+                                                           if reply.meta.get('observed_model') else [])
+            reply.meta.update(self.identity(reply.meta.get('observed_model'), models))
+            if reply.meta.get('raw') is None:   # no CLI ran (an in-process backend): what it returned is the record
+                reply.meta['raw'] = {'synthetic': {'text': reply.text, 'tools': reply.meta.get('tool_use') or [],
+                                                   'models': models, 'audit': reply.meta['audit']}}
             self.turns.append([text, reply.text])
             return reply
 
     async def _call(self, text: str) -> Reply:
         raise NotImplementedError
 
-    def identity(self, observed: str | None = None) -> dict:
+    def identity(self, observed: str | None = None, models: list | None = None) -> dict:
         """Who was asked and who answered, for one call: `requested_model` (the configured model, None for the
         CLI's default), `observed_model` (the model the backend's own output names, None when it names none),
         `identity_reported` (whether the output named a model at all) and `identity_match`: 'match' when the named
         model is the requested one (ratings.same_model), 'mismatch' when it is another model (or nothing was
         requested), 'unattested' when the output named none. `identity` ('attested' | 'unattested') only says
-        whether a model was named; consumers judge identity by `identity_match`."""
-        out = {'requested_model': self.model, 'observed_model': observed or None, **identity_fields(self.model, observed),
-               'identity': 'attested' if observed else 'unattested'}
+        whether a model was named; consumers judge identity by `identity_match`. `models` is every model the output
+        named for the turn: identity_match is 'match' only when all of them are the requested one."""
+        models = sorted({m for m in (models or [observed]) if m})
+        out = {'requested_model': self.model, 'observed_model': observed or None,
+               **identity_fields(self.model, models), 'identity': 'attested' if models else 'unattested'}
+        if models:
+            out['observed_models'] = models
         if getattr(self, 'effort', None) is not None:
             out['requested_effort'] = self.effort
         if observed:
             out['served_model'] = observed
         return out
+
+    @classmethod
+    def evidence(cls, raw) -> dict | None:
+        """What a call's retained raw output alone says: {text, tools, models, audit}; None when it can't say.
+        In-process backends (no CLI) keep their reply as `synthetic` evidence."""
+        if isinstance(raw, dict) and isinstance(raw.get('synthetic'), dict):
+            return raw['synthetic']
+        return None
 
     # ---- running a CLI -----------------------------------------------------------------------
     def folder(self) -> str:
@@ -273,6 +332,14 @@ class Backend:
         exe = shutil.which(cmd[0])
         if not exe:
             raise BackendError(f'{cmd[0]!r} is not installed or not on PATH')
+        art = await asyncio.to_thread(cli_artifact, cmd[0])
+        self.last_call['cli'] = art
+        if self.cli_pin is None:
+            self.cli_pin = art
+        elif artifact_changed(self.cli_pin, art):
+            self.cli_transitions.append({'t': round(time.time()), 'exe': cmd[0], 'from': self.cli_pin, 'to': art})
+            self.cli_pin = art
+        exe = art['path'] or exe
         workdir = cwd or self.folder()
         proc = await asyncio.create_subprocess_exec(
             exe, *cmd[1:], cwd=workdir, stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
@@ -368,15 +435,34 @@ class ClaudeCLI(Backend):
         if self.session:
             cmd += ['--resume', self.session]
         out = await self.run(cmd + self.extra_args, stdin=text)
+        p = self.parse(out)
+        if p['result'] is None or p['is_error']:
+            raise BackendError(f'claude returned no result: {out.strip()[-1500:]}')
+        self.session = p['session'] or self.session
+        models = p['models']
+        meta = {'session': self.session, 'observed_model': p['answered'][0] if len(p['answered']) == 1 else None,
+                **({'observed_models': models} if models else {}),
+                **({'answered_by': p['answered']} if p['answered'] else {}),
+                **({'init_model': p['init_model']} if p['init_model'] else {}),
+                **({'tool_use': p['tools']} if p['tools'] else {})}
+        return Reply(p['result'], '\n'.join(p['thinking']), p['usage'], meta=meta)
+
+    @staticmethod
+    def parse(out: str) -> dict:
+        """The stream-json output of one turn. `answered`: the model of every assistant message; `models`: those and
+        the init event's model (supplementary: a turn whose init names another model than its messages is mixed),
+        empty when no assistant message names one."""
         thinking, result, usage, session, is_error, tools = [], None, {}, None, False, []
-        observed, answered = None, []
+        init, answered = None, []
         for line in out.splitlines():
             try:
                 ev = json.loads(line)
             except ValueError:
                 continue
+            if not isinstance(ev, dict):
+                continue
             if ev.get('type') == 'system' and ev.get('subtype') == 'init':
-                observed = ev.get('model') or observed
+                init = ev.get('model') or init
             if ev.get('type') == 'assistant':
                 if (ev.get('message') or {}).get('model'):
                     answered.append(ev['message']['model'])
@@ -392,13 +478,16 @@ class ClaudeCLI(Backend):
                 usage = {**usage, 'cost_usd_equivalent': ev.get('total_cost_usd')}
             if ev.get('session_id'):
                 session = session or ev['session_id']
-        if result is None or is_error:
-            raise BackendError(f'claude returned no result: {out.strip()[-1500:]}')
-        self.session = session or self.session
-        meta = {'session': self.session, 'observed_model': observed or (answered[-1] if answered else None),
-                **({'answered_by': sorted(set(answered))} if answered else {}),
-                **({'tool_use': tools} if tools else {})}
-        return Reply(result, '\n'.join(thinking), usage, meta=meta)
+        models = sorted(set(answered) | ({init} if init and answered else set()))
+        return {'thinking': thinking, 'result': result, 'usage': usage, 'session': session, 'is_error': is_error,
+                'tools': tools, 'init_model': init, 'answered': sorted(set(answered)), 'models': models}
+
+    @classmethod
+    def evidence(cls, raw):
+        if not isinstance(raw, dict) or not isinstance(raw.get('stdout'), str):
+            return None
+        p = cls.parse(raw['stdout'])
+        return {'text': p['result'], 'tools': p['tools'], 'models': p['models'], 'audit': cls.AUDIT}
 
     def _session_from(self, stdout):
         return _ids(stdout, 'session_id')
@@ -452,15 +541,28 @@ class CodexCLI(Backend):
             cmd = ['codex', 'exec', '--sandbox', 'read-only', *flags, '-']
             prompt = text if self.replace_instructions else self.system + '\n\n=== THE MATCH BEGINS ===\n' + text
         out = await self.run(cmd, stdin=prompt)
-        messages, thinking, usage, tools = [], [], {}, {}
+        p = self.parse(out)
+        self.session = p['session'] or self.session
+        if p['failed']:
+            raise BackendError(f'codex: {p["failed"][:1500]}')
+        if not p['messages']:
+            raise BackendError(f'codex returned no message: {out.strip()[-1500:]}')
+        meta = {'session': self.session, **({'tool_use': p['tools']} if p['tools'] else {})}
+        return Reply(p['messages'][-1], '\n'.join(p['thinking']), p['usage'], meta=meta)
+
+    @staticmethod
+    def parse(out: str) -> dict:
+        messages, thinking, usage, tools, session, failed = [], [], {}, {}, None, None
         for line in out.splitlines():
             try:
                 ev = json.loads(line)
             except ValueError:
                 continue
+            if not isinstance(ev, dict):
+                continue
             t = ev.get('type', '')
             if t == 'thread.started':
-                self.session = ev.get('thread_id') or self.session
+                session = ev.get('thread_id') or session
             elif t in ('item.started', 'item.completed'):
                 item = ev.get('item') or {}
                 kind = item.get('type') or item.get('item_type')
@@ -475,12 +577,18 @@ class CodexCLI(Backend):
                     thinking.append(item.get('text', ''))
             elif t == 'turn.completed':
                 usage = ev.get('usage') or {}
-            elif t in ('turn.failed', 'error'):
-                raise BackendError(f'codex: {json.dumps(ev)[:1500]}')
-        if not messages:
-            raise BackendError(f'codex returned no message: {out.strip()[-1500:]}')
-        meta = {'session': self.session, **({'tool_use': list(tools.values())} if tools else {})}
-        return Reply(messages[-1], '\n'.join(thinking), usage, meta=meta)
+            elif t in ('turn.failed', 'error') and failed is None:
+                failed = json.dumps(ev)
+        return {'messages': messages, 'thinking': thinking, 'usage': usage, 'tools': list(tools.values()),
+                'session': session, 'failed': failed}
+
+    @classmethod
+    def evidence(cls, raw):
+        if not isinstance(raw, dict) or not isinstance(raw.get('stdout'), str):
+            return None
+        p = cls.parse(raw['stdout'])
+        return {'text': p['messages'][-1] if p['messages'] and not p['failed'] else None, 'tools': p['tools'],
+                'models': [], 'audit': cls.AUDIT}
 
     def _session_from(self, stdout):
         return _ids(stdout, 'thread_id', {'thread.started'})
@@ -527,30 +635,58 @@ class AgyCLI(Backend):
     AUDIT_SOURCE = 'the conversation transcript agy writes under ' + BRAIN
 
     def _transcript(self):
-        """(thinking, model, tool calls, audit) of this turn (the steps after the last user input) in the
-        conversation's transcript. audit is 'unverified' when the transcript can't be read or holds no response
-        for this turn: then nothing is known about the tools the turn ran."""
+        """The rows of this turn (the steps after the last user input) in the conversation's transcript, the user
+        input included; None when the transcript can't be read."""
         path = os.path.join(self.BRAIN, self.session or '', '.system_generated', 'logs', 'transcript.jsonl')
         try:
             with open(path) as f:
                 lines = f.read().splitlines()
         except OSError:
-            return '', None, [], 'unverified'
+            return None
         rows = []
         for line in lines:
             try:
                 rows.append(json.loads(line))
             except ValueError:
                 continue
-        start = max((i for i, r in enumerate(rows) if r.get('type') == 'USER_INPUT'), default=-1) + 1
-        thinking, model, tools, seen = '', None, [], False
-        for rec in rows[start:]:
-            if rec.get('type') == 'PLANNER_RESPONSE':
+        start = max((i for i, r in enumerate(rows) if isinstance(r, dict) and r.get('type') == 'USER_INPUT'),
+                    default=-1)
+        return rows[start:] if start >= 0 else []
+
+    @staticmethod
+    def read_turn(rows) -> tuple:
+        """(thinking, models, tool calls, audit) of a turn's transcript rows. audit is 'unverified' when there are
+        none or they hold no response for this turn: then nothing is known about the tools the turn ran."""
+        if rows is None:
+            return '', [], [], 'unverified'
+        thinking, models, tools, seen = '', [], [], False
+        started = bool(rows) and isinstance(rows[0], dict) and rows[0].get('type') == 'USER_INPUT'
+        for rec in rows[1:] if started else []:
+            if isinstance(rec, dict) and rec.get('type') == 'PLANNER_RESPONSE':
                 seen = True
-                thinking, model = rec.get('thinking') or thinking, rec.get('model') or model
+                thinking = rec.get('thinking') or thinking
+                if rec.get('model'):
+                    models.append(rec['model'])
                 tools += [{'type': 'tool_call', 'name': c.get('name'), 'input': json.dumps(c.get('args'))[:500]}
                           for c in rec.get('tool_calls') or []]
-        return thinking, model, tools, 'verified' if start and seen else 'unverified'
+        return thinking, sorted(set(models)), tools, 'verified' if started and seen else 'unverified'
+
+    @staticmethod
+    def _response(out: str) -> dict | None:
+        try:
+            data = json.loads(out[out.find('{'):])
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    @classmethod
+    def evidence(cls, raw):
+        if not isinstance(raw, dict) or not isinstance(raw.get('stdout'), str):
+            return None
+        data = cls._response(raw['stdout']) or {}
+        _, models, tools, audit = cls.read_turn(raw.get('transcript'))
+        return {'text': (data.get('response') or '') if data.get('status') == 'SUCCESS' else None, 'tools': tools,
+                'models': models, 'audit': audit}
 
     async def _call(self, text):
         cmd = ['agy', '--output-format', 'json', '--sandbox', '--print-timeout', self.print_timeout]
@@ -568,16 +704,18 @@ class AgyCLI(Backend):
             cmd += ['--conversation', self.session]
         cmd += self.extra_args + ['-p', prompt]  # flags must come before -p
         out = await self.run(cmd)
-        try:
-            data = json.loads(out[out.find('{'):])
-        except ValueError:
+        data = self._response(out)
+        if data is None:
             raise BackendError(f'agy returned non-JSON output: {out.strip()[-1500:] or "(empty)"}')
         if data.get('status') != 'SUCCESS':
             raise BackendError(f'agy {data.get("status")}: {json.dumps(data.get("error") or data)[:1500]}')
         self.session = data.get('conversation_id') or self.session
-        thinking, served, tools, audit = self._transcript()
-        meta = {'session': self.session, 'audit': audit, 'observed_model': served,
-                **({'tool_use': tools} if tools else {})}
+        rows = self._transcript()
+        if rows is not None:
+            self.last_call['raw']['transcript'] = rows
+        thinking, models, tools, audit = self.read_turn(rows)
+        meta = {'session': self.session, 'audit': audit, 'observed_model': models[0] if len(models) == 1 else None,
+                **({'observed_models': models} if models else {}), **({'tool_use': tools} if tools else {})}
         return Reply(data.get('response') or '', thinking, data.get('usage') or {}, meta=meta)
 
     def _session_from(self, stdout):
@@ -603,12 +741,24 @@ class GeminiCLI(Backend):
             cmd += ['--model', self.model]
         cmd += self.extra_args + ['-p', self.transcript(text)]
         out = await self.run(cmd)
+        p = self.parse(out)
+        if p is None:
+            raise BackendError(f'gemini returned non-JSON output: {out.strip()[-1500:]}')
+        if p['error']:
+            raise BackendError(f'gemini: {json.dumps(p["error"])[:1500]}')
+        models = p['models']
+        meta = {'audit': p['audit'], 'observed_model': models[0] if len(models) == 1 else None,
+                **({'observed_models': models} if models else {}), **({'tool_use': p['tools']} if p['tools'] else {})}
+        return Reply(p['text'], '', p['usage'], meta=meta)
+
+    @staticmethod
+    def parse(out: str) -> dict | None:
         try:
             data = json.loads(out[out.find('{'):])
         except ValueError:
-            raise BackendError(f'gemini returned non-JSON output: {out.strip()[-1500:]}')
-        if data.get('error'):
-            raise BackendError(f'gemini: {json.dumps(data["error"])[:1500]}')
+            return None
+        if not isinstance(data, dict):
+            return None
         stats = data.get('stats') if isinstance(data.get('stats'), dict) else {}
         tool_stats = stats.get('tools')
         audit = 'verified' if isinstance(tool_stats, dict) and isinstance(tool_stats.get('byName'), dict) else 'unverified'
@@ -617,9 +767,17 @@ class GeminiCLI(Backend):
         if audit == 'verified' and not tools and (tool_stats.get('totalCalls') or 0) > 0:
             tools = [{'type': 'tool_call', 'name': 'unnamed tool'}]
         models = sorted((stats.get('models') or {}) if isinstance(stats.get('models'), dict) else {})
-        meta = {'audit': audit, 'observed_model': models[0] if len(models) == 1 else None,
-                **({'observed_models': models} if len(models) > 1 else {}), **({'tool_use': tools} if tools else {})}
-        return Reply(data.get('response') or '', '', data.get('usage') or stats, meta=meta)
+        return {'text': data.get('response') or '', 'error': data.get('error'), 'audit': audit, 'tools': tools,
+                'models': models, 'usage': data.get('usage') or stats}
+
+    @classmethod
+    def evidence(cls, raw):
+        if not isinstance(raw, dict) or not isinstance(raw.get('stdout'), str):
+            return None
+        p = cls.parse(raw['stdout'])
+        if p is None:
+            return None
+        return {'text': None if p['error'] else p['text'], 'tools': p['tools'], 'models': p['models'], 'audit': p['audit']}
 
 
 class CommandCLI(Backend):
@@ -637,6 +795,12 @@ class CommandCLI(Backend):
     async def _call(self, text):
         cmd = [c.replace('{model}', self.model or '') for c in self.command] + self.extra_args
         return Reply((await self.run(cmd, stdin=self.transcript(text))).strip())
+
+    @classmethod
+    def evidence(cls, raw):
+        if not isinstance(raw, dict) or not isinstance(raw.get('stdout'), str):
+            return None
+        return {'text': raw['stdout'].strip(), 'tools': [], 'models': [], 'audit': cls.AUDIT}
 
 
 class OpenAICompat(Backend):
@@ -664,15 +828,51 @@ class OpenAICompat(Backend):
             messages += [{'role': 'user', 'content': u}, {'role': 'assistant', 'content': a}]
         messages.append({'role': 'user', 'content': text})
         raw = await asyncio.to_thread(self._post, {'model': self.model, 'messages': messages})
-        self.last_call['raw'] = raw
+        self.last_call['raw'] = {'response': raw}
+        p = self.parse(raw)
+        return Reply(p['text'], p['thinking'], raw.get('usage') or {},
+                     meta={'observed_model': raw.get('model'), **({'tool_use': p['tools']} if p['tools'] else {})})
+
+    @staticmethod
+    def parse(raw: dict) -> dict:
         msg = ((raw.get('choices') or [{}])[0]).get('message') or {}
         tools = [{'type': 'tool_call', 'name': (c.get('function') or {}).get('name')} for c in msg.get('tool_calls') or []]
-        return Reply(msg.get('content') or '', msg.get('reasoning') or '', raw.get('usage') or {},
-                     meta={'observed_model': raw.get('model'), **({'tool_use': tools} if tools else {})})
+        return {'text': msg.get('content') or '', 'thinking': msg.get('reasoning') or '', 'tools': tools,
+                'models': [raw['model']] if raw.get('model') else []}
+
+    @classmethod
+    def evidence(cls, raw):
+        if not isinstance(raw, dict) or not isinstance(raw.get('response'), dict):
+            return None
+        p = cls.parse(raw['response'])
+        return {'text': p['text'], 'tools': p['tools'], 'models': p['models'], 'audit': cls.AUDIT}
 
 
 BACKENDS = {'claude': ClaudeCLI, 'codex': CodexCLI, 'agy': AgyCLI, 'gemini': GeminiCLI, 'command': CommandCLI,
             'openai_compat': OpenAICompat}
+
+
+def verify_call(kind: str | None, call: dict, raw) -> dict:
+    """A recorded reply checked against its retained raw output, by the backend's own parser: {status, problems}.
+    status: the audit the raw output supports ('verified' | 'opaque' | 'unverified') when the record agrees with it,
+    'inconsistent' when the record says another text, tool use, identity or audit, 'unverifiable' when there is no
+    raw output the backend can read."""
+    cls = BACKENDS.get(kind) or Backend
+    ev = cls.evidence(raw) if raw is not None else None
+    if ev is None:
+        return {'status': 'unverifiable', 'problems': ['no raw output this backend can read']}
+    problems = []
+    if ev.get('text') != call.get('output'):
+        problems.append('the reply text is not what the raw output says')
+    if bool(ev.get('tools')) != bool(call.get('tool_use')):
+        problems.append('tool use differs from the raw output')
+    match = identity_fields(call.get('requested_model'), ev.get('models') or [])['identity_match']
+    if call.get('identity_match') and call['identity_match'] != match:
+        problems.append(f'identity {call["identity_match"]!r} but the raw output says {match!r}')
+    if call.get('audit') != ev.get('audit'):
+        problems.append(f'audit {call.get("audit")!r} but the raw output supports {ev.get("audit")!r}')
+    return {'status': 'inconsistent' if problems else ev.get('audit'), 'problems': problems,
+            'identity_match': match}
 
 
 def make_backend(kind: str, system: str, **kw) -> Backend:

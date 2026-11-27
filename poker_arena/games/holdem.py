@@ -474,7 +474,7 @@ Reply with only a JSON object (no code fence, no other text):
 To bet when nobody has bet yet, use "raise" with the amount of your bet."""
 
 
-VERIFY_IGNORE = {'note', 'requested', 'correction'}   # how a reply was corrected: not part of what was played
+VERIFY_IGNORE = {'note', 'requested', 'correction', 'decision_id'}   # how a reply was corrected, and its link: not what was played
 
 
 def _plain(x):

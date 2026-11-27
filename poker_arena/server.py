@@ -6,8 +6,9 @@ mixing a smoke test with a tournament makes neither readable.
     /api/runs                       every run: players, progress, pace and ETA, live or not
     /api/index?run=RUN              the run's matchups (both duplicate matches, and planned ones not started)
     /api/match?id=RUN/MATCHUP/a-first   one match: config, finished hands, and every event by hand
-    /api/ratings?run=RUN            the run's leaderboard, per-player stats and its audit summary (recomputed when
-                                    any of the run's record files changes)
+    /api/ratings?run=RUN            the run's leaderboard, per-player stats and its audit summary. Served from a
+                                    cache at once (its `cache` key says whether it is current); when a record file
+                                    changed it is recomputed in the background. 202 {pending} the first time only.
     /api/quiz?run=RUN               the run's poker-fundamentals quiz (quiz.json), when it has one
 The run `*` is every run together: its leaderboard comes from the history database (history.py), one player
 per model and reasoning level, and keeps runs whose folders have since been deleted.
@@ -561,8 +562,8 @@ def export(root, out, players_file='players.toml') -> int:
 def signature(base: Path, players_file='players.toml') -> tuple:
     """What a run's ratings depend on: every record file under it (hands, events and calls, and the plan,
     decisions, tournament, config and quiz files), and the players file that names them. For all runs the
-    history is synced from these same files, so they are its inputs too."""
-    files = [p for p in base.rglob('*.json*') if p.suffix in ('.json', '.jsonl')]
+    history is synced from these same files, so they are its inputs too. The viewer's own cache is not an input."""
+    files = [p for p in base.rglob('*.json*') if p.suffix in ('.json', '.jsonl') and CACHE_DIR not in p.parts]
     files.append(Path(players_file))
     def stat(p):
         try:
@@ -573,24 +574,161 @@ def signature(base: Path, players_file='players.toml') -> tuple:
     return tuple(sorted((str(p), *stat(p)) for p in files))
 
 
+CACHE_DIR = '.viewer-cache'
+
+
+def code_stamp() -> str:
+    """The arena's code as it is on disk: a cached leaderboard from other code is never served as current."""
+    import hashlib
+    pkg = Path(__file__).parent
+    h = hashlib.sha256()
+    for f in sorted(pkg.rglob('*.py')):
+        st = f.stat()
+        h.update(f'{f.relative_to(pkg)}:{st.st_mtime_ns}:{st.st_size};'.encode())
+    return h.hexdigest()[:16]
+
+
+def _compute_in_child(root: str, run, players_file: str, labels: dict):
+    LABELS.update(labels)
+    PLAYERS_FILE[0] = players_file
+    return ratings_for(Path(root), run)
+
+
+class RatingsCache:
+    """Leaderboards computed off the request path. A request gets the last result at once, marked fresh when
+    no record file (and no code) changed since, else stale while a background thread recomputes it. Results
+    are kept on disk under the root, so a restarted server answers immediately too. Only a run never computed
+    before waits, briefly; past that the answer is 'pending' and the page asks again. The computing happens in
+    a separate process, so pages and replays are served at full speed meanwhile."""
+
+    def __init__(self, root: Path, players_file='players.toml', compute=None, wait=0.5):
+        import threading
+        self.root, self.players_file, self.wait = root, players_file, wait
+        self.compute = compute or self._in_child
+        self.pool = None
+        self.code = code_stamp()
+        self.mem: dict = {}
+        self.errors: dict = {}   # run -> (stamp, message) of the last failed recompute; not retried until the stamp changes
+        self.jobs: dict = {}
+        self.work_lock = threading.Lock()   # one recompute at a time (and one writer to the history database)
+        self.jobs_lock = threading.Lock()
+
+    def _in_child(self, run):
+        from concurrent.futures import ProcessPoolExecutor
+        from concurrent.futures.process import BrokenProcessPool
+        for attempt in range(2):
+            if self.pool is None:
+                self.pool = ProcessPoolExecutor(max_workers=1)
+            try:
+                return self.pool.submit(_compute_in_child, str(self.root), run, self.players_file, dict(LABELS)).result()
+            except BrokenProcessPool:
+                self.pool = None
+                if attempt:
+                    raise
+
+    def base(self, run):
+        from .history import ALL
+        base = self.root if run in (None, '', '.', ALL) else (self.root / run).resolve()
+        return base if base == self.root or self.root in base.parents else None
+
+    def stamp(self, run) -> str:
+        import hashlib
+        return hashlib.sha256(repr((self.code, signature(self.base(run), self.players_file))).encode()).hexdigest()[:24]
+
+    def _file(self, run) -> Path:
+        return self.root / CACHE_DIR / f'ratings-{key(run or ".")}.json'
+
+    def _load(self, run):
+        hit = self.mem.get(run)
+        if hit is None:
+            hit = _json(self._file(run))
+            if isinstance(hit, dict) and 'data' in hit and 'stamp' in hit:
+                self.mem[run] = hit
+            else:
+                hit = None
+        return hit
+
+    def _save(self, run, entry):
+        self.mem[run] = entry
+        try:
+            f = self._file(run)
+            f.parent.mkdir(exist_ok=True)
+            tmp = f.with_suffix('.tmp')
+            tmp.write_text(json.dumps(entry, separators=(',', ':')))
+            tmp.replace(f)
+        except OSError:
+            pass   # a read-only root still serves from memory
+
+    def _work(self, run):
+        with self.work_lock:
+            try:
+                stamp = self.stamp(run)
+                hit = self.mem.get(run)
+                if hit and hit['stamp'] == stamp:
+                    return
+                t = time.time()
+                data = self.compute(run)
+                if data is not None:
+                    self._save(run, {'stamp': stamp, 'code': self.code, 'computed': time.time(), 'seconds': round(time.time() - t, 2), 'data': data})
+                self.errors.pop(run, None)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self.errors[run] = (stamp, f'{type(e).__name__}: {e}')
+
+    def refresh(self, run):
+        import threading
+        with self.jobs_lock:
+            job = self.jobs.get(run)
+            if job is None or not job.is_alive():
+                job = self.jobs[run] = threading.Thread(target=self._work, args=(run,), daemon=True)
+                job.start()
+            return job
+
+    def warm(self, runs_):
+        """Compute every run in the background, most recent first, so the first visit to each is instant."""
+        import threading
+        def go():
+            for run in runs_:
+                try:
+                    if self._load(run) is None or self._load(run)['stamp'] != self.stamp(run):
+                        self.refresh(run).join()
+                except Exception:
+                    pass
+        threading.Thread(target=go, daemon=True).start()
+
+    def get(self, run):
+        """('ok', data) with data['cache'] saying how current it is, ('pending', None), ('error', message),
+        or ('missing', None) for a run outside the root."""
+        if self.base(run) is None:
+            return 'missing', None
+        stamp = self.stamp(run)
+        hit = self._load(run)
+        failed = self.errors.get(run, (None, None))
+        if (hit is None or hit['stamp'] != stamp) and failed[0] != stamp:
+            job = self.refresh(run)
+            if hit is None:
+                job.join(self.wait)
+                hit = self._load(run)
+        failed = self.errors.get(run, (None, None))
+        if hit is None:
+            return ('error', failed[1]) if failed[0] == stamp else ('pending', None)
+        fresh = hit['stamp'] == stamp
+        meta = {'fresh': fresh, 'computed': hit.get('computed'), 'seconds': hit.get('seconds'),
+                'reason': None if fresh else 'code' if hit.get('code') != self.code else 'records',
+                'refreshing': not fresh and run in self.jobs and self.jobs[run].is_alive(),
+                'error': failed[1] if not fresh and failed[0] == stamp else None}
+        if hit['data'] is None:
+            return 'missing', None
+        return 'ok', {**hit['data'], 'cache': meta}
+
+
 def serve(root, port=8800, host='127.0.0.1', players_file='players.toml'):
-    import threading
-    from .history import ALL
     root = Path(root).resolve()  # match folders are resolved before use, so the root must be too
     LABELS.update(load_labels(players_file))
     PLAYERS_FILE[0] = players_file
-    cache = {}
-    lock = threading.Lock()   # one recompute at a time (and one writer to the history database)
-
-    def ratings_json(run):
-        base = root if run in (None, '', '.', ALL) else (root / run).resolve()
-        if base != root and root not in base.parents:
-            return None
-        stamp = signature(base, players_file)
-        with lock:
-            if cache.get(run, (None,))[0] != stamp:
-                cache[run] = (stamp, ratings_for(root, run))
-            return cache[run][1]
+    cache = RatingsCache(root, players_file)
+    cache.warm([r['run'] for r in sorted(runs(root), key=lambda r: (bool(r.get('all')), -r['updated']))])
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -602,8 +740,11 @@ def serve(root, port=8800, host='127.0.0.1', players_file='players.toml'):
             self.send_header('Content-Type', ctype)
             self.send_header('Content-Length', str(len(data)))
             self.send_header('Cache-Control', 'no-store')
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass   # the page moved on before the answer arrived
 
         def do_GET(self):
             url = urlparse(self.path)
@@ -621,8 +762,16 @@ def serve(root, port=8800, host='127.0.0.1', players_file='players.toml'):
                     data = quiz(root, run)
                     return self.send(200, json.dumps(data)) if data is not None else self.send(404, '{"error": "no quiz in this run"}')
                 if url.path == '/api/ratings':
-                    data = ratings_json(run)
-                    return self.send(200, json.dumps(data)) if data is not None else self.send(404, '{"error": "no such run"}')
+                    status, data = cache.get(run)
+                    if status == 'ok':
+                        return self.send(200, json.dumps(data))
+                    if status == 'pending':
+                        return self.send(202, json.dumps({'pending': True, 'run': run}))
+                    if status == 'error':
+                        return self.send(500, json.dumps({'error': data}))
+                    return self.send(404, '{"error": "no such run"}')
+            except (BrokenPipeError, ConnectionResetError):
+                return
             except Exception as e:  # keep serving; the app shows the error where it happened
                 import traceback
                 traceback.print_exc()

@@ -56,7 +56,7 @@
     const minConv = r.min_conversations ?? (r.design && r.design.min_conversations);
     if (minConv != null) out.pairings = out.pairings.map(p => ({ min_conversations: minConv, ...p }));
     const byId = Object.fromEntries(out.players.map(p => [p.player, p]));
-    out.pairings = out.pairings.map(p => ({ ...p, assumption: assumptionsOf(p, r.design), fit: fitOf(p, byId) }));
+    out.pairings = out.pairings.map(p => ({ ...p, design_ref: r.design || null, assumption: assumptionsOf(p, r.design), fit: fitOf(p, byId) }));
     const unregistered = !pooled && isUnregistered(r.design);
     const descriptive = pooled || unregistered;
     if (descriptive) {
@@ -142,7 +142,8 @@
       const given = g.assumptions && (g.assumptions.status || g.assumptions);
       const statuses = wins.map(x => x.assumption ? x.assumption.status : 'unknown');
       let leaderAssumption = !leader ? null : typeof given === 'string' ? given
-        : statuses.includes('unsupported') ? 'unsupported' : statuses.length && statuses.every(x => x === 'supported') ? 'supported' : 'unknown';
+        : statuses.includes('unsupported') ? 'unsupported' : statuses.length && statuses.every(x => x === 'free') ? 'free'
+        : statuses.length && statuses.every(x => x === 'supported' || x === 'free') ? 'supported' : 'unknown';
       // a leader whose wins include one outside the calibrated range is not a decided leader
       let qualified = pooled ? null : playerId(g.leader_outside_calibration);
       let decided = leader && members.includes(leader) ? leader : null;
@@ -162,11 +163,30 @@
   }
 
   // ---- what a verdict rests on: its assumptions, its eligibility, where it was recorded ---------------
-  const ASSUME = { supported: 'diagnostics passed; distribution assumptions unverified', unsupported: 'outside calibrated range', unknown: 'assumptions unchecked' };
+  const ASSUME = { free: 'no distribution assumption; conversations independent', supported: 'diagnostics passed; distribution assumptions unverified',
+    unsupported: 'outside calibrated range', unknown: 'assumptions unchecked' };
+
+  // Which test made a pairing's official verdict: {free, name, model}. `free`: an anytime-valid test for bounded
+  // outcomes (a betting confidence sequence), valid at every check if conversations are independent, with no
+  // assumption about the shape of the results. `model`: the older model-based gate's verdict, which is secondary.
+  const FREE_RE = /betting|hedg|confidence.?seq|assumption.?free|anytime|bounded|e-?value|martingale/i;
+  function testOf(p, design) {
+    const pick = o => o && [o.official_test, o.test, o.verdict_test, o.method_official].find(x => x);
+    const m = pick(p) || pick(design) || (p && p.verdict_method) || (design && design.verdict_method);
+    const name = !m ? '' : typeof m === 'string' ? m : m.name || m.kind || m.method || '';
+    const explicit = [m && typeof m === 'object' ? m.assumption_free : undefined, p && p.assumption_free, design && design.assumption_free]
+      .find(x => typeof x === 'boolean');
+    const free = explicit ?? FREE_RE.test(name);
+    const mb = p && (p.model_based ?? p.model_based_verdict ?? p.secondary_verdict);
+    const model = mb == null ? null : typeof mb === 'string' ? { verdict: mb } : mb;
+    const bound = (m && typeof m === 'object' && (m.bound_bb100 ?? m.bound)) ?? (design && (design.outcome_bound_bb100 ?? design.outcome_bound)) ?? null;
+    return { free, name, model, bound };
+  }
   const words = k => String(k).replace(/_/g, ' ');
   // The adjudicator's `assumptions` when given; else the conversation share against the share the test was
   // calibrated for. {status: 'supported'|'unsupported'|'unknown', label, detail}
   function assumptionsOf(p, design) {
+    if (testOf(p, design).free) return { status: 'free', label: ASSUME.free, detail: 'the official test assumes only that conversations (match pairs) are independent' };
     const a = p && p.assumptions;
     let status = a ? (typeof a === 'string' ? a : a.status) : null;
     let detail = '';
@@ -265,16 +285,23 @@
       return { tone: 'bad', decided: false, short: 'Ineligible', long: `Not eligible for a decision${no.reasons.length ? `: ${no.reasons.join('; ')}` : ''}.${level ? '' : ` ${name(ahead)} is ahead on points only.`}` };
     }
     const as = p.assumption || { status: 'unknown' };
-    const out = as.status === 'unsupported'
+    const test = testOf(p, p.design_ref);
+    const mv = test.model && test.model.verdict;
+    const secondary = !test.free || !mv ? null
+      : { verdict: mv, short: mv === 'a' ? `${name(p.a)} wins` : mv === 'b' ? `${name(p.b)} wins` : mv === 'even' ? 'Even'
+        : mv === 'exhausted' ? 'No winner' : mv === 'early' ? 'Too early' : 'Undecided' };
+    const out = as.status === 'free'
+      ? ` The test makes no assumption about the shape of the results: its error rate holds at every check as long as conversations are independent.${secondary ? ` The model-based test (secondary, never decides) says: ${secondary.short.toLowerCase()}.` : ''}`
+      : as.status === 'unsupported'
       ? ' The test\'s assumptions do not hold here (outside its calibrated range), so its error rate is not established.'
       : as.status === 'supported' ? ' Its error rate holds under the test\'s assumptions: the diagnostics passed, but the distribution assumptions remain unverified.'
       : ' Its error rate holds only under the test\'s assumptions, which are not checked here.';
     const qualifier = as.status === 'unsupported' ? ASSUME.unsupported : '';
     switch (p.verdict) {
       case 'a': case 'b':
-        return { tone: 'won', decided: true, qualifier, short: `${name(sides.winner)} wins`, long: `Decided${looks}: ${name(sides.winner)} beats ${name(sides.loser)}; the edge cleared the sequential test's bar.${out}` };
+        return { tone: 'won', decided: true, qualifier, secondary, short: `${name(sides.winner)} wins`, long: `Decided${looks}: ${name(sides.winner)} beats ${name(sides.loser)}; the edge cleared the sequential test's bar.${out}` };
       case 'even':
-        return { tone: 'even', decided: true, qualifier, short: 'Even', long: `Decided${looks}: within ±${band} bb/100 of each other.${out}` };
+        return { tone: 'even', decided: true, qualifier, secondary, short: 'Even', long: `Decided${looks}: within ±${band} bb/100 of each other.${out}` };
       case 'exhausted':
         return { tone: 'open', decided: false, short: 'No winner', long: `Every planned check is used and the difference is unresolved.${level ? '' : ` ${name(ahead)} is ahead on points only.`}` };
       case 'early': {
@@ -290,7 +317,7 @@
         return { tone: 'open', decided: false, short: level ? 'Level on points' : 'Ahead on points', long: `${why}${level ? '' : ` ${name(ahead)} is ahead of ${name(behind)} on points.`}` };
       }
       default:
-        return { tone: 'open', decided: false, short: 'Undecided', long: `Not decided yet${looks}.${level ? '' : ` ${name(ahead)} is ahead on points.`}` };
+        return { tone: 'open', decided: false, secondary, short: 'Undecided', long: `Not decided yet${looks}.${level ? '' : ` ${name(ahead)} is ahead on points.`}${secondary && test.free ? ` The model-based test (secondary, never decides) says: ${secondary.short.toLowerCase()}.` : ''}` };
     }
   }
 
@@ -373,29 +400,142 @@
     return { target: 50, need: Math.max(...need), planned: false, ...(isUnregistered(design) ? { retrospective: true } : {}), have: range };
   }
 
+  // ---- standings order: decided ranks first, the unresolved grouped by the places they share ---------
+  // [{kind: 'decided', rank, players}, {kind: 'unresolved', range: [lo, hi] | null, players}] or, when nothing is
+  // decided, [{kind: 'points', players}]. Inside an unresolved block (and in 'points') players go by strength.
+  const byStrength = ps => [...ps].sort((x, y) => (y.strength ?? -1e9) - (x.strength ?? -1e9));
+  function standingBlocks(ps) {
+    const decided = ps.filter(p => p.rank_kind === 'decided' && p.rank != null).sort((x, y) => x.rank - y.rank);
+    if (!decided.length) return [{ kind: 'points', players: byStrength(ps) }];
+    const blocks = [];
+    for (const p of decided) {
+      const last = blocks[blocks.length - 1];
+      if (last && last.rank === p.rank) last.players.push(p);
+      else blocks.push({ kind: 'decided', rank: p.rank, players: [p] });
+    }
+    const open = new Map();
+    for (const p of ps.filter(x => !decided.includes(x))) {
+      const r = Array.isArray(p.rank_range) && p.rank_range.length === 2 && p.rank_range[0] != null ? p.rank_range : null;
+      const k = r ? r.join('-') : 'open';
+      if (!open.has(k)) open.set(k, { kind: 'unresolved', range: r, players: [] });
+      open.get(k).players.push(p);
+    }
+    const rest = [...open.values()].sort((x, y) => (x.range ? x.range[0] : 1e9) - (y.range ? y.range[0] : 1e9));
+    rest.forEach(b => { b.players = byStrength(b.players); });
+    return blocks.concat(rest);
+  }
+
+  // ---- cohorts: the groups of players who met, named by who is in them and how they played ------------
+  // [{key, kind: 'models'|'mixed'|'bots'|'history', group, members, models, deals, protocol}], the current model
+  // cohort first: model groups before mixed before bots, more models and more deals first; players left out of
+  // the fit (earlier variants with an unknown model or protocol) last.
+  function protocolOf(ids, label) {
+    const hands = new Set(), notes = new Set();
+    for (const id of ids) {
+      const m = String(id).match(/~h(\d+)/);
+      if (m) hands.add(Number(m[1]));
+      const d = nameParts(label(id))[2];
+      if (d) d.split(/,\s*/).forEach(x => { if (!/hands per conversation/.test(x)) notes.add(x); else { const k = x.match(/(\d+)/); if (k) hands.add(Number(k[1])); } });
+    }
+    const bits = [];
+    if (hands.size === 1) bits.push(`${[...hands][0]}-hand conversations`);
+    else if (hands.size > 1) bits.push(`${[...hands].sort((a, b) => a - b).join(' / ')}-hand conversations`);
+    notes.forEach(n => bits.push(n));
+    return bits.join(' · ');
+  }
+  function cohorts(rt, { label = x => x, kind = () => 'model' } = {}) {
+    const out = rt.groups.filter(g => g.members.length).map(g => {
+      const models = g.members.filter(p => kind(p) !== 'bot');
+      const k = !models.length ? 'bots' : models.length === g.members.length ? 'models' : 'mixed';
+      return { key: `g${g.index}`, kind: k, group: g, members: g.members, models,
+        deals: g.pairings.reduce((t, x) => t + (x.deals || 0), 0), protocol: protocolOf(g.members, label) };
+    });
+    const order = { models: 0, mixed: 1, bots: 2 };
+    out.sort((x, y) => order[x.kind] - order[y.kind] || y.models.length - x.models.length || y.deals - x.deals);
+    const left = rt.players.filter(p => !p.in_fit).map(p => p.player);
+    if (left.length) out.push({ key: 'earlier', kind: 'history', group: null, members: left, models: left.filter(p => kind(p) !== 'bot'), deals: 0, protocol: protocolOf(left, label) });
+    return out;
+  }
+  // {title, sub}: a cohort in words, e.g. {title: 'Claude Sonnet 5.5 · GPT-6 Luna · Gemini 4 Neon', sub: 'High reasoning · 50-hand conversations'}
+  function cohortName(c, label = x => x) {
+    const parts = c.members.map(p => nameParts(label(p)));
+    const levels = [...new Set(c.models.map(p => nameParts(label(p))[1]).filter(Boolean))];
+    const lv = levels.length === 1 ? `${levels[0].replace(/ effort$/i, '').replace(/^./, x => x.toUpperCase())} reasoning` : levels.length ? 'mixed reasoning levels' : '';
+    if (c.kind === 'bots') return { title: 'Baseline bots', short: 'Baseline bots', sub: [...new Set(parts.map(x => x[0]))].join(' · ') };
+    if (c.kind === 'history') return { title: 'Earlier variants', short: 'Earlier variants', sub: 'model or protocol not recorded, so not rated' };
+    const names = [...new Set(c.models.map(p => nameParts(label(p))[0]))];
+    const bots = c.members.length - c.models.length;
+    const title = names.join(' · ') + (bots ? ` + ${bots === 1 ? '1 bot' : `${bots} bots`}` : '');
+    const short = names.length > 2 ? `${names.length} models${bots ? ` + ${bots} bots` : ''}` : title;
+    return { title, short, sub: [lv, c.protocol].filter(Boolean).join(' · ') };
+  }
+
+  // ---- which hands a figure covers: verified committed results, or provisional live play -------------
+  // {committed, provisional, rejected, stats, verified} from the ratings when they say; numbers are null when unknown.
+  function populationOf(rt) {
+    const P = (rt && (rt.population || rt.populations)) || {};
+    const stats = (rt && rt.stats_population) || P.stats || null;
+    return { committed: P.committed ?? P.verified ?? null, provisional: P.provisional ?? P.live ?? null,
+      rejected: Array.isArray(rt && rt.rejected) ? rt.rejected.length : (P.rejected ?? 0), verified: !!(P.committed != null || P.verified != null),
+      stats: typeof stats === 'string' ? { kind: stats } : stats };
+  }
+
   // ---- poker fundamentals: quiz.json in one shape -----------------------------------------------------
   // {suite, version, spots: [{id, title, kind, street, hole, board, pot, to_call, stack, bb, ..., best, ev}],
   //  players: [{player, score, correct, answered, total, ev_lost_bb, reference, answers: {spot: {...}}}]}
   const num = (...xs) => xs.find(x => x != null && isFinite(x)) ?? null;
+  const isFallback = a => !!a && (a.fallback === true || a.valid === false || a.status === 'fallback');
+  // A quiz player's provenance: {status: 'eligible'|'ineligible'|'unrecorded'|'bot', reasons, identity, facts}
+  function provenanceOf(r) {
+    if (r.kind === 'bot' || (r.spec && r.spec.bot)) return { status: 'bot', reasons: [], identity: null, facts: [] };
+    const e = r.eligibility ?? r.eligible ?? (r.provenance && (r.provenance.eligibility ?? r.provenance.eligible));
+    const P = r.provenance || {};
+    const identity = P.identity_match || r.identity_match || null;
+    const reasons = [].concat((e && typeof e === 'object' && e.reasons) || r.ineligible_reasons || P.reasons || []).map(String);
+    let status = e == null ? null : typeof e === 'boolean' ? (e ? 'eligible' : 'ineligible') : typeof e === 'string' ? e : e.status || (e.eligible === false ? 'ineligible' : e.eligible ? 'eligible' : null);
+    if (status && !['eligible', 'ineligible'].includes(status)) status = /^(ok|pass|valid|eligible)/i.test(status) ? 'eligible' : 'ineligible';
+    if (!status) status = 'unrecorded';
+    const facts = [['protocol', P.protocol || r.protocol], ['implementation', P.implementation || r.implementation], ['CLI', P.cli_version || r.cli_version],
+      ['audit', P.audit || r.audit_status]].filter(([, v]) => v).map(([k, v]) => `${k} ${typeof v === 'object' ? (v.version || v.status || v.hash || JSON.stringify(v)) : v}`);
+    return { status, reasons, identity, facts };
+  }
   function quizOf(raw) {
     if (!raw || typeof raw !== 'object') return null;
     const spots = (raw.spots || raw.items || raw.questions || []).map((x, i) => ({ ...x, id: String(x.id ?? x.spot ?? i),
       best: x.best ?? x.correct ?? x.answer ?? null, bb: x.bb ?? raw.bb ?? 1 }));
     const refs = new Set([].concat(raw.reference || raw.references || []).map(String));
     const list = Array.isArray(raw.players) ? raw.players : Object.entries(raw.players || raw.results || {}).map(([player, r]) => ({ player, ...r }));
+    const catOf = s => s.category || s.kind || 'other';
+    const spotById = Object.fromEntries(spots.map(s => [s.id, s]));
     const players = list.map(r => {
-      const answers = Array.isArray(r.answers) ? Object.fromEntries(r.answers.map(a => [String(a.spot ?? a.id), a])) : r.answers || {};
+      const raw_ = Array.isArray(r.answers) ? Object.fromEntries(r.answers.map(a => [String(a.spot ?? a.id), a])) : r.answers || {};
+      // a fallback (no valid answer after every retry) is never correct, whatever the record says
+      const answers = Object.fromEntries(Object.entries(raw_).map(([k, a]) => [k, isFallback(a) ? { ...a, fallback: true, correct: false, credited: !!a.correct } : a]));
       const vals = Object.values(answers);
-      const correct = num(r.correct, vals.length ? vals.filter(a => a.correct).length : null);
+      const fallbacks = vals.length ? vals.filter(isFallback).length : num(r.fallbacks) ?? 0;
+      const correct = vals.length ? vals.filter(a => a.correct && !isFallback(a)).length : num(r.correct);
       const answered = num(r.answered, vals.length || null);
       const total = num(r.total, spots.length || answered);
+      const valid = vals.length ? vals.length - fallbacks : num(r.valid_answers, r.valid);
       const lost = num(r.ev_lost_bb, r.ev_loss_bb, r.regret_bb, vals.length ? vals.reduce((t, a) => t + (num(a.ev_lost_bb, a.ev_loss_bb, a.regret_bb) || 0), 0) : null);
-      return { ...r, answers, correct, answered, total, ev_lost_bb: lost,
-        score: num(r.score, correct != null && total ? correct / total : null),
+      const cats = {};
+      for (const [k, a] of Object.entries(answers)) {
+        const s = spotById[k];
+        const c = cats[s ? catOf(s) : 'other'] = cats[s ? catOf(s) : 'other'] || { correct: 0, total: 0, valid: 0, fallbacks: 0 };
+        c.total++;
+        if (isFallback(a)) c.fallbacks++; else { c.valid++; if (a.correct) c.correct++; }
+      }
+      const given = r.by_category || r.categories;
+      const by_category = given && typeof given === 'object' && !Array.isArray(given) && !vals.length ? given : cats;
+      return { ...r, answers, correct, answered, total, valid, fallbacks, ev_lost_bb: lost, by_category,
+        valid_accuracy: vals.length ? (valid ? correct / valid : null) : num(r.valid_accuracy),
+        score: fallbacks ? (correct != null && total ? correct / total : null) : num(r.score, correct != null && total ? correct / total : null),
+        provenance: provenanceOf(r),
         reference: !!(r.reference || refs.has(String(r.player)) || r.kind === 'reference') };
     }).sort((x, y) => (y.score ?? -1) - (x.score ?? -1) || (x.ev_lost_bb ?? 1e9) - (y.ev_lost_bb ?? 1e9));
+    const categories = [...new Set(spots.map(catOf))];
     return { ...raw, suite: raw.suite_name || (typeof raw.suite === 'string' ? raw.suite : raw.suite && raw.suite.name) || 'Poker fundamentals',
-      version: raw.version ?? (raw.suite && raw.suite.version) ?? null, spots, players };
+      version: raw.version ?? (raw.suite && raw.suite.version) ?? null, spots, players, categories };
   }
 
   // ---- replay helpers ----------------------------------------------------------------------------------
@@ -421,7 +561,7 @@
       .sort((x, y) => Math.abs(y.net) - Math.abs(x.net) || x.deal - y.deal).slice(0, n);
   }
 
-  return { quizOf, firstDifference, bigSwings, IDENTITY, esc, MINUS, signed, plural, trim, approx, nameParts, family, isContract, normalize, verdict, verdictSides, powerLine, correction, actText,
+  return { standingBlocks, cohorts, cohortName, protocolOf, populationOf, testOf, isFallback, provenanceOf, quizOf, firstDifference, bigSwings, IDENTITY, esc, MINUS, signed, plural, trim, approx, nameParts, family, isContract, normalize, verdict, verdictSides, powerLine, correction, actText,
     isDecided, decidedLeader, playerId, rateOf, targetEdge, isUnregistered, scenarios, conversationsShort,
     assumptionsOf, ineligible, sourceOf, basisOf, fitOf, identityOf, ASSUME };
 });

@@ -223,6 +223,53 @@ class TestViewerData(unittest.TestCase):
             life = server.lifecycle(root, 'r', ms)
             self.assertEqual((life['status'], life['pairings']['a|b']['status']), ('finished', 'ineligible'))
 
+    def test_ratings_cache_never_blocks(self):
+        import threading as th
+        gate, calls = th.Event(), []
+        def slow(run):
+            calls.append(run)
+            gate.wait(5)
+            return {'players': [], 'n': len(calls)}
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d).resolve()
+            shutil.copytree(self.runs / 'pilot', root / 'pilot')
+            cache = server.RatingsCache(root, compute=slow, wait=0.05)
+            self.assertEqual(cache.get('pilot'), ('pending', None))      # never computed: answers at once
+            gate.set()
+            cache.jobs['pilot'].join(5)
+            status, data = cache.get('pilot')
+            self.assertEqual((status, data['n'], data['cache']['fresh']), ('ok', 1, True))
+            self.assertTrue((root / server.CACHE_DIR).exists())
+            self.assertEqual(server.signature(root / 'pilot'), server.signature(root / 'pilot'))
+            self.assertFalse(any(server.CACHE_DIR in p for p, *_ in server.signature(root)))
+            gate.clear()
+            hands = next((root / 'pilot').rglob('hands.jsonl'))
+            hands.write_text(hands.read_text() + '\n')
+            status, data = cache.get('pilot')                           # records changed: the old answer at once, marked stale
+            self.assertEqual((status, data['n'], data['cache']['fresh'], data['cache']['reason']), ('ok', 1, False, 'records'))
+            gate.set()
+            cache.jobs['pilot'].join(5)
+            self.assertEqual(cache.get('pilot')[1]['n'], 2)
+            hands.write_text(hands.read_text() + '\n')
+            broken = server.RatingsCache(root, compute=lambda run: 1 / 0, wait=2)
+            broken.mem['pilot'] = cache.mem['pilot']
+            broken.get('pilot')
+            broken.jobs['pilot'].join(5)
+            status, data = broken.get('pilot')                          # a failed recompute keeps the last answer, says so
+            self.assertEqual((status, data['n'], data['cache']['fresh']), ('ok', 2, False))
+            self.assertIn('ZeroDivisionError', data['cache']['error'])
+            self.assertFalse(broken.jobs['pilot'].is_alive())           # and is not retried until something changes
+            cache.get('pilot')
+            cache.jobs['pilot'].join(5)
+            again = server.RatingsCache(root, compute=lambda run: 1 / 0)
+            status, data = again.get('pilot')                           # a restarted server answers from disk
+            self.assertEqual((status, data['n'], data['cache']['fresh']), ('ok', 3, True))
+            self.assertEqual(again.get('../x')[0], 'missing')
+            empty = server.RatingsCache(root / 'pilot', compute=lambda run: time.sleep(0.2) or 1 / 0, wait=0)
+            self.assertEqual(empty.get('pilot')[0], 'pending')
+            empty.jobs['pilot'].join(5)
+            self.assertEqual(empty.get('pilot')[0], 'error')
+
     def test_key_matches_the_app(self):
         self.assertEqual(server.key('pilot/a__vs__b-1/a-first'), 'pilot~2Fa__vs__b-1~2Fa-first')
         self.assertEqual(server.key('.'), '~2E')
@@ -244,7 +291,13 @@ class TestViewerData(unittest.TestCase):
         get = lambda p: json.loads(urllib.request.urlopen(base + p).read())
         self.assertEqual(get('/api/runs')[0]['run'], 'pilot')
         self.assertEqual(len(get('/api/index?run=pilot')), 4)
-        self.assertTrue(get('/api/ratings?run=pilot')['players'])
+        for _ in range(400):                         # the first answer may be {pending}: computed in the background
+            rt = get('/api/ratings?run=pilot')
+            if not rt.get('pending'):
+                break
+            time.sleep(0.05)
+        self.assertTrue(rt['players'])
+        self.assertTrue(rt['cache']['fresh'])
         self.assertEqual(len(get('/api/match?id=pilot/fake__vs__rule/b-first')['hands']), 6)
         page = urllib.request.urlopen(base + '/').read().decode()
         self.assertIn('app.js', page)
@@ -680,6 +733,72 @@ class TestViewerLogic(unittest.TestCase):
         alt = r[3]
         self.assertEqual((alt['spots'][0]['best'], alt['players'][0]['correct'], alt['players'][0]['ev_lost_bb'], alt['players'][0]['score']), ('fold', 0, 2, 0.5))
         self.assertIsNone(r[4])
+
+    def test_quiz_fallbacks_categories_provenance(self):
+        raw = {'spots': [{'id': 's1', 'category': 'pot_odds', 'correct': 'fold'}, {'id': 's2', 'category': 'sizing', 'correct': 'bet'},
+                         {'id': 's3', 'category': 'sizing', 'correct': 'fold'}],
+               'players': {'m': {'correct': 3, 'total': 3, 'score': 1.0, 'answers': [
+                   {'spot': 's1', 'action': 'fold', 'correct': True},
+                   {'spot': 's2', 'action': 'bet', 'correct': True},
+                   {'spot': 's3', 'action': 'fold', 'correct': True, 'fallback': True}],
+                   'provenance': {'eligibility': {'status': 'ineligible', 'reasons': ['identity mismatch']}, 'cli_version': '2.1'}},
+                   'b': {'kind': 'bot', 'answers': [{'spot': 's1', 'action': 'fold', 'correct': True}]}}}
+        r = self.run_js(f'const q = Core.quizOf({json.dumps(raw)}); const m = q.players.find(p => p.player === "m");'
+                        ' return [m.correct, m.score, m.valid, m.fallbacks, m.valid_accuracy, m.by_category, m.answers.s3.correct, m.provenance,'
+                        ' q.categories, q.players.find(p => p.player === "b").provenance.status, Core.quizOf({players: {x: {answers: []}}}).players[0].provenance.status];')
+        self.assertEqual(r[:5], [2, 2 / 3, 2, 1, 1.0])                   # a fallback that happened to be best gets no credit
+        self.assertEqual(r[5], {'pot_odds': {'correct': 1, 'total': 1, 'valid': 1, 'fallbacks': 0},
+                                'sizing': {'correct': 1, 'total': 2, 'valid': 1, 'fallbacks': 1}})
+        self.assertFalse(r[6])
+        self.assertEqual((r[7]['status'], r[7]['reasons']), ('ineligible', ['identity mismatch']))
+        self.assertIn('CLI 2.1', r[7]['facts'])
+        self.assertEqual(r[8], ['pot_odds', 'sizing'])
+        self.assertEqual((r[9], r[10]), ('bot', 'unrecorded'))
+
+    def test_decided_order_first(self):
+        ps = [{'player': 'rule', 'rank': 2, 'rank_kind': 'decided', 'strength': 221},
+              {'player': 'ref', 'rank': 1, 'rank_kind': 'decided', 'strength': 217},
+              {'player': 'random', 'rank': None, 'rank_kind': 'descriptive', 'rank_range': [3, 4], 'strength': -253},
+              {'player': 'station', 'rank': None, 'rank_kind': 'descriptive', 'rank_range': [3, 4], 'strength': -185}]
+        r = self.run_js(f'const b = Core.standingBlocks({json.dumps(ps)}); return [b.map(x => [x.kind, x.rank ?? x.range, x.players.map(p => p.player)]),'
+                        f' Core.standingBlocks({json.dumps(ps)}.map(p => ({{...p, rank_kind: "descriptive"}}))).map(x => [x.kind, x.players.map(p => p.player)])];')
+        self.assertEqual(r[0], [['decided', 1, ['ref']], ['decided', 2, ['rule']], ['unresolved', [3, 4], ['station', 'random']]])
+        self.assertEqual(r[1], [['points', ['rule', 'ref', 'station', 'random']]])
+
+    def test_cohorts_lead_with_current_models(self):
+        rt = {'players': [{'player': p, 'strength': 0, 'in_fit': p != 'old~h5'} for p in ('bot:rule', 'bot:ref', 'a~h50', 'b~h50', 'old~h5')],
+              'pairings': [{'a': 'bot:rule', 'b': 'bot:ref', 'deals': 900, 'edge': 10}, {'a': 'a~h50', 'b': 'b~h50', 'deals': 50, 'edge': 5}],
+              'groups': [{'players': ['bot:rule', 'bot:ref']}, {'players': ['a~h50', 'b~h50']}]}
+        labels = {'bot:rule': 'Rule bot', 'bot:ref': 'Reference bot', 'a~h50': 'Claude Opus 5.5 · High', 'b~h50': 'GPT-6 Luna · High', 'old~h5': 'Claude Sonnet · default effort (protocol not recorded)'}
+        r = self.run_js(f'const rt = Core.normalize({json.dumps(rt)}, {{pooled: true}}); const L = {json.dumps(labels)};'
+                        ' const cs = Core.cohorts(rt, {label: p => L[p] || p, kind: p => p.startsWith("bot:") ? "bot" : "model"});'
+                        ' return cs.map(c => [c.kind, c.members, Core.cohortName(c, p => L[p] || p)]);')
+        self.assertEqual([c[0] for c in r], ['models', 'bots', 'history'])
+        self.assertEqual(r[0][2]['title'], 'Claude Opus 5.5 · GPT-6 Luna')
+        self.assertEqual(r[0][2]['sub'], 'High reasoning · 50-hand conversations')
+        self.assertEqual(r[1][2]['title'], 'Baseline bots')
+        self.assertEqual(r[2][1], ['old~h5'])
+
+    def test_assumption_free_official_verdict(self):
+        p = {'a': 'x', 'b': 'y', 'edge': 80, 'verdict': 'a', 'official_test': 'betting confidence sequence', 'model_based': {'verdict': 'open'},
+             'assumptions': {'status': 'unsupported'}}
+        r = self.run_js(f'const rt = Core.normalize({{players: [{{player: "x", strength: 40}}, {{player: "y", strength: -40}}], pairings: [{json.dumps(p)}],'
+                        ' design: {registered: true}}); const q = rt.pairings[0]; const v = Core.verdict(q);'
+                        ' return [q.assumption.status, v.decided, v.secondary && v.secondary.short, v.long, rt.groups[0].leader, rt.groups[0].leader_assumption,'
+                        ' Core.testOf({}, {test: "t-test"}).free];')
+        self.assertEqual(r[0], 'free')                 # the official test needs no distribution assumption
+        self.assertTrue(r[1])
+        self.assertEqual(r[2], 'Undecided')            # the model-based gate is shown, secondary
+        self.assertIn('independent', r[3])
+        self.assertIn('secondary, never decides', r[3])
+        self.assertEqual((r[4], r[5]), ('x', 'free'))  # an assumption-free win makes a decided leader
+        self.assertFalse(r[6])
+
+    def test_population(self):
+        r = self.run_js('return [Core.populationOf({rejected: [{}, {}], population: {committed: 400, provisional: 6}, stats_population: "verified committed"}),'
+                        ' Core.populationOf({})];')
+        self.assertEqual(r[0], {'committed': 400, 'provisional': 6, 'rejected': 2, 'verified': True, 'stats': {'kind': 'verified committed'}})
+        self.assertEqual(r[1]['committed'], None)
 
     def test_divergence_and_swings(self):
         hand = HAND
