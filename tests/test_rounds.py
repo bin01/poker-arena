@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from poker_arena import ratings
-from poker_arena.runner import make_plan, plan_design, round_seeds, run_plan
+from poker_arena.runner import PlanConflict, make_plan, plan_design, round_seeds, run_plan
 
 PLAYERS = ('[players.rule]\nbot = "rule"\nsims = 30\n[players.random]\nbot = "random"\n'
            '[players.station]\nbot = "station"\n[players.station2]\nbot = "station"\n')
@@ -45,11 +45,12 @@ class TestRounds(unittest.TestCase):
                          matchups=[['station', 'station2'], ['rule', 'random']], **kw)
 
     def folders(self, plan):
-        return sorted(p.name for p in Path(plan['out']).iterdir() if p.is_dir())
+        return sorted(p.name for p in Path(plan['out']).iterdir() if p.is_dir() and p.name != 'source')
 
     def test_design_defaults_and_legacy(self):
         p = make_plan(['a', 'b'], deals=50)
-        self.assertEqual(p['design'], {'alpha': 0.05, 'round_deals': 50, 'max_rounds': 6, 'block': 10})
+        self.assertEqual(p['design'], {'alpha': 0.05, 'round_deals': 50, 'block': 10})   # max_rounds from the power target
+        self.assertGreater(plan_design(p)['max_rounds'], 1)
         self.assertEqual(p['replicates'], 1)
         self.assertEqual(plan_design({'deals': 20, 'until_decided': 60, 'seed': 0})['max_rounds'], 3)
         self.assertIsNone(plan_design({'deals': 20, 'seed': 0}))
@@ -118,6 +119,28 @@ class TestRounds(unittest.TestCase):
             stored = json.loads((Path(plan['out']) / 'plan.json').read_text())
             self.assertEqual(stored['design'], norm(plan))
             asyncio.run(run_plan(plan, log=lambda *a: None))                   # and a rerun matches it
+
+    def test_the_runner_plays_the_normalized_design_only(self):
+        norm = lambda plan: {'alpha': 0.05, 'round_deals': 10, 'max_rounds': 1, 'block': 10, 'replicates': 3}
+        plan = self.plan(design={'max_rounds': 1})
+        plan['matchups'] = [['station', 'station2']]
+        calls = []
+        with mock.patch.object(ratings, 'normalize_design', norm), \
+                mock.patch.object(ratings, 'decide', fake_decide(calls)):
+            asyncio.run(run_plan(plan, log=lambda *a: None))
+        self.assertEqual(self.folders(plan), ['station__vs__station2', 'station__vs__station2__x2',
+                                              'station__vs__station2__x3'])
+        self.assertEqual(round_seeds(plan, 1, 2, norm(plan)), list(range(1010, 1020)))
+
+    def test_conflicting_replicates_are_an_error(self):
+        plan = self.plan(design={'max_rounds': 2, 'replicates': 3}, replicates=2)
+        with self.assertRaisesRegex(PlanConflict, 'replicates'):
+            asyncio.run(run_plan(plan, log=lambda *a: None))
+        self.assertFalse(Path(plan['out']).exists())                         # before anything is written
+        with self.assertRaises(PlanConflict):
+            plan_design(plan)
+        agreed = self.plan(design={'max_rounds': 2, 'replicates': 2}, replicates=2)
+        self.assertEqual(plan_design(agreed)['replicates'], 2)
 
     def test_lifecycle_while_playing_and_when_stopped(self):
         out = Path(self.plan()['out'])

@@ -14,18 +14,29 @@ round and replicate deal to every pairing (the same seeds), so conversations on 
 
 Inference and description. Exactly one thing here is a test: the preregistered sequential procedure of each
 pairing (`normalize_design`, `decide`). Its verdicts 'a', 'b' and 'even', at a completed planned look, are the
-only inferential results: the family-wise chance of any false verdict in a tournament is at most `alpha`
-(Bonferroni over the pairings, Pocock-type repeated looks calibrated by simulation). A decided rank and a
-leader are built from those verdicts alone: a leader has a decided win over every other player of its group.
-Everything else (strengths, their intervals, the order by points, the front runner, session Elo, every
-all-time number) is descriptive, recomputed on every refresh, and labelled so.
+only inferential results, and only in a run with a preregistered design and players whose identity is
+verified. A decided rank and a leader are built from those verdicts alone: a leader has a decided win over
+every other player of its group. Everything else (strengths, their intervals, the order by points, the front
+runner, session Elo, every all-time number, every number of a run without a design) is descriptive,
+recomputed on every refresh, and labelled so.
 
-The test. The statistic is the conversation-level t: the deal-weighted mean edge over the pairing's
-conversations, with a cluster-robust standard error that treats each conversation as one unit (C - 1 degrees
-of freedom). It is valid whatever the dependence inside a conversation and however much conversations differ,
-and it needs at least MIN_CONVERSATIONS conversations: from one conversation, no verdict is possible. Each
-look is tested at the same nominal level, found by simulation so that over all planned looks a pairing with
-no edge is called with chance alpha / n_pairings. `even` is an equivalence verdict (TOST at +-EQUIV_BB100).
+The test. The unit is the conversation; a look can decide only with at least MIN_CONVERSATIONS of them and
+some spread between them. A winner needs two arms to agree at a look: the conversation-level t (the
+deal-weighted mean edge over its cluster-robust standard error, C - 1 degrees of freedom) beyond a bar
+calibrated by simulation, and a sign-flip randomization test of the same statistic with its own error spent
+look by look. The sign-flip arm makes the guarantee exact for any conversation results symmetric about the
+true edge (any tails, any discreteness, any dependence inside a conversation: e.g. two interchangeable
+players). The t arm's bar is calibrated for a stated family of skewed results: conversation effects of
+exponential, lognormal or rare-large-loss shape holding up to half a conversation mean's variance. Together:
+with no edge, a pairing is called with chance at most alpha / n_pairings in either case (Bonferroni over the
+pairings, Pocock-type repeated looks). Beyond the family (large, rare, one-sided swings) no test of this
+size can keep that promise; docs/methodology.md gives the measured worst cases. `even` is an equivalence
+verdict (TOST at +-EQUIV_BB100, both arms).
+
+Planning. The deals a design needs come from the spread of a conversation's mean, which counts the
+dependence inside it: a conversation effect (assumed_icc) and memory between deals (assumed_ar1). A design
+reports its power under optimistic, assumed and pessimistic dependence, and by default plays as many rounds
+as the assumed (moderate) case needs for 80% power.
 
 Strength (descriptive). A least-squares paired-comparison fit on deals, x ~ s_a - s_b, with the strengths
 summing to zero within each connected group. Repeats of one deal by one pair are averaged into one
@@ -51,15 +62,21 @@ import numpy as np
 OBJECTIVE = 'bb/100 over duplicate deals'
 BLOCK = 10                  # deals per aligned block in the within-conversation bootstrap and session Elo
 EQUIV_BB100 = 15            # margin of the equivalence test behind 'even'
-DEFAULT_DESIGN = {'alpha': 0.05, 'round_deals': 50, 'max_rounds': 6, 'block': BLOCK}
+DEFAULT_DESIGN = {'alpha': 0.05, 'round_deals': 50, 'block': BLOCK}   # max_rounds: from the power target
 TARGET_EDGE = 50            # bb/100: the edge a plan is powered to detect unless it says otherwise
 PRIOR_SD = 350              # bb/100: the per-deal spread assumed when planning (first model runs: about 340)
+ASSUMED_ICC = 0.01          # planning: share of the per-deal variance that is a conversation effect (moderate)
+ASSUMED_AR1 = 0.2           # planning: AR(1) memory between consecutive deals of a conversation (moderate)
 POWER = 0.8
-MIN_CONVERSATIONS = 2       # a verdict needs this many independent conversations of the pairing
+MAX_ROUNDS = 40
+MIN_CONVERSATIONS = 8       # a verdict needs this many independent conversations of the pairing
+FAMILY = ('normal', 'exponential', 'lognormal', 'rare_loss')   # null shapes the bars are calibrated for
+FAMILY_SHARE = 0.5          # in the skewed shapes, the conversation effect's share of a conversation mean's variance
 POWER_EDGES = (20, 50, 100)
 BOOT = 300
-SIMS = 400_000              # null sequences behind each nominal level
+CAL_SIMS = 100_000          # null sequences per shape behind each nominal level
 POWER_SIMS = 40_000
+FLIPS = 9_999               # random sign vectors of the sign-flip arm (plus the observed one)
 SIM_SEED = 20261126
 SESSION = 10                # deals per Elo session
 TIE_BB = 0.1                # a session within this many big blinds per deal of even is a tie
@@ -67,6 +84,10 @@ ELO_PRIOR = 1.5             # prior sd of a session-Elo rating, in logits
 K = 400 / math.log(10)
 ALIASES = ('sonnet', 'opus', 'haiku')   # bare CLI aliases: the model version behind them is unknown
 DECIDED = ('a', 'b', 'even')
+GUARANTEE = ('exactly whenever every conversation\'s result is symmetric about the pairing\'s true edge (for '
+             'instance when the two players are interchangeable), and in simulation for '
+             'skewed results whose conversation effects are no larger than their card noise (docs/methodology.md); '
+             'rarer, larger swings can exceed it, and no test of this size can rule them out.')
 _Z = NormalDist()
 
 
@@ -150,13 +171,36 @@ def quarantine_reason(identity: str) -> str | None:
     return None
 
 
+SERVED_ALIASES: dict[str, set] = {}   # canonical configured id -> canonical served ids documented as the same model
+_SNAPSHOT = re.compile(r'^(?P<base>.+?)-(?:\d{8}|\d{4}-\d{2}-\d{2})$')
+
+
+def canonical_model(m) -> str:
+    """A model id in one spelling: lower case, no provider prefix (models/, google/, ...), and any run of
+    spaces, dots, underscores, slashes or brackets as one hyphen, so "Gemini 4 Neon (High)" and
+    "gemini-4-neon-high" are the same id. Nothing else is equated."""
+    s = str(m).strip().lower()
+    s = re.sub(r'^(?:models|google|anthropic|openai|vertex_ai|gemini)/', '', s)
+    return re.sub(r'[^a-z0-9]+', '-', s).strip('-')
+
+
+def same_model(configured, served) -> bool:
+    """Whether the model that answered is the configured one: the same canonical id, a dated snapshot of it
+    (`<id>-YYYYMMDD` or `<id>-YYYY-MM-DD`, the providers' documented way of pinning a version), or an id listed
+    for it in SERVED_ALIASES. A shorter or longer id is a different model (claude-sonnet-5 is not
+    claude-sonnet-5-5)."""
+    a, b = canonical_model(configured), canonical_model(served)
+    if a == b or b in SERVED_ALIASES.get(a, ()):
+        return True
+    snap = _SNAPSHOT.match(b)
+    return bool(snap) and snap.group('base') == a
+
+
 def served_mismatch(model, served) -> list[str]:
     """The models that answered for a player configured as `model` and are not that model."""
-    norm = lambda m: re.sub(r'[^a-z0-9]', '', str(m).lower())
     if not model:
         return []
-    m = norm(model)
-    return sorted({s for s in served or () if s and not (norm(s).startswith(m) or m.startswith(norm(s)))})
+    return sorted({s for s in served or () if s and not same_model(model, s)})
 
 
 def fingerprint(game: dict, seed, button) -> str | None:
@@ -263,7 +307,9 @@ def load_meta(root, served=None) -> dict:
 # The preregistered design.
 
 _COMPUTED = ('replicates', 'n_pairings', 'alpha_pairing', 'nominal_alpha', 'deals_needed', 'deals_planned',
-             'max_deals', 'power_at_max', 'min_conversations', 'conversations_needed')
+             'max_deals', 'power_at_max', 'min_conversations', 'conversations_needed', 'power_scenarios',
+             'underpowered', 'registered', 'sd_conversation_bb100', 'calibration')
+_PLAN_KEYS = ('design', 'deals', 'until_decided', 'replicates', 'matchups', 'target_edge_bb100', 'prior_sd_bb100')
 
 
 def _n_pairings(plan: dict) -> int:
@@ -271,56 +317,119 @@ def _n_pairings(plan: dict) -> int:
 
 
 def normalize_design(plan: dict | None) -> dict | None:
-    """The plan's sequential design with every default filled in: alpha, round_deals, max_rounds, block,
-    replicates (independent conversations per pairing per round), n_pairings and alpha_pairing (Bonferroni),
-    nominal_alpha (the level each look is tested at), and the preregistered target: target_edge_bb100 (default
-    50) and prior_sd_bb100 (default 350), the deals per pairing they need for 80% power (deals_needed, in
-    conversations of round_deals), deals_planned (that, capped by max_rounds x round_deals x replicates, i.e.
-    max_deals) and the simulated power of the whole procedure at the target (power_at_max). The runner, the
-    ratings and the viewer all use this one. None for a plan with no sequential design (one fixed round)."""
+    """The plan's sequential design with every default filled in: alpha, round_deals, block, replicates
+    (independent conversations per pairing per round), n_pairings and alpha_pairing (Bonferroni), nominal_alpha
+    (the level each look is tested at), min_conversations, and the preregistered target: target_edge_bb100
+    (default 50), prior_sd_bb100 (the per-deal spread, default 350) and the dependence assumed when planning
+    (assumed_icc: the share of the per-deal variance that is a conversation effect; assumed_ar1: memory from one
+    deal to the next inside a conversation). max_rounds, unless the plan sets it, is the fewest rounds that give
+    80% power at the target under those assumptions (max_rounds_basis 'power'); `budget_deals` caps the deals per
+    pairing (basis 'budget'), and then `underpowered` says whether that leaves less than 80%. power_scenarios
+    gives the power at the target under optimistic, the assumed (moderate) and pessimistic dependence;
+    power_at_max is the moderate one. registered: False for a plan whose design was not fixed before play (an
+    older stopping rule). The runner, the ratings and the viewer all use this one. None for a plan with no
+    sequential design."""
     if not plan or not plan.get('deals') and not (plan.get('design') or {}).get('round_deals'):
         return None
+    if plan.get('design') is None and not plan.get('until_decided'):
+        return None
+    key = json.dumps({k: plan.get(k) for k in _PLAN_KEYS if k != 'matchups'} | {'n': _n_pairings(plan)},
+                     sort_keys=True, default=str)
+    return json.loads(_normalized(key))
+
+
+@lru_cache(maxsize=256)
+def _normalized(key: str) -> str:
+    plan = json.loads(key)
     given = {k: v for k, v in (plan.get('design') or {}).items() if k not in _COMPUTED}
-    if plan.get('design'):
+    if plan.get('design') is not None:
         d = {**DEFAULT_DESIGN, 'round_deals': plan.get('deals') or DEFAULT_DESIGN['round_deals'], **given}
-    elif plan.get('until_decided'):
+    else:
         d = {**DEFAULT_DESIGN, 'round_deals': plan['deals'],
              'max_rounds': max(1, plan['until_decided'] // plan['deals']), 'legacy': 'until_decided'}
-    else:
-        return None
     reps = int(plan.get('replicates') or (plan.get('design') or {}).get('replicates') or 1)
-    return _complete(d, reps, _n_pairings(plan), plan.get('target_edge_bb100') or d.get('target_edge_bb100'),
-                     plan.get('prior_sd_bb100') or d.get('prior_sd_bb100'))
+    return json.dumps(_complete(d, reps, plan['n'], plan.get('target_edge_bb100') or d.get('target_edge_bb100'),
+                                plan.get('prior_sd_bb100') or d.get('prior_sd_bb100')))
 
 
-def _fixed_design(round_deals, n_pairings) -> dict:
-    """A run planned as one fixed round (older plans, `play`): its only look is at the end."""
-    return _complete({**DEFAULT_DESIGN, 'round_deals': int(round_deals or 1), 'max_rounds': 1, 'legacy': 'fixed'},
-                     1, n_pairings, None, None)
+def design_effect(ar1: float, R: int) -> float:
+    """Variance of the mean of R deals with AR(1) memory ar1, relative to R independent deals."""
+    return 1 + 2 * sum((1 - k / R) * ar1 ** k for k in range(1, R))
+
+
+def sd_conversation(sd: float, R: int, icc: float, ar1: float) -> float:
+    """The spread (bb/100) of one conversation's mean edge: a conversation effect holding a share icc of the
+    per-deal variance sd^2, plus the card noise of R deals with AR(1) memory."""
+    return math.sqrt(icc * sd * sd + (1 - icc) * sd * sd * design_effect(ar1, R) / R)
+
+
+def scenarios(icc: float, ar1: float) -> list[tuple[str, float, float]]:
+    """The planning scenarios: no dependence, the assumed one, and double the ICC with 0.1 more memory."""
+    return [('optimistic', 0.0, 0.0), ('moderate', icc, ar1), ('pessimistic', min(0.5, 2 * icc), round(min(0.9, ar1 + 0.1), 3))]
+
+
+def rounds_for(shift: float, alpha_pairing: float, replicates: int, power: float = POWER) -> int | None:
+    """The fewest rounds (looks) whose simulated power reaches `power` when each conversation's mean edge is
+    `shift` of its own spread; None beyond MAX_ROUNDS."""
+    reps = int(replicates)
+    z = _Z.inv_cdf(1 - alpha_pairing / 8) + _Z.inv_cdf(power)
+    r = max(1, math.ceil(max(MIN_CONVERSATIONS, (z / max(shift, 1e-9)) ** 2) / reps))
+    if r > MAX_ROUNDS:
+        return None if power_of(shift, alpha_pairing, MAX_ROUNDS, reps) < power else MAX_ROUNDS
+    if power_of(shift, alpha_pairing, r, reps) >= power:
+        while r > 1 and power_of(shift, alpha_pairing, r - 1, reps) >= power:
+            r -= 1
+        return r
+    while r < MAX_ROUNDS:
+        r += 1
+        if power_of(shift, alpha_pairing, r, reps) >= power:
+            return r
+    return None
 
 
 def _complete(d, reps, n_pairings, target, prior) -> dict:
-    R, rounds, B = int(d['round_deals']), int(d['max_rounds']), int(d.get('block') or BLOCK)
+    R, B = int(d['round_deals']), int(d.get('block') or BLOCK)
     target, prior = float(target or TARGET_EDGE), float(prior or PRIOR_SD)
+    icc, ar1 = float(d.get('assumed_icc', ASSUMED_ICC)), float(d.get('assumed_ar1', ASSUMED_AR1))
     ap = d['alpha'] / n_pairings
-    a1 = nominal_alpha(ap, R, rounds, B, reps)
-    conv = conversations_needed(target, prior, R, a1)
-    per_round, cap = R * reps, R * reps * rounds
-    planned = min(cap, math.ceil(conv * R / per_round) * per_round)
-    return {**d, 'round_deals': R, 'max_rounds': rounds, 'block': B, 'replicates': reps, 'n_pairings': n_pairings,
-            'alpha_pairing': ap, 'nominal_alpha': a1, 'min_conversations': MIN_CONVERSATIONS,
-            'target_edge_bb100': target, 'prior_sd_bb100': prior, 'conversations_needed': conv,
-            'deals_needed': conv * R, 'deals_planned': planned, 'max_deals': cap,
-            'power_at_max': power_of(target / prior * math.sqrt(R), ap, rounds, reps)}
+    plan_sd = sd_conversation(prior, R, icc, ar1)
+    need = rounds_for(target / plan_sd, ap, reps)
+    if d.get('max_rounds'):
+        rounds, basis = int(d['max_rounds']), d.get('max_rounds_basis') or 'given'
+    else:
+        rounds, basis = need or MAX_ROUNDS, 'power'
+    if d.get('budget_deals'):
+        cap = max(1, int(d['budget_deals']) // (R * reps))
+        if rounds > cap:
+            rounds, basis = cap, 'budget'
+    a1, _, levels, _ = _calibrate(ap, rounds, reps)
+    power = [{'scenario': name, 'assumed_icc': i, 'assumed_ar1': a,
+              'sd_conversation_bb100': round(sd_conversation(prior, R, i, a), 1),
+              'power': power_of(target / sd_conversation(prior, R, i, a), ap, rounds, reps)}
+             for name, i, a in scenarios(icc, ar1)]
+    moderate = power[1]['power']
+    cap = R * reps * rounds
+    return {**d, 'round_deals': R, 'max_rounds': rounds, 'max_rounds_basis': basis, 'block': B, 'replicates': reps,
+            'n_pairings': n_pairings, 'alpha_pairing': ap, 'nominal_alpha': a1,
+            'min_conversations': first_verdict(ap, rounds, reps) or MIN_CONVERSATIONS,
+            'registered': not d.get('legacy'), 'target_edge_bb100': target, 'prior_sd_bb100': prior,
+            'assumed_icc': icc, 'assumed_ar1': ar1, 'sd_conversation_bb100': round(plan_sd, 1),
+            'conversations_needed': need * reps if need else None, 'deals_needed': need * reps * R if need else None,
+            'deals_planned': cap, 'max_deals': cap, 'power_at_max': moderate, 'power_scenarios': power,
+            'underpowered': moderate < POWER,
+            'calibration': {'family': list(FAMILY), 'conversation_effect_share': FAMILY_SHARE,
+                            'levels': {k: round(v, 6) for k, v in levels.items()}, 'sims': CAL_SIMS}}
 
 
-def conversations_needed(edge, sd, R, a1, power=POWER) -> int:
-    """Conversations of R deals one pairing needs for `power` to detect `edge` with the conversation-level t at
-    nominal level a1 (normal approximation to the noncentral t)."""
-    for C in range(MIN_CONVERSATIONS, 100_000):
-        if _Z.cdf(edge * math.sqrt(C * R) / sd - t_ppf(1 - a1 / 2, C - 1)) >= power:
-            return C
-    return 100_000
+def unregistered(round_deals, n_pairings, replicates=1) -> dict:
+    """The design of a run that had none fixed before play: nothing in it is a test. `retrospective` is what a
+    default design would have needed for 80% power at the target (moderate dependence), labelled as such."""
+    R = int(round_deals or DEFAULT_DESIGN['round_deals'])
+    ref = normalize_design({'deals': R, 'design': {}, 'replicates': 4, 'matchups': [[i, -i - 1] for i in range(n_pairings)]})
+    return {'registered': False, 'alpha': DEFAULT_DESIGN['alpha'], 'round_deals': R, 'replicates': int(replicates or 1),
+            'block': BLOCK, 'n_pairings': n_pairings, 'min_conversations': MIN_CONVERSATIONS,
+            'retrospective': {k: ref[k] for k in ('target_edge_bb100', 'prior_sd_bb100', 'assumed_icc', 'assumed_ar1',
+                                                  'replicates', 'conversations_needed', 'deals_needed')}}
 
 
 # The stopping rule.
@@ -329,61 +438,151 @@ def _look_cs(rounds, reps):
     return [k * reps for k in range(1, rounds + 1)]
 
 
-@lru_cache(maxsize=None)
-def _looks(rounds: int, reps: int, shift: float = 0.0, sims: int = SIMS):
-    """The conversation-level t at every look of `sims` sequences whose conversation means are N(shift, 1) (a
-    round adds `reps` conversations), 0 where a look has too few conversations. Deterministic: one fixed seed."""
-    rng = np.random.default_rng(SIM_SEED)
-    cs_ = _look_cs(rounds, reps)
-    out = np.zeros((sims, rounds))
-    step = 100_000
-    for start in range(0, sims, step):
-        n = min(step, sims - start)
-        z = rng.standard_normal((n, rounds * reps)) + shift
-        s, s2 = np.cumsum(z, 1), np.cumsum(z * z, 1)
-        for k, C in enumerate(cs_):
-            if C < MIN_CONVERSATIONS:
-                continue
-            m = s[:, C - 1] / C
-            var = np.maximum(s2[:, C - 1] - C * m * m, 1e-300) / (C - 1)
-            out[start:start + n, k] = m / np.sqrt(var / C)
+def _p_two_sided(t, df: int):
+    """2 P(T > |t|) for Student t with integer df, vectorized (Abramowitz and Stegun 26.7.3-4)."""
+    t = np.abs(np.asarray(t, float))
+    th = np.arctan(t / math.sqrt(df))
+    c2, s = np.cos(th) ** 2, np.sin(th)
+    if df == 1:
+        return 1 - 2 * th / math.pi
+    if df % 2 == 0:
+        term = np.ones_like(t)
+        acc = term.copy()
+        for j in range(1, (df - 2) // 2 + 1):
+            term = term * c2 * (2 * j - 1) / (2 * j)
+            acc += term
+        return np.clip(1 - s * acc, 0.0, 1.0)
+    term = np.cos(th)
+    acc = term.copy()
+    for j in range(1, (df - 3) // 2 + 1):
+        term = term * c2 * (2 * j) / (2 * j + 1)
+        acc += term
+    return np.clip(1 - 2 / math.pi * (th + s * acc), 0.0, 1.0)
+
+
+def _null(shape, rng, n, C):
+    """n x C conversation means with no edge, unit variance: card noise (normal) plus, in the skewed shapes, a
+    conversation effect holding FAMILY_SHARE of the variance."""
+    z = rng.standard_normal((n, C))
+    if shape == 'normal':
+        return z
+    if shape == 'exponential':
+        u = rng.exponential(1.0, (n, C)) - 1
+    elif shape == 'lognormal':
+        u = (np.exp(rng.standard_normal((n, C))) - math.exp(0.5)) / math.sqrt((math.e - 1) * math.e)
+    else:   # rare_loss: a small win nine times in ten, a loss nine times as large otherwise
+        u = np.where(rng.random((n, C)) < 0.9, 1 / 3, -3.0)
+    return math.sqrt(1 - FAMILY_SHARE) * z + math.sqrt(FAMILY_SHARE) * u
+
+
+_T_CACHE: dict = {}
+
+
+def _tcols(shape, reps, shift, sims, stream, looks):
+    """The conversation-level t at looks 1..`looks` of `sims` simulated sequences of conversation means
+    (`shape` plus `shift`, `reps` conversations a look), one float32 column per look, 0 with fewer than two
+    conversations or no spread. Each look's conversations come from their own seed, so the columns of a short
+    design are those of a longer one, and are kept for reuse."""
+    key = (shape, int(reps), round(float(shift), 6), int(sims), int(stream))
+    c = _T_CACHE.get(key)
+    if c is None:
+        c = _T_CACHE[key] = {'s1': np.zeros(sims), 's2': np.zeros(sims), 'cols': []}
+    while len(c['cols']) < looks:
+        j = len(c['cols'])
+        rng = np.random.default_rng([SIM_SEED, int(stream), int(reps), j, int(round(shift * 1e6))])
+        z = _null(shape, rng, sims, reps) + shift
+        c['s1'] += z.sum(1)
+        c['s2'] += (z * z).sum(1)
+        C = (j + 1) * reps
+        if C < 2:
+            c['cols'].append(np.zeros(sims, np.float32))
+            continue
+        m = c['s1'] / C
+        var = (c['s2'] - C * m * m) / (C - 1)
+        ok = var > 1e-12 * (1 + m * m)
+        c['cols'].append(np.where(ok, m / np.sqrt(np.where(ok, var, 1.0) / C), 0.0).astype(np.float32))
+    return c['cols'][:looks]
+
+
+def _crossings(cols, reps, eligible, a1):
+    """(sequences x looks) whether |t| reached the bar of nominal level a1 at each eligible look."""
+    out = np.zeros((len(cols[0]), len(cols)), bool)
+    for j, t in enumerate(cols):
+        if eligible[j]:
+            out[:, j] = np.abs(t) >= t_ppf(1 - a1 / 2, (j + 1) * reps - 1)
     return out
 
 
-def _bars(a, rounds, reps):
-    return np.array([t_ppf(1 - a / 2, C - 1) if C >= MIN_CONVERSATIONS else np.inf for C in _look_cs(rounds, reps)])
+def _levels(ap, rounds, reps, eligible):
+    k = max(0, int(math.floor((ap - 2 * math.sqrt(ap * (1 - ap) / CAL_SIMS)) * CAL_SIMS)))
+    levels = {}
+    for i, shape in enumerate(FAMILY):
+        cols = _tcols(shape, reps, 0.0, CAL_SIMS, i, rounds)
+        lowest = np.ones(CAL_SIMS)
+        for j, t in enumerate(cols):
+            if not eligible[j]:
+                continue
+            df = (j + 1) * reps - 1
+            near = np.abs(t) > t_ppf(1 - min(0.25, 10 * ap), df)
+            lowest[near] = np.minimum(lowest[near], _p_two_sided(t[near], df))
+        levels[shape] = min(ap, float(np.partition(lowest, k)[k]) * (1 - 1e-9))
+    a1 = min(levels.values())
+    hit = np.logical_or.accumulate(_crossings(_tcols('normal', reps, 0.0, CAL_SIMS, 0, rounds), reps, eligible, a1), 1)
+    return a1, tuple(float(x) for x in hit.mean(0)), levels
+
+
+@lru_cache(maxsize=None)
+def _calibrate(alpha_pairing: float, rounds: int, reps: int):
+    """(nominal level, the normal-shape cumulative chance of a crossing by each look, {shape: level}, which
+    looks can decide). Each shape's level is the largest at which at most alpha_pairing (less two Monte Carlo
+    standard errors) of its null sequences cross at any look; the nominal level is the smallest of them (a
+    Pocock design on the p-value scale, calibrated for every shape of the family). A look can decide when it
+    has MIN_CONVERSATIONS conversations and the sign-flip arm can reject there at all (its error spent by then
+    is at least 1.5 x 2^(1 - conversations), the chance of the most extreme signs); a look that cannot is left
+    out of the calibration, so its error is not wasted."""
+    ap, rounds, reps = float(alpha_pairing), int(rounds), int(reps)
+    cs = _look_cs(rounds, reps)
+    eligible = tuple(C >= MIN_CONVERSATIONS for C in cs)
+    a1, cum, levels = ap, (0.0,) * rounds, {s: ap for s in FAMILY}
+    for _ in range(rounds + 1):
+        if not any(eligible):
+            return ap, (0.0,) * rounds, {s: ap for s in FAMILY}, eligible
+        a1, cum, levels = _levels(ap, rounds, reps, eligible)
+        spend = [c * ap / cum[-1] if cum[-1] > 0 else 0.0 for c in cum]
+        feasible = tuple(e and spend[j] >= 1.5 * 2.0 ** (1 - cs[j]) for j, e in enumerate(eligible))
+        if feasible == eligible:
+            break
+        eligible = feasible
+    return a1, cum, levels, eligible
+
+
+def first_verdict(alpha_pairing: float, rounds: int, reps: int) -> int | None:
+    """The fewest conversations at which a look of this design can decide."""
+    eligible = _calibrate(float(alpha_pairing), int(rounds), int(reps))[3]
+    return next((C for C, e in zip(_look_cs(int(rounds), int(reps)), eligible) if e), None)
 
 
 def nominal_alpha(alpha_pairing: float, round_deals: int, max_rounds: int, block: int = BLOCK, replicates: int = 1) -> float:
     """The two-sided level every look is tested at so that, over all `max_rounds` looks, a pairing with no edge
-    is called for either player with chance alpha_pairing (a Pocock design on the p-value scale), found by
-    bisection on simulated null sequences. With the conversation-level t it depends only on the looks and the
-    conversations per round (round_deals and block are kept for the signature)."""
-    return _nominal(float(alpha_pairing), int(max_rounds), int(replicates))
-
-
-@lru_cache(maxsize=None)
-def _nominal(alpha_pairing, rounds, reps):
-    if sum(C >= MIN_CONVERSATIONS for C in _look_cs(rounds, reps)) <= 1:
-        return alpha_pairing
-    T = np.abs(_looks(rounds, reps))
-    lo, hi = math.log(alpha_pairing / rounds / 4), math.log(alpha_pairing)
-    for _ in range(36):
-        mid = (lo + hi) / 2
-        lo, hi = (mid, hi) if (T >= _bars(math.exp(mid), rounds, reps)).any(axis=1).mean() <= alpha_pairing else (lo, mid)
-    return math.exp(lo)
+    is called for either player with chance at most alpha_pairing for every null shape of the calibration family
+    (normal, and skewed conversation effects: exponential, lognormal, rare large losses), found by simulation.
+    It depends only on the looks and the conversations per round (round_deals and block are kept for the
+    signature)."""
+    return _calibrate(float(alpha_pairing), int(max_rounds), int(replicates))[0]
 
 
 @lru_cache(maxsize=None)
 def power_of(shift: float, alpha_pairing: float, max_rounds: int, replicates: int = 1) -> float:
-    """The chance the procedure calls the better player when each conversation's mean edge is `shift` standard
-    errors of a conversation mean (edge x sqrt(round_deals) / per-deal sd), by simulation."""
+    """The chance the t arm of the procedure calls the better player when each conversation's mean edge is
+    `shift` of the spread of a conversation mean, by simulation (normal conversation means). The sign-flip arm
+    can only lower it, by under 2 points in the heavy tests."""
     rounds, reps = int(max_rounds), int(replicates)
-    a1 = _nominal(float(alpha_pairing), rounds, reps)
-    T = _looks(rounds, reps, round(float(shift), 6), POWER_SIMS)
-    hit = np.abs(T) >= _bars(a1, rounds, reps)
-    first = hit.argmax(axis=1)
-    return round(float((hit.any(axis=1) & (T[np.arange(len(T)), first] > 0)).mean()), 3)
+    a1, _, _, eligible = _calibrate(float(alpha_pairing), rounds, reps)
+    cols = _tcols('normal', reps, float(shift), POWER_SIMS, 99, rounds)
+    hit = _crossings(cols, reps, eligible, a1)
+    first = hit.argmax(1)
+    T = np.stack(cols, 1)
+    return round(float((hit.any(1) & (T[np.arange(len(T)), first] > 0)).mean()), 3)
 
 
 def boundary(alpha_pairing: float, round_deals: int, max_rounds: int, block: int = BLOCK, look: int | None = None,
@@ -394,9 +593,56 @@ def boundary(alpha_pairing: float, round_deals: int, max_rounds: int, block: int
     rounds, reps = int(max_rounds), int(replicates)
     look = rounds if look is None else max(1, min(int(look), rounds))
     C = look * reps
-    if C < MIN_CONVERSATIONS:
+    if not _calibrate(float(alpha_pairing), rounds, reps)[3][look - 1]:
         return math.inf
     return t_ppf(1 - nominal_alpha(alpha_pairing, round_deals, rounds, block, reps) / 2, C - 1)
+
+
+_FLIP_COLS: list = []
+
+
+def _flips(G: int) -> np.ndarray:
+    """(FLIPS + 1) x G signs: row 0 all +1 (the data as observed), the rest independent fair signs, one
+    seeded column per conversation, so the matrix of the first G conversations never depends on later ones."""
+    while len(_FLIP_COLS) < G:
+        c = len(_FLIP_COLS)
+        col = np.random.default_rng([SIM_SEED, 7, c]).integers(0, 2, FLIPS) * 2 - 1
+        _FLIP_COLS.append(np.concatenate([[1], col]).astype(float))
+    return np.stack(_FLIP_COLS[:G], 1)
+
+
+def _signflip(sizes, sums, cs, spend, null=0.0, side=0) -> list[bool]:
+    """The sign-flip arm, look by look: whether the observed conversations have been rejected at or before each
+    look (`cs` conversations at each, `spend` the cumulative chance allowed by then) as having a mean edge other
+    than `null` (side 0), above it (side 1) or below it (side -1). Under the null that each conversation's total
+    is symmetric about `null` x its deals (independent conversations, any shape, any dependence inside one),
+    the observed signs are exchangeable with the random ones, and at every look the threshold is the lowest
+    that keeps the rows rejected so far, observed included, within spend x rows: so the chance of a false
+    rejection by the last look is at most its spend, exactly."""
+    E = _flips(len(sums))
+    rows = len(E)
+    rejected = np.zeros(rows, bool)
+    path = []
+    dev = sums - null * sizes
+    for c, f in zip(cs, spend):
+        if c >= MIN_CONVERSATIONS and f > 0:
+            z = E[:, :c] * dev[:c]
+            n = sizes[:c]
+            N = n.sum()
+            m = z.sum(1) / N
+            r = z - np.outer(m, n)
+            se2 = c / (c - 1) * (r * r).sum(1) / N ** 2
+            pos = se2 > 1e-12 * (1 + (m * N) ** 2)
+            t = np.where(pos, (np.abs(m) if side == 0 else side * m) / np.sqrt(np.where(pos, se2, 1.0)), 0.0)
+            budget = int(math.floor(f * rows + 1e-9)) - int(rejected.sum())
+            free = ~rejected & (t > 0)
+            vals = t[free]
+            if budget >= 1 and len(vals):
+                thr = vals.min() if budget >= len(vals) else \
+                    np.nextafter(np.partition(vals, len(vals) - budget - 1)[len(vals) - budget - 1], np.inf)
+                rejected |= free & (t >= thr)
+        path.append(bool(rejected[0]))
+    return path
 
 
 def _chunks(xs, groups, block):
@@ -425,13 +671,20 @@ def _cr1(sizes, sums):
 
 def decide(xs, design=None, n_pairings=1, looks_used=None, groups=None) -> dict:
     """The verdict on one pairing from a's result per duplicate deal (bb/100), at look `looks_used` of the
-    design. `groups` labels each deal's conversation (its match folder); without it all deals are one.
+    design. `groups` labels each deal's conversation (its match folder), conversations in play order (round by
+    round); without it all deals are one.
 
-    verdict: 'a' or 'b' (|t| reached the bar), 'even' (the repeated (1 - 2 alpha) interval lies inside
-    +-EQUIV_BB100), 'exhausted' (the last planned look, undecided), 'open' (undecided: looks remain, or between
-    looks), 'early' (too few deals to estimate a spread). A verdict needs MIN_CONVERSATIONS conversations; with
-    fewer, `basis` is 'blocks' and the interval is conditional on the one conversation played (`reason`)."""
-    d = {**DEFAULT_DESIGN, **(design or {})}
+    A look can decide only with at least `min_conversations` conversations (MIN_CONVERSATIONS or more: the
+    first look of the design at which the sign-flip arm can reject at all) and some spread between them. Then a
+    winner needs both arms at that look: the conversation-level t beyond the calibrated bar, and the sign-flip
+    test (exact when results are symmetric about the true edge) rejecting by then. verdict: 'a' or 'b' (the
+    first look where both did, `decided_at_look`), 'even' (the repeated (1 - 2 alpha) interval inside
+    +-EQUIV_BB100, and both one-sided sign-flip tests), 'exhausted' (the last planned look, undecided), 'open'
+    (undecided, looks remain, or no look yet), 'early' (a completed look with fewer conversations than a verdict
+    needs, or too few deals for any spread). The
+    numbers describe all the deals given; with one conversation `basis` is 'blocks' and the interval is
+    conditional on it."""
+    d = {**DEFAULT_DESIGN, 'max_rounds': 1, **(design or {})}
     xs = [float(x) for x in xs]
     n, B, rounds, reps = len(xs), int(d.get('block') or BLOCK), int(d['max_rounds']), int(d.get('replicates') or 1)
     R = int(d.get('round_deals') or n or 1)
@@ -441,48 +694,88 @@ def decide(xs, design=None, n_pairings=1, looks_used=None, groups=None) -> dict:
     labels = list(groups) if groups is not None else ['.'] * n
     conv = {}
     for g, x in zip(labels, xs):
-        c = conv.setdefault(g, [0, 0.0])
+        c = conv.setdefault(g, [0, 0.0, 0.0])
         c[0] += 1
         c[1] += x
+        c[2] += x * x
+    sizes = np.array([c[0] for c in conv.values()], float)
+    sums = np.array([c[1] for c in conv.values()], float)
     bsizes, bsums = _chunks(xs, labels, B)
     C, G = len(conv), len(bsizes)
     out = {'deals': n, 'blocks': G, 'conversations': C, 'edge': round(sum(xs) / n, 1) if n else None, 'se': None,
            'ci95': None, 't': None, 'df': None, 'basis': None, 'boundary': None, 'verdict': 'early',
            'looks_used': looks_used, 'looks_planned': rounds, 'alpha_pairing': alpha_p, 'equiv_bb100': EQUIV_BB100,
-           'ci_decision': None, 'equiv_ci': None, 'sd_per_deal': None, 'reason': None,
+           'min_conversations': MIN_CONVERSATIONS, 'decided_at_look': None, 'signflip': None,
+           'conversation_share': None, 'ci_decision': None, 'equiv_ci': None, 'sd_per_deal': None, 'reason': None,
            'power': {'deals_for_80pct': {str(e): None for e in POWER_EDGES}}}
-    if C >= MIN_CONVERSATIONS:
-        m, se = _cr1(np.array([c[0] for c in conv.values()], float), np.array([c[1] for c in conv.values()], float))
+    if C >= 2:
+        m, se = _cr1(sizes, sums)
         df, basis = C - 1, 'conversations'
     elif G >= 2:
         m, se = _cr1(bsizes, bsums)
         df, basis = G - 1, 'blocks'
     else:
+        out['reason'] = 'too few deals to estimate any spread'
         return out
-    a1 = nominal_alpha(alpha_p, R, rounds, B, reps) if rounds > 1 else alpha_p
-    aeq = nominal_alpha(min(1.0, 2 * alpha_p), R, rounds, B, reps) if rounds > 1 else min(1.0, 2 * alpha_p)
-    bnd, beq = t_ppf(1 - a1 / 2, df), t_ppf(1 - aeq / 2, df)
-    t = m / se if se > 0 else (math.copysign(math.inf, m) if m else 0.0)
     iv = lambda c: [round(m - c * se, 1), round(m + c * se, 1)]
-    can = basis == 'conversations'
+    a1, cum, _, eligible = _calibrate(alpha_p, rounds, reps)
+    aeq = _calibrate(min(1.0, 2 * alpha_p), rounds, reps)[0]
+    need = next((c for c, e in zip(_look_cs(rounds, reps), eligible) if e), None) or MIN_CONVERSATIONS
+    out['min_conversations'] = need
+    can = C >= need
+    bnd = t_ppf(1 - a1 / 2, df) if can else None
+    beq = t_ppf(1 - aeq / 2, df) if can else None
+    flat = lambda mean, s: s <= 1e-9 * (1 + abs(mean))
+    t = 0.0 if flat(m, se) else m / se
+    verdict, reason, at, flip = None, None, None, None
     if looks_used < 1:
         verdict = 'open'
-    elif can and abs(t) >= bnd:
-        verdict = 'a' if t > 0 else 'b'
-    elif can and m - beq * se > -EQUIV_BB100 and m + beq * se < EQUIV_BB100:
-        verdict = 'even'
-    elif looks_used >= rounds:
-        verdict = 'exhausted'
+    elif not can:
+        verdict = 'early'
+        reason = (f'{C} conversation{"s" if C != 1 else ""}: a verdict needs at least {need} independent '
+                  f'conversations (fresh match pairs) of the pairing')
     else:
-        verdict = 'open'
+        cs = [min(j * reps, C) for j in range(1, looks_used + 1)]
+        cs[-1] = C
+        spend = [cum[min(j, len(cum) - 1)] * alpha_p / cum[-1] if cum[-1] > 0 else 0.0 for j in range(len(cs))]
+        flips = _signflip(sizes, sums, cs, spend)
+        flip = flips[-1]
+        eq = None
+        for j, c in enumerate(cs):
+            if c < MIN_CONVERSATIONS or not eligible[min(j, len(eligible) - 1)]:
+                continue
+            mj, sej = _cr1(sizes[:c], sums[:c])
+            if flat(mj, sej):
+                continue
+            tj = mj / sej
+            if abs(tj) >= t_ppf(1 - a1 / 2, c - 1) and flips[j]:
+                verdict, at = ('a' if tj > 0 else 'b'), j + 1
+                break
+            q = t_ppf(1 - aeq / 2, c - 1)
+            if mj - q * sej > -EQUIV_BB100 and mj + q * sej < EQUIV_BB100:
+                if eq is None:
+                    eq = [_signflip(sizes, sums, cs, spend, EQUIV_BB100, -1), _signflip(sizes, sums, cs, spend, -EQUIV_BB100, 1)]
+                if eq[0][j] and eq[1][j]:
+                    verdict, at = 'even', j + 1
+                    break
+        if verdict is None:
+            verdict = 'exhausted' if looks_used >= rounds else 'open'
+            if flat(m, se):
+                reason = 'the conversations show no spread at all, so no verdict is possible from them'
+            elif abs(t) >= bnd and not flip:
+                reason = 'the t arm crossed its bar but the sign-flip arm did not (both are needed)'
+    share = None
+    if C >= 2:
+        within = sum((c[2] - c[1] ** 2 / c[0]) / (c[0] - 1) / c[0] for c in conv.values() if c[0] > 1) / C
+        between = float(np.var(sums / sizes, ddof=1))
+        share = round(max(0.0, 1 - within / between), 2) if between > 0 else None
     sigma = se * math.sqrt(n)
     plan_c = _Z.inv_cdf(1 - a1 / 2)
     out.update({'edge': round(m, 1), 'se': round(se, 1), 'ci95': iv(t_ppf(0.975, df)), 'df': df, 'basis': basis,
-                't': round(t, 2) if math.isfinite(t) else None, 'boundary': round(bnd, 3) if can else None,
-                'verdict': verdict, 'ci_decision': iv(bnd) if can else None, 'equiv_ci': iv(beq) if can else None,
-                'sd_per_deal': round(sigma, 1),
-                'reason': None if can else (f'one conversation: a verdict needs at least {MIN_CONVERSATIONS} independent '
-                                            f'conversations (fresh matches) of the pairing'),
+                't': round(t, 2), 'boundary': round(bnd, 3) if can else None, 'verdict': verdict,
+                'decided_at_look': at, 'signflip': flip, 'conversation_share': share,
+                'ci_decision': iv(bnd) if can else None, 'equiv_ci': iv(beq) if can else None,
+                'sd_per_deal': round(sigma, 1), 'reason': reason,
                 'power': {'deals_for_80pct': {str(e): math.ceil(((plan_c + _Z.inv_cdf(POWER)) * sigma / e) ** 2)
                                               for e in POWER_EDGES}}})
     return out
@@ -640,13 +933,42 @@ def sessions(obs, size=SESSION) -> list[dict]:
                 continue
             a = chunk[0]['a']
             out.append({'a': a, 'b': chunk[0]['b'], 'matchup': mu, 'deals': len(chunk),
-                        'net_bb': sum((o['x'] if o['a'] == a else -o['x']) / 50 for o in chunk)})
+                        'net_bb': sum((o['x'] if o['a'] == a else -o['x']) / 50 for o in chunk),
+                        'cells': [(str(o['slate']), o['pos'], frozenset((o['a'], o['b']))) for o in chunk]})
     return out
 
 
 def outcome(s) -> float:
     band = TIE_BB * s['deals']
     return 1.0 if s['net_bb'] > band else 0.0 if s['net_bb'] < -band else 0.5
+
+
+def _elo_boot(names, comps, games, Ws, iters=40):
+    """Session-Elo MAP ratings refitted under each row of bootstrap weights (boot x sessions): a session keeps
+    the weight of the slate (or aligned block) it was played on, so sessions of one conversation, and of
+    pairings that shared the cards, are resampled together."""
+    N = len(names)
+    idx = {n: i for i, n in enumerate(names)}
+    X = np.zeros((len(games), N))
+    for k, g in enumerate(games):
+        X[k, idx[g['a']]] += 1
+        X[k, idx[g['b']]] -= 1
+    y = np.array([outcome(g) for g in games], float)
+    w = np.zeros((len(Ws), N))
+    pr = 1 / ELO_PRIOR ** 2
+    for _ in range(iters):
+        p = 1 / (1 + np.exp(-(w @ X.T)))
+        grad = (Ws * (y - p)) @ X - pr * w
+        H = np.einsum('bs,si,sj->bij', Ws * p * (1 - p), X, X) + pr * np.eye(N)
+        step = np.linalg.solve(H, grad[..., None])[..., 0]
+        w += step
+        if np.abs(step).max() < 1e-9:
+            break
+    A = np.eye(N)
+    for c in comps:
+        ii = [idx[q] for q in c]
+        A[np.ix_(ii, ii)] -= 1 / len(c)
+    return w @ A.T
 
 
 def _elo(names, comps, games, iters=60):
@@ -698,9 +1020,12 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
     elif design is None:
         design = normalize_design(plan) if plan else None
         if design is None:
-            design = _fixed_design((plan or {}).get('deals') or max((d.get('planned') or 0 for d in raw), default=1),
-                                   n_pairings)
+            design = unregistered((plan or {}).get('deals') or max((d.get('planned') or 0 for d in raw), default=1),
+                                  n_pairings, (plan or {}).get('replicates') or 1)
+        elif not design.get('registered', True):
+            design = {**unregistered(design['round_deals'], n_pairings, design['replicates']), 'legacy': design.get('legacy')}
     block = int((design or {}).get('block') or BLOCK)
+    registered = not pooled and bool(design and design.get('registered', True))
     info = lambda p: meta.get(p) or {'identity': p, 'kind': 'bot' if p.startswith('bot:') else 'model',
                                      'quarantine_reason': None, 'identity_resolved': True}
     excluded = {p for d in raw for p in (d['a'], d['b']) if pooled and info(p)['quarantine_reason']}
@@ -712,6 +1037,7 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
     idx = {n: i for i, n in enumerate(names)}
 
     cells = _cells(obs)
+    cell_ix = {(c['slate'], c['pos'], frozenset((c['a'], c['b']))): i for i, c in enumerate(cells)}
     for c in cells:                     # groups never share a stratum: one group's pairings don't shape another's
         c['slate'] = f'{comp_of[c["a"]]}|{c["slate"]}'
     strata = _strata(cells)
@@ -734,7 +1060,7 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
             v[idx[p]] += s
         return v
 
-    pairings = _pairings(used, obs, design, n_pairings, pooled, recorded or {})
+    pairings = _pairings(used, obs, design, n_pairings, pooled, recorded or {}, lambda p: info(p)['quarantine_reason'])
     vmap = {frozenset((x['a'], x['b'])): x for x in pairings}
 
     def result(p, q):
@@ -748,6 +1074,10 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
 
     games = sessions(obs, session)
     elo, cov = _elo(names, comps, games) if names else (np.zeros(0), np.zeros((0, 0)))
+    elo_draws = np.zeros((0, len(names)))
+    if names and games and len(W) >= 2:
+        Ws = np.stack([W[:, [cell_ix[k] for k in g['cells'] if k in cell_ix]].mean(1) for g in games], 1)
+        elo_draws = _elo_boot(names, comps, games, Ws)
     tot = defaultdict(lambda: {'net_bb': 0.0, 'deals': 0})
     for d in raw:
         for p, s in ((d['a'], 1), (d['b'], -1)):
@@ -805,6 +1135,10 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
             won = sum(1 for s in mine_s if outcome(s) == (1.0 if s['a'] == p else 0.0))
             ties = sum(1 for s in mine_s if outcome(s) == 0.5)
             sd = math.sqrt(max(cov[i, i], 0))
+            sd_boot = float(np.std(elo_draws[:, i], ddof=1)) if len(elo_draws) >= 2 and df and df >= 1 else None
+            q = t_ppf(0.975, df) if sd_boot is not None else 1.96
+            elo_basis = 'posterior' if sd_boot is None or sd_boot <= sd else 'bootstrap'
+            sd = max(sd, sd_boot or 0.0)
             rank, rng_, tied = decided[p]
             players.append({
                 'player': p, 'identity': info(p)['identity'], 'kind': info(p)['kind'], 'component': ci,
@@ -814,7 +1148,9 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
                 'identity_resolved': bool(info(p).get('identity_resolved', identity_resolved(info(p)['identity']))),
                 'net_bb': round(tot[p]['net_bb'], 1), 'hands': 2 * tot[p]['deals'], 'deals': tot[p]['deals'],
                 'session_elo': round(1500 + K * float(elo[i])),
-                'session_elo_ci95': [round(1500 + K * (elo[i] - 1.96 * sd)), round(1500 + K * (elo[i] + 1.96 * sd))],
+                'session_elo_ci95': [round(1500 + K * (elo[i] - q * sd)), round(1500 + K * (elo[i] + q * sd))],
+                'session_elo_basis': elo_basis,
+                'inferential': registered and not info(p)['quarantine_reason'],
                 'sessions': len(mine_s), 'session_w': won, 'session_t': ties, 'session_l': len(mine_s) - won - ties,
                 'quarantined': bool(info(p)['quarantine_reason']), 'quarantine_reason': info(p)['quarantine_reason'],
                 'unrated_reason': None})
@@ -826,7 +1162,8 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
             'position': None, 'rank': None, 'rank_kind': 'descriptive', 'rank_range': None, 'rank_tied_with': [],
             'in_fit': False, 'identity_resolved': bool(info(p).get('identity_resolved', identity_resolved(info(p)['identity']))),
             'net_bb': round(tot[p]['net_bb'], 1), 'hands': 2 * tot[p]['deals'], 'deals': tot[p]['deals'],
-            'session_elo': None, 'session_elo_ci95': None, 'sessions': 0, 'session_w': 0, 'session_t': 0,
+            'session_elo': None, 'session_elo_ci95': None, 'session_elo_basis': None, 'inferential': False,
+            'sessions': 0, 'session_w': 0, 'session_t': 0,
             'session_l': 0, 'quarantined': p in excluded,
             'quarantine_reason': info(p)['quarantine_reason'] if p in excluded else None,
             'unrated_reason': info(p)['quarantine_reason'] if p in excluded else 'played only unrated opponents'})
@@ -853,10 +1190,14 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
     notes = list(notes) + _notes(pooled, design, pairings, comps, groups, obs, repeats, excluded, unrated, players, block)
     return {'objective': OBJECTIVE, 'design': design, 'pooled': pooled, 'deals': len(raw), 'hands': 2 * len(raw),
             'observations': len(obs), 'repeats': repeats, 'block': block, 'boot': boot,
-            'equiv_bb100': EQUIV_BB100, 'session_deals': session, 'min_conversations': MIN_CONVERSATIONS,
+            'equiv_bb100': EQUIV_BB100, 'session_deals': session,
+            'min_conversations': (design or {}).get('min_conversations') or MIN_CONVERSATIONS,
             'inference': ('descriptive only: pooled across runs, so no result here is a test' if pooled else
+                          'descriptive only: this run had no preregistered design, so no result here is a test'
+                          if not registered else
                           'decided results come only from the preregistered sequential test of each pairing; '
                           'strengths, intervals and the order by points are descriptive'),
+            'guarantee': None if not registered else GUARANTEE,
             'components': comps, 'groups': groups, 'leader': leaders[0] if leaders else None, 'leaders': leaders,
             'players': players, 'pairings': pairings, 'matchups': pairings, 'roster': roster, 'notes': notes}
 
@@ -880,15 +1221,31 @@ def _notes(pooled, design, pairings, comps, groups, obs, repeats, excluded, unra
         notes.append('All-time standings pool runs with different designs and stopping times, so they are '
                      'descriptive only: no verdict, rank or leader here is a test result. Only identical '
                      'protocols pool (model, reasoning level and the settings that change play).')
+    elif not design.get('registered', True):
+        notes.append('This run had no preregistered design (it was played as one fixed round, or under an older '
+                     'stopping rule), so nothing in it is a test: every verdict is descriptive, and any sample size '
+                     'shown for it is retrospective.')
     else:
-        notes.append(f'Decided results come only from the preregistered sequential test of each pairing (at most '
+        notes.append(f'Decided results come only from the preregistered sequential test of each pairing: at most '
                      f'{design["alpha"]:.0%} chance of any false verdict over its {design["n_pairings"]} '
-                     f'pairing{"s" if design["n_pairings"] != 1 else ""}); '
-                     f'strengths, intervals and the order by points are descriptive.')
+                     f'pairing{"s" if design["n_pairings"] != 1 else ""}, {GUARANTEE} Strengths, intervals and the '
+                     f'order by points are descriptive.')
+        if any(x['verdict'] == 'early' for x in pairings):
+            notes.append(f'A verdict needs at least {design.get("min_conversations", MIN_CONVERSATIONS)} conversations (fresh match pairs) of a '
+                         f'pairing; pairings with fewer are "too early", whatever their numbers say.')
         if any(x['basis'] == 'blocks' for x in pairings):
-            notes.append(f'Some pairings have one conversation (one fresh match pair): no verdict is possible from '
-                         f'one, and their intervals describe that conversation only (blocks of {block} deals), not '
-                         f'how a new match would go.')
+            notes.append(f'Some pairings have one conversation: their intervals describe that conversation only '
+                         f'(blocks of {block} deals), not how a new match would go.')
+        wide = [x for x in pairings if (x.get('conversation_share') or 0) > FAMILY_SHARE
+                and x['conversations'] >= design.get('min_conversations', MIN_CONVERSATIONS)]
+        if wide:
+            notes.append('In ' + ', '.join(f'{x["a"]} vs {x["b"]}' for x in wide) + ' the conversations differ by more '
+                         'than their card noise explains (estimated), beyond the range the test is calibrated for '
+                         'unless their results are symmetric; its verdict there is less certain than stated.')
+        doubt = [x for x in pairings if x.get('test_verdict')]
+        if doubt:
+            notes.append('Pairings with a player whose identity is in doubt (no exact model version, mixed settings, or '
+                         'another model answered) are descriptive only: ' + ', '.join(f'{x["a"]} vs {x["b"]}' for x in doubt) + '.')
     if any(p['ci_basis'] in ('blocks', 'mixed') for p in players if p['in_fit']):
         notes.append('Strength intervals marked "blocks" rest on blocks of deals within single conversations, so '
                      'they leave out how much fresh matches differ.')
@@ -907,20 +1264,19 @@ def _notes(pooled, design, pairings, comps, groups, obs, repeats, excluded, unra
         notes.append(f'Not rated (every opponent was unrated): {", ".join(sorted(set(unrated) - excluded))}.')
     elif not pooled and any(x['quarantined'] for x in players):
         notes.append('Some players are quarantined (no exact model version, mixed settings, or another model '
-                     'answered): they are rated in this run but not pooled into the all-time standings.')
+                     'answered): their strengths are shown, but no verdict involving them is decided and they are '
+                     'not pooled into the all-time standings.')
     if any(len(c) > 2 and _is_tree(c, obs) for c in comps):
         notes.append('Every pairing in a group is its only link between those players, so the strengths fit the '
                      'pairings exactly and nothing checks that edges add up across players.')
-    changed = [x for x in pairings if x.get('recorded_verdict') and x['recorded_verdict'] != x['verdict']]
+    changed = [x for x in pairings if x.get('recorded_verdict') and x['recorded_verdict'] != x.get('test_verdict', x['verdict'])]
     if changed:
         notes.append('The run recorded different verdicts with an earlier version of the test ('
                      + ', '.join(f'{x["a"]} vs {x["b"]}: {x["recorded_verdict"]}' for x in changed)
                      + '); shown here is the current test on the same looks, and a pairing it stopped is not resumed.')
-    if design and design.get('legacy') == 'until_decided':
-        notes.append('This run stopped pairings with an older rule (|z| >= 2.7); its verdicts are re-judged here with '
-                     'the current test, so a pairing that stopped may now read as undecided.')
     notes.append('Session Elo is the share of 10-deal sessions won: a different, secondary statistic that never '
-                 'decides anything.')
+                 'decides anything. Its interval is the wider of a posterior one and a bootstrap that resamples '
+                 'sessions with their slates and conversations.')
     return notes
 
 
@@ -929,9 +1285,11 @@ def _is_tree(comp, obs):
     return len(edges) == len(comp) - 1
 
 
-def _pairings(raw, obs, design, n_pairings, pooled, recorded) -> list:
+def _pairings(raw, obs, design, n_pairings, pooled, recorded, blocked=lambda p: None) -> list:
     """One row per pair of players, pooling every conversation between them, with its verdict at the last
-    completed planned look (pooled: descriptive only)."""
+    completed planned look. Descriptive only (verdict 'descriptive', `inferential` False) when pooled, when the
+    run had no preregistered design, or when either player's identity is in doubt (`blocked` gives the reason:
+    unresolved model, mixed settings, another model answered)."""
     by = {}
     for o in obs:
         x = by.setdefault(frozenset((o['a'], o['b'])), {'a': o['a'], 'b': o['b'], 'obs': [], 'matchups': [],
@@ -949,14 +1307,17 @@ def _pairings(raw, obs, design, n_pairings, pooled, recorded) -> list:
         o = outcome(g) if g['a'] == by[key]['a'] else 1 - outcome(g)
         wins[key][0] += o == 1.0
         wins[key][1] += o == 0.0
+    registered = bool(design and design.get('registered', True))
     out = []
     for key, x in by.items():
-        os_ = x['obs']
+        os_ = sorted(x['obs'], key=lambda o: (o['round'], o['replicate'], o['matchup'], o['deal']))
         sign = lambda o: o['x'] if o['a'] == x['a'] else -o['x']
-        if pooled:
+        doubt = [f'{p}: {blocked(p)}' for p in (x['a'], x['b']) if blocked(p)]
+        if pooled or not registered:
             v = decide([sign(o) for o in os_], {'max_rounds': 1, 'round_deals': len(os_), 'block': BLOCK},
                        n_pairings, 0, groups=[o['matchup'] for o in os_])
-            v.update(verdict='descriptive', boundary=None, ci_decision=None, equiv_ci=None, reason=None)
+            v.update(verdict='descriptive', boundary=None, ci_decision=None, equiv_ci=None, signflip=None,
+                     reason=None if pooled else 'this run had no preregistered design, so nothing in it is a test')
             looks, beyond = 0, 0
         else:
             rounds, reps = int(design['max_rounds']), int(design.get('replicates') or 1)
@@ -974,6 +1335,10 @@ def _pairings(raw, obs, design, n_pairings, pooled, recorded) -> list:
             at = [o for o in os_ if o['round'] <= looks] if looks else os_
             v = decide([sign(o) for o in at], design, n_pairings, looks, groups=[o['matchup'] for o in at])
             beyond = len(os_) - len(at) if looks else 0
+            if doubt:
+                v.update(test_verdict=v['verdict'], verdict='descriptive',
+                         reason='; '.join(doubt) + ': results that involve it are descriptive only')
+        v['inferential'] = v['verdict'] != 'descriptive'
         rec = recorded.get(f'{x["a"]}__vs__{x["b"]}') or recorded.get(f'{x["b"]}__vs__{x["a"]}') or []
         last = rec[-1] if rec else {}
         out.append({'a': x['a'], 'b': x['b'], 'matchups': x['matchups'], 'matchup': x['matchups'][-1],
@@ -997,7 +1362,8 @@ def ratings(root, boot=BOOT, seed=0, session=SESSION) -> dict:
     meta = load_meta(root, {p: s.get('served_models') for p, s in stats.items()})
     r = rate(load_deals(root), boot, seed, session, meta=meta, plan=plan, playing=playing,
              recorded=_json(root / 'decisions.json') or {})
-    return {**r, 'stats': stats}
+    from .stats import LABELS, POSITIONS
+    return {**r, 'stats': stats, 'stat_labels': LABELS, 'position_labels': POSITIONS}
 
 
 VERDICT_TEXT = {
@@ -1005,8 +1371,8 @@ VERDICT_TEXT = {
     'even': 'even (decided): the edge is within ±{e} bb/100',
     'open': 'undecided so far',
     'exhausted': 'undecided after every planned look (not evidence that they are equal)',
-    'early': 'too few deals to judge',
-    'descriptive': 'descriptive only (pooled across runs, not a test)',
+    'early': 'too early to judge: too few conversations',
+    'descriptive': 'descriptive only (not a test)',
 }
 
 
@@ -1052,16 +1418,39 @@ def _named(text, name, ids):
     return text
 
 
+def _pct(x):
+    return '?' if x is None else '>99%' if x >= 0.995 else '<1%' if x < 0.005 else f'{x:.0%}'
+
+
 def design_line(d) -> str:
-    """The preregistered target in words."""
+    """The preregistered target and its power under each dependence scenario, in words (or, for a run without a
+    design, what one would have needed, labelled retrospective)."""
     if not d:
         return ''
-    reach = (f'the plan allows at most {d["max_deals"]:,} (power at the target: {d["power_at_max"]:.0%})'
-             if d['deals_needed'] > d['max_deals'] else f'the plan allows {d["max_deals"]:,}')
-    head = (f'This run had no preregistered target. To detect a {d["target_edge_bb100"]:.0f} bb/100 edge'
-            if d.get('legacy') else f'Planned to detect a {d["target_edge_bb100"]:.0f} bb/100 edge')
-    return (f'{head} with 80% power, assuming a per-deal spread of {d["prior_sd_bb100"]:.0f} bb/100: that needs about {d["deals_needed"]:,} deals per pairing '
-            f'({d["conversations_needed"]} conversations of {d["round_deals"]}); {reach}.')
+    if not d.get('registered', True):
+        x = d.get('retrospective') or {}
+        if not x.get('deals_needed'):
+            return 'No preregistered design: nothing in this run is a test.'
+        return (f'No preregistered design: nothing in this run is a test. Retrospective sample size only: detecting a '
+                f'{x["target_edge_bb100"]:.0f} bb/100 edge with 80% power would take about {x["deals_needed"]:,} deals '
+                f'per pairing ({x["conversations_needed"]} conversations of {d["round_deals"]} deals), assuming a '
+                f'per-deal spread of {x["prior_sd_bb100"]:.0f} and moderate dependence (ICC {x["assumed_icc"]}, '
+                f'AR(1) {x["assumed_ar1"]}).')
+    sc = {x['scenario']: x for x in d.get('power_scenarios') or []}
+    per = f'{d["replicates"]} conversation{"s" if d["replicates"] != 1 else ""} of {d["round_deals"]} deals'
+    head = (f'Planned to detect a {d["target_edge_bb100"]:.0f} bb/100 edge: up to {d["max_rounds"]} rounds of {per} '
+            f'({d["max_deals"]:,} deals per pairing), a verdict from {d["min_conversations"]} conversations on.')
+    if sc:
+        m = sc['moderate']
+        head += (f' Power at the target, per-deal spread {d["prior_sd_bb100"]:.0f}: {_pct(m["power"])} with the assumed '
+                 f'dependence (ICC {m["assumed_icc"]}, AR(1) {m["assumed_ar1"]}), {_pct(sc["optimistic"]["power"])} with '
+                 f'none, {_pct(sc["pessimistic"]["power"])} if it is worse (ICC {sc["pessimistic"]["assumed_icc"]}, '
+                 f'AR(1) {sc["pessimistic"]["assumed_ar1"]}).')
+    if d.get('underpowered'):
+        why = 'a budget of ' + f'{d["budget_deals"]:,} deals' if d.get('max_rounds_basis') == 'budget' else 'its max_rounds'
+        need = f'about {d["deals_needed"]:,}' if d.get('deals_needed') else f'more than {MAX_ROUNDS * d["round_deals"] * d["replicates"]:,}'
+        head += f' Underpowered: capped by {why}; 80% would need {need} deals per pairing.'
+    return head
 
 
 def verdicts(r, labels=None) -> str:
@@ -1072,10 +1461,12 @@ def verdicts(r, labels=None) -> str:
     d = r.get('design')
     if r.get('pooled'):
         lines = ['Pairings (descriptive: pooled across runs, nothing here is a test):']
+    elif d and not d.get('registered', True):
+        lines = ['Pairings (descriptive: this run had no preregistered design, nothing here is a test):']
     else:
         lines = [f'Pairings (decided only by the preregistered sequential test: at most {d["alpha"]:.0%} chance of '
                  f'any false verdict over {d["n_pairings"]} pairing{"s" if d["n_pairings"] != 1 else ""}; a verdict needs '
-                 f'{MIN_CONVERSATIONS}+ conversations):']
+                 f'{d.get("min_conversations", MIN_CONVERSATIONS)}+ conversations):']
     for m in sorted(r['pairings'], key=lambda m: (order[m['verdict']], m['a'], m['b'])):
         a, b = name(m['a']), name(m['b'])
         head = f'  {a} vs {b}: '
@@ -1089,23 +1480,28 @@ def verdicts(r, labels=None) -> str:
             if m['boundary'] is not None:
                 t = m['t'] if m['t'] is not None else 'inf'
                 head += (', no planned look yet' if m['looks_used'] < 1 else
-                         f', t = {t} vs bar {m["boundary"]:.2f} at look {m["looks_used"]} of {m["looks_planned"]}')
+                         f', t = {t} vs bar {m["boundary"]:.2f} at look {m["looks_used"]} of {m["looks_planned"]}'
+                         + ('' if m.get('signflip') is None else
+                            f', sign-flip test {"rejects" if m["signflip"] else "does not reject"}')
+                         + (f', decided at look {m["decided_at_look"]}' if m.get('decided_at_look')
+                            and m['decided_at_look'] != m['looks_used'] else ''))
         state = VERDICT_TEXT[m['verdict']].format(a=a, b=b, e=r.get('equiv_bb100', EQUIV_BB100))
         lines.append(f'{head}: {state}.')
-        if m.get('reason') and m['verdict'] != 'descriptive':
+        if m.get('reason') and (m['verdict'] != 'descriptive' or m.get('test_verdict')):
             lines.append(f'      {m["reason"]}.')
         if m.get('deals_since_look'):
             lines.append(f'      {m["deals_since_look"]} more deals are in a round under way, not yet looked at.')
         need = m['power']['deals_for_80pct']
-        if m['verdict'] in ('open', 'exhausted') and need.get('50'):
+        if m['verdict'] in ('open', 'exhausted') and need.get('50') and m['conversations'] >= 2:
             lines.append('      deals per pairing for an 80% chance to detect a real edge of '
-                         + ', '.join(f'{e} bb/100: {need[e]:,}' for e in need) + ' (from the observed spread)')
+                         + ', '.join(f'{e} bb/100: {need[e]:,}' for e in need) + ' (from the observed spread of its '
+                         'conversations; a planning number, not a forecast)')
     lead = [x for x in r.get('leaders') or [] if x]
-    if not r.get('pooled'):
+    if not r.get('pooled') and (d or {}).get('registered', True):
         lines.append('Decided leader: ' + ('; '.join(f'{name(x["player"])} (won its pairing against every other '
                                                     f'player of its group)' for x in lead) if lead else 'none.'))
-        if d:
-            lines.append(design_line(d))
+    if d and not r.get('pooled'):
+        lines.append(design_line(d))
     return '\n'.join(lines)
 
 

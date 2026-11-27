@@ -19,7 +19,9 @@ the tool's raw output (`raw`), the CLI session before and after, and every faile
 (`failed_attempts`, rate-limit waits included, each with its exit status, stdout and stderr). A failed try
 that may have advanced a CLI's own conversation is followed by a rebuild, so the retry never builds on a
 turn the record lacks. `meta['tool_use']` lists any tool the model ran or tried in its turn (the seat rejects
-such a reply). `state()` / `restore()` let a stopped match resume; `rebuild()` starts a CLI conversation over
+such a reply). `meta['audit']` says how far the turn could be checked: 'verified' (the backend's own record of
+the turn was read in full), 'unverified' (a record should exist but couldn't be read: the seat rejects the reply
+and asks again, as for tool use) or 'opaque' (this backend never exposes one; its protocol says so). `state()` / `restore()` let a stopped match resume; `rebuild()` starts a CLI conversation over
 from the turns the match committed, for when the CLI's own conversation may hold turns the record dropped.
 `protocol()` is what a player's results depend on, for its identity across runs.
 """
@@ -79,6 +81,8 @@ class Backend:
     PRIVATE = {'system', 'turns', 'session', 'workdir', 'label', 'key', 'rebuilding', 'last_call'}
     NOT_PROTOCOL = {'timeout', 'rate_limit_wait', 'max_wait', 'print_timeout'}   # settings that don't change play
     TOOLS = 'none offered'   # how this CLI keeps tools away from the model (tool_policy)
+    AUDIT = 'verified'       # what a turn's record shows by default (see the module docstring)
+    AUDIT_SOURCE = "the backend's own output"
 
     def __init__(self, system: str, *, model: str | None = None, timeout: float = 900, retries: int = 3,
                  rate_limit_wait: float = 900, max_wait: float = 6 * 3600, max_history_chars: int = 400_000,
@@ -103,7 +107,9 @@ class Backend:
         return cli_version(self.exe)
 
     def tool_policy(self) -> dict:
-        return {'restriction': self.TOOLS, 'tool_turns': 'rejected and asked again in a rebuilt conversation'}
+        return {'restriction': self.TOOLS, 'tool_turns': 'rejected and asked again in a rebuilt conversation',
+                'audit': {'default': self.AUDIT, 'source': self.AUDIT_SOURCE,
+                          'unverified_turns': 'rejected and asked again in a rebuilt conversation'}}
 
     def protocol(self) -> dict:
         """The settings that change how this seat plays (not timeouts or waits), with the tool policy."""
@@ -204,6 +210,7 @@ class Backend:
                 meta['rebuilt_from_turns'] = len(self.turns)
                 self.rebuilding = False
             reply.meta = {**meta, **reply.meta}
+            reply.meta.setdefault('audit', self.AUDIT)
             self.turns.append([text, reply.text])
             return reply
 
@@ -470,15 +477,18 @@ class AgyCLI(Backend):
             with open(path, 'w') as f:
                 f.write(AGY_AGENT + self.system + '\n')
 
+    AUDIT_SOURCE = 'the conversation transcript agy writes under ' + BRAIN
+
     def _transcript(self):
-        """(thinking, model, tool calls) of this turn (the steps after the last user input) in the
-        conversation's transcript, if agy wrote one."""
+        """(thinking, model, tool calls, audit) of this turn (the steps after the last user input) in the
+        conversation's transcript. audit is 'unverified' when the transcript can't be read or holds no response
+        for this turn: then nothing is known about the tools the turn ran."""
         path = os.path.join(self.BRAIN, self.session or '', '.system_generated', 'logs', 'transcript.jsonl')
         try:
             with open(path) as f:
                 lines = f.read().splitlines()
         except OSError:
-            return '', None, []
+            return '', None, [], 'unverified'
         rows = []
         for line in lines:
             try:
@@ -486,13 +496,14 @@ class AgyCLI(Backend):
             except ValueError:
                 continue
         start = max((i for i, r in enumerate(rows) if r.get('type') == 'USER_INPUT'), default=-1) + 1
-        thinking, model, tools = '', None, []
+        thinking, model, tools, seen = '', None, [], False
         for rec in rows[start:]:
             if rec.get('type') == 'PLANNER_RESPONSE':
+                seen = True
                 thinking, model = rec.get('thinking') or thinking, rec.get('model') or model
                 tools += [{'type': 'tool_call', 'name': c.get('name'), 'input': json.dumps(c.get('args'))[:500]}
                           for c in rec.get('tool_calls') or []]
-        return thinking, model, tools
+        return thinking, model, tools, 'verified' if start and seen else 'unverified'
 
     async def _call(self, text):
         cmd = ['agy', '--output-format', 'json', '--sandbox', '--print-timeout', self.print_timeout]
@@ -517,8 +528,8 @@ class AgyCLI(Backend):
         if data.get('status') != 'SUCCESS':
             raise BackendError(f'agy {data.get("status")}: {json.dumps(data.get("error") or data)[:1500]}')
         self.session = data.get('conversation_id') or self.session
-        thinking, served, tools = self._transcript()
-        meta = {'session': self.session, **({'served_model': served} if served else {}),
+        thinking, served, tools, audit = self._transcript()
+        meta = {'session': self.session, 'audit': audit, **({'served_model': served} if served else {}),
                 **({'tool_use': tools} if tools else {})}
         return Reply(data.get('response') or '', thinking, data.get('usage') or {}, meta=meta)
 
@@ -533,6 +544,7 @@ class GeminiCLI(Backend):
     """Gemini CLI in headless mode; the transcript is re-sent every turn (as an argument, so it is capped
     lower than the other stateless backends; the oldest turns go first and the notes carry what matters)."""
     exe = 'gemini'
+    AUDIT_SOURCE = "the tool counts in gemini's JSON stats"
 
     def __init__(self, system, **kw):
         kw.setdefault('max_history_chars', 200_000)
@@ -558,7 +570,10 @@ class GeminiCLI(Backend):
 
 class CommandCLI(Backend):
     """Any CLI: `command` is a list of arguments ({model} is filled in); the full transcript goes to stdin
-    and stdout is the reply. For example ["pi", "-p", "--model", "{model}"] or ["ollama", "run", "{model}"]."""
+    and stdout is the reply. For example ["pi", "-p", "--model", "{model}"] or ["ollama", "run", "{model}"].
+    Its stdout is only the reply, so whether a turn ran a tool can't be checked (audit 'opaque')."""
+    AUDIT = 'opaque'
+    AUDIT_SOURCE = 'none: the CLI prints only its reply'
 
     def __init__(self, system, *, command: list[str], **kw):
         super().__init__(system, **kw)

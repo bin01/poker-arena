@@ -402,6 +402,59 @@ class TestViewerLogic(unittest.TestCase):
         self.assertEqual(r[5], {'target': 50, 'need': 700, 'planned': False, 'have': [40, 40]})
         self.assertIsNone(r[6])
 
+    def test_unregistered_is_descriptive(self):
+        r = self.run_js(f'const c = {json.dumps(CONTRACT)}; c.players[0].rank_kind = "decided";'
+                        ' const out = []; for (const design of [{registered: false, target_edge_bb100: 50, deals_needed: 650},'
+                        ' {legacy: "fixed", target_edge_bb100: 50, deals_needed: 650}, {registered: true, target_edge_bb100: 50, deals_needed: 650}]) {'
+                        '   const r = Core.normalize({...c, design}); out.push([r.unregistered, r.leaders.length, r.groups.map(g => g.leader),'
+                        '     r.players.map(p => p.rank), r.pairings.map(p => Core.verdict(p).short), Core.verdict(r.pairings[0]).long,'
+                        '     Core.targetEdge(design, r.pairings)]); } return out;')
+        unreg, legacy, reg = r
+        for x in (unreg, legacy):
+            self.assertTrue(x[0])
+            self.assertEqual((x[1], x[2], x[3]), (0, [None, None], [None, None, None, None]))
+            self.assertEqual(x[4], ['Ahead on points', 'Ahead on points'])
+            self.assertIn('no recorded test plan', x[5])
+            self.assertTrue(x[6]['retrospective'])
+            self.assertFalse(x[6]['planned'])
+        self.assertFalse(reg[0])
+        self.assertEqual(reg[4], ['a wins', 'Too early'])
+        self.assertTrue(reg[6]['planned'])
+        self.assertNotIn('retrospective', reg[6])
+
+    def test_design_fields(self):
+        r = self.run_js('return [Core.scenarios({power_scenarios: {pessimistic: {power: 0.3, deals_needed: 2000},'
+                        ' optimistic: {power_at_max: 0.95}, moderate: 0.8}}), Core.scenarios({power_scenarios: [{name: "moderate", power: 0.5}]}),'
+                        ' Core.scenarios({}), Core.normalize({pairings: [{a: "a", b: "b", verdict: "early", conversations: 3, deals: 30}],'
+                        ' min_conversations: 8}).pairings.map(p => [Core.conversationsShort(p), Core.verdict(p).long])];')
+        self.assertEqual([x['name'] for x in r[0]], ['optimistic', 'moderate', 'pessimistic'])
+        self.assertEqual([x['power'] for x in r[0]], [0.95, 0.8, 0.3])
+        self.assertEqual(r[0][2]['deals'], 2000)
+        self.assertEqual(r[1], [{'name': 'moderate', 'power': 0.5, 'deals': None}])
+        self.assertEqual(r[2], [])
+        self.assertTrue(r[3][0][0])
+        self.assertIn('8 independent conversations', r[3][0][1])
+
+    def test_timeline(self):
+        r = self.run_js(f'const a = PokerTable.steps({json.dumps(HAND)}).steps;'
+                        ' const b = PokerTable.steps(' + json.dumps(HAND[:6] + [HAND[-1]]) + ').steps;'
+                        ' const al = PokerTable.timeline([a, b], "aligned"), sq = PokerTable.timeline([a, b], "sequence");'
+                        ' return [a.length, b.length, al.map(f => [f.seg, f.at]), sq.map(f => [f.focus, f.at]),'
+                        ' PokerTable.frameOf(sq, 1, 0), PokerTable.frameOf(al, 0, 3), PokerTable.timeline([[], []]).length];')
+        na, nb, al, sq, f1, f0, empty = r
+        self.assertEqual(len(sq), na + nb)
+        self.assertEqual(sq[na - 1], [0, [na - 1, 0]])          # play 1 to its end while play 2 waits
+        self.assertEqual(sq[na], [1, [na - 1, 0]])               # then play 2 from its start
+        self.assertEqual(f1, na)
+        segs = [s for s, _ in al]
+        self.assertEqual(segs, sorted(segs, key=['preflop', 'flop', 'turn', 'river', 'end'].index))
+        self.assertEqual(al[-1][1], [na - 1, nb - 1])            # both end on their result
+        ends = [k for k, (s, _) in enumerate(al) if s == 'end']
+        self.assertTrue(all(at[1] < nb - 1 for s, at in al if s != 'end'))   # play 2's result waits for the end segment
+        self.assertEqual(al[f0][1][0], 3)
+        self.assertTrue(ends)
+        self.assertEqual(empty, 1)
+
     def test_corrections(self):
         r = self.run_js('const f = c => c + " chips"; return ['
                         ' Core.correction({requested: {action: "raise", amount: 5.5}, executed: {action: "raise", amount: 6},'

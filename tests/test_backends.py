@@ -167,9 +167,31 @@ class TestToolUse(OnPath):
         (logs / 'transcript.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
         be = make_backend('agy', 'SYS')
         be.session, be.BRAIN = 'conv-1', str(brain)
-        thinking, model, tools = be._transcript()
-        self.assertEqual((thinking, model), ('t', 'g-1'))
+        thinking, model, tools, audit = be._transcript()
+        self.assertEqual((thinking, model, audit), ('t', 'g-1', 'verified'))
         self.assertEqual([t['name'] for t in tools], ['search_web'])
+
+    def test_agy_without_a_readable_transcript_is_unverified(self):
+        brain = Path(tempfile.mkdtemp())
+        be = make_backend('agy', 'SYS')
+        be.session, be.BRAIN = 'conv-1', str(brain)
+        self.assertEqual(be._transcript(), ('', None, [], 'unverified'))           # no file
+        logs = brain / 'conv-1' / '.system_generated' / 'logs'
+        logs.mkdir(parents=True)
+        (logs / 'transcript.jsonl').write_text(json.dumps({'type': 'PLANNER_RESPONSE', 'model': 'g'}) + '\n')
+        self.assertEqual(be._transcript()[3], 'unverified')                        # no user turn: not this turn
+        (logs / 'transcript.jsonl').write_text(json.dumps({'type': 'USER_INPUT'}) + '\n')
+        self.assertEqual(be._transcript()[3], 'unverified')                        # no response to it yet
+        self.assertEqual(be.protocol()['tool_policy']['audit']['default'], 'verified')
+
+    def test_every_reply_carries_an_audit_status(self):
+        d = self.install('codex', FAKE_CODEX)
+        os.environ['ARGV_LOG'] = str(d / 'argv.jsonl')
+        self.addCleanup(os.environ.pop, 'ARGV_LOG', None)
+        self.assertEqual(asyncio.run(make_backend('codex', 'SYS', retries=0).send('hi')).meta['audit'], 'verified')
+        cmd = make_backend('command', 'SYS', command=['cat'], retries=0)
+        self.assertEqual(asyncio.run(cmd.send('hi')).meta['audit'], 'opaque')
+        self.assertEqual(cmd.protocol()['tool_policy']['audit']['default'], 'opaque')
 
 
 class TestAttempts(unittest.TestCase):

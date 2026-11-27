@@ -3,13 +3,14 @@ never leave a CLI conversation ahead of the record, a hand is committed atomical
 the commit on resume, bots resume with their random state, and each player's protocol is fingerprinted."""
 import asyncio
 import json
+import tarfile
 import unittest
 from unittest import mock
 
-from poker_arena import backends
+from poker_arena import backends, runner
 from poker_arena.agents import RandomBot
 from poker_arena.backends import BackendError
-from poker_arena.runner import ResumeMismatch, match_manifest, run_match
+from poker_arena.runner import ResumeMismatch, make_plan, match_manifest, run_match, run_plan
 from test_runner import QUIET, Base, FakeCLI
 
 
@@ -180,8 +181,13 @@ class TestProtocol(Base):
     def test_fingerprint_is_per_player_and_seat_independent(self):
         spec = {'backend': 'fakecli', 'model': 'm-1', 'effort': 'high'}
         one = match_manifest(self.G, [('m', spec), ('s', {'bot': 'station'})], [1, 2])['protocol']
-        two = match_manifest(self.G, [('s', {'bot': 'station'}), ('m', spec)], [7, 8, 9])['protocol']
+        two = match_manifest(self.G, [('s', {'bot': 'station'}), ('m', spec)], [7, 8])['protocol']
         self.assertEqual(one, two)
+        longer = match_manifest(self.G, [('m', spec), ('s', {'bot': 'station'})], [7, 8, 9])['protocol']
+        self.assertNotEqual(longer['m']['fingerprint'], one['m']['fingerprint'])   # the horizon is part of it
+        self.assertEqual(longer['m']['settings']['horizon']['hands_per_conversation'], 3)
+        self.assertIn('every match', longer['m']['settings']['horizon']['memory_reset'])
+        self.assertEqual(longer['s'], one['s'])                                     # a bot has no memory
         p = one['m']
         self.assertEqual(len(p['fingerprint']), 16)
         s = p['settings']
@@ -190,10 +196,10 @@ class TestProtocol(Base):
         self.assertIn('tool_policy', s)
         self.assertNotIn('timeout', s)
         self.assertEqual(one['s']['settings'], {'bot': 'station'})
-        slow = match_manifest(self.G, [('m', {**spec, 'timeout': 5}), ('s', {'bot': 'station'})], [1])['protocol']
+        slow = match_manifest(self.G, [('m', {**spec, 'timeout': 5}), ('s', {'bot': 'station'})], [1, 2])['protocol']
         self.assertEqual(slow['m']['fingerprint'], p['fingerprint'])         # a timeout doesn't change play
         for change in ({'max_fixes': 0}, {'extra_args': ['--x']}, {'model': 'm-2'}):
-            other = match_manifest(self.G, [('m', {**spec, **change}), ('s', {'bot': 'station'})], [1])['protocol']
+            other = match_manifest(self.G, [('m', {**spec, **change}), ('s', {'bot': 'station'})], [1, 2])['protocol']
             self.assertNotEqual(other['m']['fingerprint'], p['fingerprint'], change)
 
     def test_config_records_it_and_resume_checks_it(self):
@@ -210,6 +216,124 @@ class TestProtocol(Base):
         del cfg['protocol']                                                   # written by older code: adopted
         (m / 'config.json').write_text(json.dumps(cfg))
         asyncio.run(run_match(self.G, seats, [1, 2], m, **QUIET))
+
+
+
+class UnverifiedCLI(FakeCLI):
+    """Its turn record can't be read on the calls listed in `bad`."""
+    bad = set()
+
+    async def _call(self, text):
+        reply = await super()._call(text)
+        if len(FakeCLI.sent) in UnverifiedCLI.bad:
+            reply.meta['audit'] = 'unverified'
+        return reply
+
+
+class TestAudit(Base):
+    def setUp(self):
+        super().setUp()
+        backends.BACKENDS['unverified'] = UnverifiedCLI
+
+    def tearDown(self):
+        backends.BACKENDS.pop('unverified', None)
+        super().tearDown()
+
+    def test_an_unverified_turn_is_rejected_and_asked_again(self):
+        UnverifiedCLI.bad = {2}
+        m = self.d / 'm'
+        asyncio.run(run_match(self.G, [('m', {'backend': 'unverified'}), ('s', {'bot': 'station'})], [1, 2], m,
+                              **QUIET))
+        self.assertIsNone(FakeCLI.sent[2]['session'])                         # rebuilt without that turn
+        self.assertEqual(FakeCLI.sent[2]['text'].split('=== NOW ===')[-1].strip().split('\n')[1],
+                         FakeCLI.sent[1]['text'].split('\n')[0])              # the same question, no notice
+        calls = self.rows(m / 'calls.jsonl')
+        self.assertTrue(all(c.get('audit') for c in calls))                  # every call carries its status
+        self.assertEqual([c['rejected'] for c in calls if c.get('rejected')], ['unverified'])
+        thoughts = [e['data'] for e in self.rows(m / 'events.jsonl') if e['kind'] == 'thought' and e['data']['seat'] == 0]
+        self.assertEqual([t['correction']['kind'] for t in thoughts if t['correction']], ['unverified'])
+        self.assertTrue(all(t['audit'] == 'verified' for t in thoughts))       # every move played was audited
+        turns = json.loads((m / 'state.json').read_text())['agents'][0]['backend']['turns']
+        self.assertEqual(len(turns), len(calls) - 1)
+
+    def test_no_auditable_turn_stops_the_match_instead_of_playing(self):
+        UnverifiedCLI.bad = set(range(1, 100))
+        m = self.d / 'm'
+        with self.assertRaisesRegex(BackendError, 'audited'):
+            asyncio.run(run_match(self.G, [('m', {'backend': 'unverified', 'max_fixes': 1}), ('s', {'bot': 'station'})],
+                                  [1, 2], m, **QUIET))
+        self.assertEqual([c['rejected'] for c in self.rows(m / 'calls.jsonl')], ['unverified', 'unverified'])
+        self.assertFalse(self.rows(m / 'hands.jsonl'))
+        UnverifiedCLI.bad = set()
+        asyncio.run(run_match(self.G, [('m', {'backend': 'unverified', 'max_fixes': 1}), ('s', {'bot': 'station'})],
+                              [1, 2], m, **QUIET))                              # resumable once it can be read
+        self.assertEqual(len(self.rows(m / 'hands.jsonl')), 2)
+
+
+class TestImplementation(Base):
+    seats = [('m', {'backend': 'fakecli'}), ('s', {'bot': 'station'})]
+
+    def changed(self, name='poker_arena/backends.py'):
+        src = dict(runner.sources())
+        src[name] = src[name] + b'\n# changed\n'
+        return mock.patch.object(runner, '_SOURCES', src)
+
+    def test_config_records_hashes_and_resume_refuses_other_code(self):
+        m = self.d / 'm'
+        asyncio.run(run_match(self.G, self.seats, [1, 2, 3], m, **QUIET))
+        impl = json.loads((m / 'config.json').read_text())['implementation']
+        for f in ('poker_arena/runner.py', 'poker_arena/agents.py', 'poker_arena/backends.py', 'poker_arena/ratings.py',
+                  'poker_arena/cards.py', 'poker_arena/games/holdem.py'):
+            self.assertIn(f, impl['files'])
+        self.assertTrue(impl['prompt_template'] and impl['fingerprint'])
+        (m / 'result.json').unlink()
+        with self.changed(), self.assertRaisesRegex(ResumeMismatch, 'backends.py.*--allow-code-change'):
+            asyncio.run(run_match(self.G, self.seats, [1, 2, 3], m, **QUIET))
+        with self.changed():
+            asyncio.run(run_match(self.G, self.seats, [1, 2, 3], m, allow_code_change=True, **QUIET))
+            cfg = json.loads((m / 'config.json').read_text())
+            change = cfg['implementation_changes'][0]
+            self.assertEqual((change['from'], change['files']), (impl['fingerprint'], ['poker_arena/backends.py']))
+            self.assertEqual(cfg['implementation'], impl)                       # the original stays
+            (m / 'result.json').unlink()
+            asyncio.run(run_match(self.G, self.seats, [1, 2, 3], m, **QUIET))  # the accepted code resumes freely
+        (m / 'result.json').unlink()
+        with self.assertRaises(ResumeMismatch):                                  # and the old code is a change again
+            asyncio.run(run_match(self.G, self.seats, [1, 2, 3], m, **QUIET))
+
+    def test_plan_refuses_other_code_before_playing_and_keeps_each_source(self):
+        players = self.d / 'players.toml'
+        players.write_text('[players.a]\nbot = "station"\n[players.b]\nbot = "station"\n')
+        plan = make_plan(['a', 'b'], deals=4, out=str(self.d / 'run'), players_file=str(players),
+                         design={'max_rounds': 2})
+        decide = lambda xs, d, n, k, groups=None: {'verdict': 'exhausted' if k >= 2 else 'open', 'looks_used': k}
+        with mock.patch('poker_arena.ratings.decide', side_effect=decide):
+            asyncio.run(run_plan(plan, **QUIET))
+            out = self.d / 'run'
+            stored = json.loads((out / 'plan.json').read_text())
+            self.assertEqual(stored['sources'], [f'source/{stored["implementation"]["fingerprint"]}.tar.gz'])
+            with tarfile.open(out / stored['sources'][0]) as tar:
+                names = tar.getnames()
+            self.assertIn('poker_arena/runner.py', names)
+            self.assertIn('implementation.json', names)
+            with self.changed('poker_arena/ratings.py'), self.assertRaisesRegex(ResumeMismatch, 'ratings.py'):
+                asyncio.run(run_plan(plan, **QUIET))
+            with self.changed('poker_arena/ratings.py'):
+                asyncio.run(run_plan(plan, allow_code_change=True, **QUIET))
+                stored = json.loads((out / 'plan.json').read_text())
+                self.assertEqual(len(stored['sources']), 2)
+                self.assertEqual(stored['implementation_changes'][0]['files'], ['poker_arena/ratings.py'])
+                first = f'source/{stored["implementation"]["fingerprint"]}.tar.gz'
+                self.assertEqual(stored['implementation_changes'][0]['source'], next(x for x in stored['sources']
+                                                                                     if x != first))
+
+    def test_a_viewer_change_is_not_an_implementation_change(self):
+        src = dict(runner.sources())
+        key = next(k for k in src if k.endswith('server.py'))
+        src[key] += b'\n# changed\n'
+        before = runner.implementation(self.G)['fingerprint']
+        with mock.patch.object(runner, '_SOURCES', src):
+            self.assertEqual(runner.implementation(self.G)['fingerprint'], before)
 
 
 if __name__ == '__main__':

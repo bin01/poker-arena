@@ -12,7 +12,7 @@ from unittest import mock
 from poker_arena import backends
 from poker_arena.backends import Backend, BackendError, Reply
 from poker_arena.games import get_game
-from poker_arena.runner import ResumeMismatch, make_plan, run_duplicate, run_match, run_plan
+from poker_arena.runner import PlanConflict, ResumeMismatch, make_plan, run_duplicate, run_match, run_plan
 
 FAKE = [sys.executable, str(Path(__file__).with_name('fake_model.py'))]
 QUIET = dict(log=lambda *a: None)
@@ -95,9 +95,12 @@ class TestResume(Base):
         with mock.patch('poker_arena.ratings.decide', create=True,
                         side_effect=lambda xs, d, n, k, groups=None: {'verdict': 'exhausted', 'looks_used': k, 'deals': len(xs)}):
             asyncio.run(run_plan(plan, **QUIET))
-            for change in ({'deals': 5}, {'seed': 7}, {'design': {**plan['design'], 'alpha': 0.1}}, {'replicates': 2}):
+            for change in ({'deals': 5, 'design': {**plan['design'], 'round_deals': 5}}, {'seed': 7},
+                           {'design': {**plan['design'], 'alpha': 0.1}}, {'replicates': 2}):
                 with self.assertRaises(ResumeMismatch, msg=change):
                     asyncio.run(run_plan({**plan, **change}, **QUIET))
+            with self.assertRaisesRegex(PlanConflict, 'round_deals'):            # deals that contradict the design
+                asyncio.run(run_plan({**plan, 'deals': 5}, **QUIET))
             players.write_text('[players.rule]\nbot = "rule"\nsims = 99\n[players.station]\nbot = "station"\n')
             with self.assertRaisesRegex(ResumeMismatch, 'specs'):
                 asyncio.run(run_plan(plan, **QUIET))
@@ -274,6 +277,18 @@ class TestCorrections(Base):
         self.assertEqual(t['requested'], {'action': 'raise', 'amount': 9999})
         self.assertEqual(t['executed'], {'action': 'raise', 'amount': 200})
         self.assertEqual(t['retries'], [])
+
+
+
+class TestTempFolder(unittest.TestCase):
+    def test_falls_back_to_a_folder_in_the_repo(self):
+        import os
+        import conftest
+        env = {'TMPDIR': '/nonexistent-read-only/tmp', 'TEMP': '', 'TMP': ''}
+        with mock.patch.dict(os.environ, env), mock.patch.object(tempfile, 'gettempdir', side_effect=FileNotFoundError):
+            self.assertEqual(Path(conftest._choose()), Path(__file__).resolve().parent / '.tmp')
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {'TMPDIR': d}):
+            self.assertEqual(conftest._choose(), d)                          # TMPDIR first when writable
 
 
 if __name__ == '__main__':

@@ -283,23 +283,6 @@ small { font-size: 11.5px; }
 .watch:hover { background: rgba(var(--gold-rgb), .1); }
 .power { grid-column: 1 / -1; font-size: 11.5px; color: var(--ink-3); margin-top: 6px; }
 
-/* ---- games: the list ------------------------------------------------------------------------------ */
-.layout { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 28px; align-items: start; }
-.mbody { min-width: 0; }
-.mlist { position: sticky; top: 84px; max-height: calc(100vh - 108px); overflow-y: auto; overflow-x: hidden; padding: 8px; }
-.mlist .group { font-size: 10.5px; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; color: rgba(var(--gold-rgb), .7); padding: 12px 10px 6px; }
-.mlist a { display: block; padding: 10px; border-radius: 10px; border: 1px solid transparent; }
-.mlist a[href]:hover { background: rgba(255, 255, 255, .04); }
-.mlist a.active { background: rgba(var(--gold-rgb), .09); border-color: rgba(var(--gold-rgb), .3); }
-.mlist .row { display: flex; align-items: center; gap: 10px; }
-.mlist .duo { display: flex; flex: none; }
-.mlist .duo .mono + .mono { margin-left: -7px; }
-.mlist .pair-names { flex: 1; min-width: 0; font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.mlist .pair-names .vs { color: var(--ink-3); font-weight: 400; margin: 0 4px; font-family: var(--display); font-style: italic; }
-.mlist .meta { font-size: 12px; color: var(--ink-3); margin: 3px 0 0 51px; display: flex; justify-content: space-between; gap: 8px; }
-.mlist .meta b { font-weight: 700; white-space: nowrap; }
-.mlist a.planned { opacity: .5; }
-
 /* ---- games: scoreboard and deal chips -------------------------------------------------------------- */
 .scoreboard { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 20px; padding: 24px 28px; margin-bottom: 22px; overflow: hidden;
   background: radial-gradient(500px 160px at 50% 0%, rgba(var(--gold-rgb), .12), transparent 70%), var(--panel); }
@@ -320,7 +303,6 @@ small { font-size: 11.5px; }
 .score-cap { font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-3); margin-top: 8px; }
 .score-verdict { margin-top: 12px; display: flex; flex-direction: column; align-items: center; gap: 5px; }
 
-.strip-wrap { margin-bottom: 6px; }
 .strip { display: grid; grid-template-columns: repeat(var(--cols, 25), minmax(0, 1fr)); gap: 6px; justify-items: center; }
 .chipbtn { --c: #3a453f; width: 100%; max-width: 34px; aspect-ratio: 1; border: 0; padding: 0; border-radius: 50%; cursor: pointer; position: relative;
   display: grid; place-items: center; font: 700 10.5px var(--sans); color: #fff;
@@ -338,17 +320,9 @@ small { font-size: 11.5px; }
 .swatch { display: inline-block; width: 11px; height: 11px; border-radius: 50%; vertical-align: -1px; margin-right: 6px; box-shadow: inset 0 0 0 2px rgba(255, 255, 255, .35); }
 .kbd { font-family: var(--mono); font-size: 10.5px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; padding: 0 5px; margin: 0 2px; color: var(--ink-2); background: rgba(255, 255, 255, .04); }
 
-.deal-bar { display: flex; align-items: center; gap: 8px 14px; margin: 28px 0 12px; flex-wrap: wrap; }
-.deal-bar h2 { font-family: var(--display); font-size: 26px; }
-.deal-bar h2 small { font: 500 14px var(--sans); color: var(--ink-3); }
-.deal-bar .nav { display: flex; gap: 6px; }
-.deal-bar .nav button, .toggle, .ctl { font: 600 12.5px var(--sans); color: var(--ink-2); background: rgba(255, 255, 255, .04);
+.toggle, .ctl { font: 600 12.5px var(--sans); color: var(--ink-2); background: rgba(255, 255, 255, .04);
   border: 1px solid var(--line); border-radius: 999px; padding: 6px 14px; cursor: pointer; transition: all .15s; }
-.deal-bar .nav button { width: 34px; padding: 6px 0; }
-.deal-bar .nav button:hover:not(:disabled), .toggle:hover, .ctl:hover { color: var(--ink); border-color: rgba(var(--gold-rgb), .5); }
-.deal-bar .nav button:disabled { opacity: .35; cursor: default; }
-.deal-bar b { color: var(--ink); }
-.deal-bar b.gold { color: var(--gold); }
+.toggle:hover, .ctl:hover { color: var(--ink); border-color: rgba(var(--gold-rgb), .5); }
 .deal-outcome { transition: opacity .2s; }
 .deal-outcome.spoiler { opacity: 0; }
 .toggle[aria-pressed="true"] { color: var(--gold); border-color: rgba(var(--gold-rgb), .5); background: rgba(var(--gold-rgb), .1); }
@@ -360,7 +334,6 @@ small { font-size: 11.5px; }
 .ctl.play:hover { color: var(--night); filter: brightness(1.08); }
 .scrub { flex: 1 1 140px; min-width: 100px; accent-color: var(--gold); }
 .step-text { font-size: 12px; color: var(--ink-3); min-width: 90px; }
-.controls .keys { font-size: 11.5px; color: var(--ink-3); flex-basis: 100%; }
 
 /* ---- the table (table.js): seats around an oval of felt -------------------------------------------- */
 .pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; align-items: start; }
@@ -532,9 +505,6 @@ small { font-size: 11.5px; }
   .hero-card { width: 100%; max-width: 340px; }
   .hero-card.back { flex-direction: column; text-align: center; padding: 26px 20px; }
   .layout { grid-template-columns: minmax(0, 1fr); gap: 16px; }
-  .mlist { position: static; max-height: none; display: flex; gap: 8px; overflow-x: auto; overflow-y: hidden; padding: 8px; scroll-snap-type: x proximity; }
-  .mlist .group { display: none; }
-  .mlist a { flex: 0 0 auto; width: 240px; scroll-snap-align: center; border-color: var(--line-soft); }
   .scoreboard { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); padding: 18px 16px; gap: 14px 12px; }
   .score-mid { grid-column: 1 / -1; grid-row: 2; max-width: none; }
   .face, .face.right { flex-direction: column; text-align: center; gap: 8px; }
@@ -544,7 +514,6 @@ small { font-size: 11.5px; }
   .score-big { font-size: 46px; }
   .strip { grid-template-columns: repeat(auto-fill, minmax(30px, 1fr)); }
   .controls { top: 60px; padding: 8px 10px; gap: 6px; }
-  .controls .keys { display: none; }
   .ctl { width: 34px; }
   .ctl.play { min-width: 84px; padding: 6px 10px; }
   .step-text { display: none; }
@@ -580,10 +549,8 @@ small { font-size: 11.5px; }
 }
 
 /* the `font` shorthand resets numerals to Playfair's old-style figures; scores read better lining */
-.hero-num, .score-big, .rank, .deal-bar h2, .idx, .page-head h1, .face-name, .hero-name, .section-head h2, .brand, .pc b { font-variant-numeric: lining-nums tabular-nums; }
+.hero-num, .score-big, .rank, .deal-title h2, .idx, .page-head h1, .face-name, .hero-name, .section-head h2, .brand, .pc b { font-variant-numeric: lining-nums tabular-nums; }
 .mono { text-transform: none; letter-spacing: 0; }
-.deal-bar h2 .round { font-family: var(--sans); font-size: 11px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase;
-  color: var(--gold); display: block; line-height: 1.4; }
 @media (max-width: 520px) {
   #status > span:not(.live-dot):not(.idle-dot) { display: none; }
   .top-inner { gap: 8px; }
@@ -652,4 +619,154 @@ details.split summary { cursor: pointer; padding: 10px 16px; font-weight: 600; c
   .matrix .mx-name .effort { display: none; }
   .matrix tbody th { padding-left: 10px; }
   .matrix td.cell { min-width: 62px; }
+}
+
+/* ---- round 4: provisional order, the matchup list by pairing → round → replicate, one replay timeline -- */
+.layout { display: grid; grid-template-columns: 290px minmax(0, 1fr); gap: 28px; align-items: start; }
+.mbody { min-width: 0; }
+.board-list.unranked { --cols: minmax(180px, 1.5fr) 92px minmax(160px, 1.6fr) 96px 120px; }
+.rank.prov { color: var(--ink-3); opacity: .6; font-size: 16px; }
+@media (max-width: 980px) { .board-list.unranked { --cols: minmax(0, 1fr) 76px minmax(110px, 1fr); } }
+@media (max-width: 420px) { .board-list.unranked { --cols: minmax(0, 1fr) 64px; } }
+.notice { margin: 4px auto 0; }
+.target-more { display: block; margin-top: 4px; }
+.target b { color: var(--ink-2); }
+.hero-card:not(.back) .target b { color: #3b2a0c; }
+.target .flag { margin-right: 4px; }
+
+.th-def { font: inherit; letter-spacing: inherit; text-transform: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: help;
+  border-bottom: 1px dotted rgba(var(--gold-rgb), .45); }
+.th-def:hover, .th-def.on { color: var(--gold); }
+.def-line { display: block; color: var(--ink-3); margin-bottom: 2px; }
+.def-line.on { color: var(--ink-2); }
+.seat-tag { font-size: 12.5px; color: var(--ink-2); padding-left: 41px; }
+
+.mlist { position: sticky; top: 84px; max-height: calc(100vh - 108px); overflow-y: auto; overflow-x: hidden; padding: 8px; }
+.mlist .mbar { display: none; }
+.mlist .group { font-size: 10.5px; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; color: rgba(var(--gold-rgb), .7); padding: 12px 10px 6px; }
+.pgroup { border-radius: 10px; border: 1px solid transparent; padding: 2px 0; }
+.pgroup + .pgroup { margin-top: 2px; }
+.pgroup.active { background: rgba(var(--gold-rgb), .07); border-color: rgba(var(--gold-rgb), .28); }
+.pgroup.planned { opacity: .5; }
+.phead { display: flex; align-items: flex-start; gap: 10px; padding: 9px 10px 2px; border-radius: 10px; }
+.phead[href]:hover .pair-names { color: var(--gold); }
+.phead .duo { display: flex; flex: none; padding-top: 1px; }
+.phead .duo .mono + .mono { margin-left: -7px; }
+.phead .pair-names { flex: 1; min-width: 0; font-weight: 600; font-size: 13px; line-height: 1.35; overflow-wrap: anywhere; }
+.phead .vs { color: var(--ink-3); font-weight: 400; font-family: var(--display); font-style: italic; }
+.phead .live-dot { margin-top: 5px; }
+.phead > b { flex: none; font-size: 12px; font-weight: 700; white-space: nowrap; padding-top: 1px; }
+.pmeta { font-size: 12px; color: var(--ink-3); padding: 2px 10px 9px 51px; }
+.pmeta .decided-badge { margin-right: 4px; }
+.vword.won { color: var(--pos); font-weight: 600; }
+.vword.open { color: var(--gold); }
+.rounds { padding: 0 10px 10px 14px; display: grid; gap: 6px; }
+.rrow { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
+.rlab { flex: 0 0 100%; font-size: 10px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-3); }
+.rep { display: inline-flex; align-items: baseline; gap: 6px; padding: 3px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 600; color: var(--ink-2);
+  border: 1px solid var(--line); background: rgba(255, 255, 255, .03); white-space: nowrap; }
+.rep b { font-size: 11px; font-weight: 700; }
+.rep:hover { border-color: rgba(var(--gold-rgb), .5); }
+.rep.on { color: var(--night); background: var(--gold); border-color: transparent; }
+.rep.on b { color: var(--night); }
+.rep.live::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: #ff4d4d; align-self: center; }
+
+.scoreboard { padding: 16px 26px; margin-bottom: 14px; }
+.score-big { font-size: 44px; }
+.score-verdict .vlong { font-size: 11.5px; max-width: 400px; }
+.score-verdict { margin-top: 8px; gap: 3px; }
+.score-verdict .vline { display: inline-flex; align-items: center; gap: 6px; }
+.score-round { margin-top: 8px; padding-top: 8px; }
+.score-mini { display: none; }
+.dealmap { margin-bottom: 14px; }
+.dealmap summary { display: none; }
+.dealmap .strip-legend { margin-top: 10px; }
+.strip-legend .keys { margin-left: auto; }
+.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 9px 14px; margin-bottom: 10px; }
+.deal-title { display: flex; align-items: center; gap: 10px; }
+.deal-title h2 { font-family: var(--display); font-size: 22px; line-height: 1.1; white-space: nowrap; }
+.deal-title h2 small { font: 500 13px var(--sans); color: var(--ink-3); }
+.deal-title .round { font-family: var(--sans); font-size: 10px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: var(--gold); display: block; line-height: 1.3; }
+.deal-title .nav { display: flex; gap: 5px; }
+.deal-title .nav button { font: 600 12.5px var(--sans); color: var(--ink-2); background: rgba(255, 255, 255, .04); border: 1px solid var(--line);
+  border-radius: 999px; width: 32px; padding: 5px 0; cursor: pointer; }
+.deal-title .nav button:hover:not(:disabled) { color: var(--ink); border-color: rgba(var(--gold-rgb), .5); }
+.deal-title .nav button:disabled { opacity: .35; cursor: default; }
+.ctls { display: flex; gap: 6px; }
+.controls .scrub { flex: 1 1 120px; }
+.controls .deal-outcome { flex-basis: 100%; font-size: 12.5px; }
+.controls .deal-outcome.spoiler { display: none; }
+.controls .deal-outcome b { color: var(--ink); }
+.controls .deal-outcome b.gold { color: var(--gold); }
+.view-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin-bottom: 14px; }
+.view-bar .spacer { flex: 1; }
+.mode-switch { display: inline-flex; gap: 4px; }
+.seq-note { display: none; }
+.play.held { opacity: .62; transition: opacity .3s; }
+@media (max-width: 1180px) {
+  .mode-switch { display: none; }
+  .seq-note { display: inline; }
+  .play.held { opacity: 1; }
+}
+@media (max-width: 860px) {
+  .layout { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .mlist { position: static; max-height: none; padding: 6px; }
+  .mlist .mbar { display: flex; align-items: center; gap: 10px; padding: 2px 2px 4px; }
+  .mtoggle { font: 600 12.5px var(--sans); color: var(--ink-2); background: rgba(255, 255, 255, .04); border: 1px solid var(--line); border-radius: 999px;
+    padding: 5px 12px; cursor: pointer; display: inline-flex; gap: 6px; align-items: center; }
+  .mtoggle i { font-style: normal; color: var(--gold); transition: transform .2s; }
+  .mlist.open .mtoggle i { transform: rotate(180deg); }
+  .mwhere { font-size: 12px; color: var(--ink-3); }
+  .mlist:not(.open) .group, .mlist:not(.open) .pgroup:not(.active) { display: none; }
+  .mlist:not(.open) .pgroup.active { background: none; border-color: transparent; }
+  .mlist:not(.open) .pgroup.active .phead, .mlist:not(.open) .pgroup.active .pmeta { display: none; }
+  .mlist:not(.open) .rounds { padding: 4px 2px 2px; }
+  .rounds { padding-left: 10px; }
+  .pmeta { padding-left: 10px; }
+  .rounds { display: flex; overflow-x: auto; gap: 10px; scrollbar-width: none; }
+  .rrow { flex-wrap: nowrap; flex: none; }
+  .rlab { flex: none; }
+  .scoreboard { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); padding: 12px 12px; gap: 8px 10px; margin-bottom: 10px; }
+  .score-mid { grid-column: 1 / -1; grid-row: 2; }
+  .face { flex-direction: row; text-align: left; gap: 8px; }
+  .face.right { flex-direction: row-reverse; text-align: right; }
+  .face .mono.xl { width: 34px; height: 34px; font-size: 12px; }
+  .face-name, .face.right .face-name { font-size: 14.5px; flex-direction: row; flex-wrap: wrap; align-items: center; }
+  .face.right .face-name { flex-direction: row-reverse; }
+  .face-name .tag, .face-name .effort { font-size: 9px; }
+  .score-scope { font-size: 9px; letter-spacing: .1em; }
+  .score-who { font-size: 10px; letter-spacing: .1em; }
+  .score-big { font-size: 32px; }
+  .score-big small { font-size: 13px; }
+  .score-rate { font-size: 12px; }
+  .score-verdict .vlong { display: none; }
+  .score-round, .score-cap { grid-column: 1 / -1; }
+  .score-round { font-size: 11.5px; margin-top: 6px; padding-top: 6px; }
+  .mbody.playing .scoreboard > :not(.score-mini) { display: none; }
+  .mbody.playing .scoreboard { display: block; padding: 8px 12px; }
+  .mbody.playing .score-mini { display: block; font-size: 12.5px; color: var(--ink-2); text-align: center; }
+  .score-mini b { color: var(--ink); }
+  .dealmap { margin-bottom: 10px; border: 1px solid var(--line); border-radius: 12px; background: rgba(0, 0, 0, .18); }
+  .dealmap summary { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 9px 14px; cursor: pointer; font-weight: 600; color: var(--ink-2); list-style: none; }
+  .dealmap summary::-webkit-details-marker { display: none; }
+  .dealmap summary > span:first-child::before { content: "▸ "; color: var(--gold); }
+  .dealmap[open] summary > span:first-child::before { content: "▾ "; }
+  .dealmap .strip { padding: 4px 10px 0; }
+  .dealmap .strip-legend { padding: 0 12px 10px; }
+  .strip-legend .keys { display: none; }
+  .controls { top: 60px; padding: 8px 10px; gap: 6px 8px; }
+  .deal-title { flex: 1; justify-content: space-between; }
+  .deal-title h2 { font-size: 19px; }
+  .ctls { flex: 1 1 100%; justify-content: space-between; }
+  .ctls .ctl { flex: 1; width: auto; }
+  .ctls .ctl.play { flex: 2.4; }
+  .controls .scrub { flex: 1 1 60%; order: 0; }
+  .step-text { display: inline; min-width: 0; font-size: 11.5px; }
+  .controls .deal-outcome { font-size: 12px; }
+  .view-bar { gap: 6px; margin-bottom: 10px; }
+  .view-bar .toggle { padding: 5px 10px; font-size: 12px; }
+  .seq-note { display: none; }
+  .play-head { display: none; }
+  .deal-title .round { display: none; }
+  .table-slot { padding-top: 14px; }
 }

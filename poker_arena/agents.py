@@ -7,7 +7,10 @@ can't be parsed or played (the game's `apply` returns an error, which includes s
 actions it won't convert) is sent back with the error; after `max_fixes` tries the seat takes the game's
 fallback (check or fold). Every attempt is kept in `Decision.calls`, every refusal in `Decision.errors`.
 A reply from a turn that ran (or tried) a tool is never used: the turn is taken back, the CLI conversation is
-rebuilt without it, and the seat is asked again (an error of kind `tool_use`).
+rebuilt without it, and the seat is asked again (an error of kind `tool_use`). So is a reply whose turn could
+not be audited (`audit: 'unverified'`, e.g. an agy transcript that can't be read), as an error of kind
+`unverified`; if no turn of a decision can be audited the match stops (a BackendError), so it can be resumed
+once the record is readable again, rather than playing a move nobody can check. Every call records `audit`.
 
 Bots read the request's structured data and never talk. They cost nothing and anchor the ratings; their
 random state is saved with the match, so a resumed match plays exactly as an uninterrupted one.
@@ -138,11 +141,20 @@ class ModelAgent(Agent):
                 reply = await self.backend.send(message)
             except BackendError as e:  # the CLI gave up: keep what was tried, for the log
                 calls.append({'prompt': message, 'output': None, 'attempt': attempt, 'error': str(e)[:2000],
-                              'backend_failed': True, **getattr(e, 'meta', {})})
+                              'backend_failed': True, 'audit': 'no_reply', **getattr(e, 'meta', {})})
                 e.calls = calls
                 raise
             calls.append({'prompt': message, 'output': reply.text, 'thinking': reply.thinking, 'usage': reply.usage,
                           'latency': reply.latency, 'attempt': attempt, **reply.meta})
+            if reply.meta.get('audit') == 'unverified':
+                error = 'The turn could not be audited (its record of tool use was unreadable); asked again.'
+                calls[-1].update(error=error, rejected='unverified')
+                obj = parse_json(reply.text)
+                errors.append({'requested': None if obj is None else
+                               {'action': json_safe(obj.get('action')), 'amount': json_safe(obj.get('amount'))},
+                               'error': error, 'kind': 'unverified'})
+                self.backend.forget_last()
+                continue
             if reply.meta.get('tool_use'):
                 used = ', '.join(sorted({str(t.get('name') or t.get('type')) for t in reply.meta['tool_use']}))
                 error = f'Your reply used a tool ({used}). Tools are not allowed in this match.'
@@ -170,6 +182,10 @@ class ModelAgent(Agent):
                            'error': error, 'kind': 'invalid'})
             message = base = (f'That reply could not be played: {error}\nReply again with only the JSON object.\n\n'
                               f'{request.prompt}')
+        if calls and all(c.get('rejected') == 'unverified' for c in calls):
+            e = BackendError(f'{self.player_id}: none of {len(calls)} turns could be audited; stopping the match')
+            e.calls = calls
+            raise e
         return Decision({}, '', '', calls[-1]['output'] if calls else '', calls, fallback=True, errors=errors)
 
 

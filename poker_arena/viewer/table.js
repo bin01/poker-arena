@@ -102,6 +102,41 @@
     return { steps: out, log, n, button: d.button };
   }
 
+  // One timeline over the two plays of a deal: frames of {at: [step per play], focus, seg}.
+  // 'sequence': the first play from start to end, then the next (focus is the play that moves).
+  // 'aligned': street by street, so both plays reach the flop, turn, river and result together; a play
+  // with fewer actions on a street holds while the other catches up.
+  const SEGMENTS = ['preflop', 'flop', 'turn', 'river', 'end'];
+  const segOf = st => st.done || st.label === 'Showdown' ? 'end' : st.street;
+  function timeline(lists, mode = 'aligned') {
+    const plays = lists.map(l => l || []);
+    const frames = [];
+    if (mode === 'sequence') {
+      plays.forEach((l, j) => l.forEach((st, k) => frames.push({
+        focus: j, seg: segOf(st), at: plays.map((m, i) => i === j ? k : i < j ? Math.max(0, m.length - 1) : 0) })));
+    } else {
+      const segs = plays.map(l => {
+        const by = {};
+        l.forEach((st, k) => (by[segOf(st)] = by[segOf(st)] || []).push(k));
+        return by;
+      });
+      const cur = plays.map(() => 0);
+      for (const key of SEGMENTS) {
+        const len = Math.max(0, ...segs.map(s => (s[key] || []).length));
+        for (let o = 0; o < len; o++) {
+          segs.forEach((s, j) => { const ks = s[key]; if (ks && ks.length) cur[j] = ks[Math.min(o, ks.length - 1)]; });
+          frames.push({ focus: null, seg: key, at: [...cur] });
+        }
+      }
+    }
+    return frames.length ? frames : [{ focus: 0, seg: 'preflop', at: plays.map(() => 0) }];
+  }
+  // The first frame that shows step `k` of play `j` (as the moving play, in a sequence).
+  function frameOf(frames, j, k) {
+    const i = frames.findIndex(f => f.at[j] === k && (f.focus == null || f.focus === j));
+    return i < 0 ? frames.findIndex(f => f.at[j] >= k) : i;
+  }
+
   const wager = (i, where) => `<div class="wager ${where[i]}" data-bet="${i}"><span class="chip-dot"></span><b></b></div>`;
 
   // The table's markup for `seats` = [{name (html), effort, badge (html), role}]. Seat 0 sits nearest the
@@ -179,5 +214,5 @@
     if (turn) turn.textContent = snap.toAct != null && names[snap.toAct] ? `${names[snap.toAct]} to act` : '';
   }
 
-  return { steps, html, show, card, cards, SUIT };
+  return { steps, timeline, frameOf, html, show, card, cards, SUIT };
 });

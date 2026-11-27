@@ -10,7 +10,8 @@ Style (standard poker tracking definitions, per hand dealt):
            counted separately as a showdown tie (sd_ties)
     talk   share of its decisions that came with table talk
 
-These are tendencies, not measures of quality: no value of them is good or bad in itself. Every rate comes
+`LABELS` names each rate for readers ("Plays preflop" for vpip, "Raises preflop" for pfr ...) with its
+definition, and `POSITIONS` names the seats of `by_position`. These are tendencies, not measures of quality: no value of them is good or bad in itself. Every rate comes
 with its counts (`counts`: {rate: {n, of}}) and is broken down by opponent (`by_opponent`) and by position
 (`by_position`: button, which posts the small blind heads-up, or big blind), since pooling over opponents and
 seats can hide what a player does against whom.
@@ -100,6 +101,23 @@ def add(into: dict, counts: dict):
     for k, v in counts.items():
         into[k] = max(into.get(k, 0), v) if k == 'slowest' else into.get(k, 0) + v
 
+
+LABELS = {   # what each rate is called where people read it, and what it counts
+    'vpip': {'label': 'Plays preflop', 'short': 'VPIP',
+             'definition': 'share of hands in which it put money in preflop by choice: called or raised (posting a '
+                           'blind, or checking the big blind, does not count)'},
+    'pfr': {'label': 'Raises preflop', 'short': 'PFR', 'definition': 'share of hands in which it raised preflop'},
+    'af': {'label': 'Aggression after the flop', 'short': 'AF',
+           'definition': 'bets and raises after the flop, per call after the flop'},
+    'wtsd': {'label': 'Goes to showdown', 'short': 'WTSD',
+             'definition': 'share of the hands where it saw the flop that it took to a showdown'},
+    'wsd': {'label': 'Wins at showdown', 'short': 'W$SD',
+            'definition': 'share of its showdowns whose pot it won outright (a split pot is not a win)'},
+    'sd_ties': {'label': 'Splits at showdown', 'short': 'split',
+                'definition': 'share of its showdowns that ended in a split pot'},
+    'talk': {'label': 'Talks', 'short': 'talk', 'definition': 'share of its decisions that came with table talk'},
+}
+POSITIONS = {'button': 'Button (small blind)', 'big_blind': 'Big blind'}
 
 RATES = {'vpip': ('vpip', 'hands'), 'pfr': ('pfr', 'hands'), 'af': ('aggr', 'calls_post'),
          'wtsd': ('showdowns', 'saw_flop'), 'wsd': ('won_sd', 'showdowns'), 'sd_ties': ('sd_ties', 'showdowns'),

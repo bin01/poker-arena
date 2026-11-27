@@ -43,16 +43,26 @@
   const playerId = x => x == null ? null : typeof x === 'object' ? x.player : x;
 
   // `pooled`: an all-runs view, which is descriptive only: no pairing verdict there is a decision.
+  // A run without a recorded design (or with one the ratings invented for an older run) is unregistered.
+  const isUnregistered = d => !!d && (d.registered === false || (d.registered == null && !!d.legacy));
+
   function normalize(r, { pooled = false } = {}) {
     r = r || {};
     const out = isContract(r) ? fromContract(r) : fromLegacy(r);
-    if (pooled) {
-      out.pairings = out.pairings.map(p => ({ ...p, verdict_recorded: p.verdict, verdict: 'descriptive' }));
+    const minConv = r.min_conversations ?? (r.design && r.design.min_conversations);
+    if (minConv != null) out.pairings = out.pairings.map(p => ({ min_conversations: minConv, ...p }));
+    const unregistered = !pooled && isUnregistered(r.design);
+    const descriptive = pooled || unregistered;
+    if (descriptive) {
+      const why = pooled ? 'pooled' : 'unregistered';
+      out.pairings = out.pairings.map(p => ({ ...p, verdict_recorded: p.verdict, verdict: 'descriptive', descriptive_reason: why }));
       out.leaders = [];
-      out.players = out.players.map(p => ({ ...p, rank_kind: 'descriptive' }));
+      out.players = out.players.map(p => ({ ...p, rank_kind: 'descriptive', rank: null }));
     }
     out.pooled = pooled;
-    out.groups = groupsOf(out, r.groups, pooled);
+    out.unregistered = unregistered;
+    out.groups = groupsOf(out, r.groups, descriptive);
+    if (descriptive) out.groups.forEach(g => { g.leader = null; });
     return out;
   }
 
@@ -150,13 +160,36 @@
         return { tone: 'even', decided: true, short: 'Even', long: `Decided${looks}: within ±${band} bb/100 of each other.` };
       case 'exhausted':
         return { tone: 'open', decided: false, short: 'No winner', long: `Every planned check is used and the difference is unresolved.${level ? '' : ` ${name(ahead)} is ahead on points only.`}` };
-      case 'early':
-        return { tone: 'early', decided: false, short: 'Too early', long: `Too few deals to judge${p.deals ? ` (${p.deals} so far)` : ''}.` };
-      case 'descriptive':
-        return { tone: 'open', decided: false, short: level ? 'Level on points' : 'Ahead on points', long: `Pooled across runs, so descriptive only: no test decides it here.${level ? '' : ` ${name(ahead)} is ahead of ${name(behind)} on points.`}` };
+      case 'early': {
+        const conv = conversationsShort(p);
+        return { tone: 'early', decided: false, short: 'Too early', long: conv
+          ? `No verdict before ${p.min_conversations} independent conversations (match pairs); it has ${p.conversations}.`
+          : `Too few deals to judge${p.deals ? ` (${p.deals} so far)` : ''}.` };
+      }
+      case 'descriptive': case 'unregistered': {
+        const why = p.descriptive_reason === 'unregistered' || p.verdict === 'unregistered'
+          ? 'This run has no recorded test plan, so descriptive only: no test decides it.'
+          : 'Pooled across runs, so descriptive only: no test decides it here.';
+        return { tone: 'open', decided: false, short: level ? 'Level on points' : 'Ahead on points', long: `${why}${level ? '' : ` ${name(ahead)} is ahead of ${name(behind)} on points.`}` };
+      }
       default:
         return { tone: 'open', decided: false, short: 'Undecided', long: `Not decided yet${looks}.${level ? '' : ` ${name(ahead)} is ahead on points.`}` };
     }
+  }
+
+  // True when a pairing has fewer independent conversations than a verdict needs.
+  const conversationsShort = p => !!p && p.min_conversations != null && p.conversations != null && p.conversations < p.min_conversations;
+
+  // A design's power scenarios as [{name, power, deals}] in a fixed order, from a map or a list.
+  const SCENARIOS = ['optimistic', 'moderate', 'pessimistic'];
+  function scenarios(design) {
+    const raw = design && design.power_scenarios;
+    if (!raw) return [];
+    const list = Array.isArray(raw) ? raw.map(x => [x.name || x.scenario, x]) : Object.entries(raw);
+    return list.filter(([n, x]) => n && x != null).map(([n, x]) => {
+      const o = typeof x === 'number' ? { power: x } : x;
+      return { name: n, power: o.power_at_max ?? o.power ?? null, deals: o.deals_needed ?? o.deals ?? null };
+    }).sort((a, b) => (SCENARIOS.indexOf(a.name) + 99) % 99 - (SCENARIOS.indexOf(b.name) + 99) % 99);
   }
 
   // "To tell a 50 bb/100 edge apart takes about N deals" from decide()'s power table.
@@ -207,18 +240,22 @@
 
   // The preregistered target edge and how far some pairings are from it:
   // {target, need, planned (from the design, or from the spread seen so far), have: [min, max]} or null.
+  // An unregistered run's numbers are retrospective: `planned` is false and `retrospective` true.
   function targetEdge(design, pairings) {
     const have = pairings.map(p => p.deals || 0);
     const range = have.length ? [Math.min(...have), Math.max(...have)] : [0, 0];
     if (design && design.target_edge_bb100 && (design.deals_needed || design.deals_planned)) {
+      if (isUnregistered(design)) {
+        return { target: design.target_edge_bb100, need: design.deals_needed || design.deals_planned, planned: false, retrospective: true, have: range };
+      }
       return { target: design.target_edge_bb100, need: design.deals_needed || design.deals_planned, allowed: design.max_deals || null,
                power: design.power_at_max ?? null, planned: true, have: range };
     }
     const need = pairings.map(p => p.power?.deals_for_80pct?.['50']).filter(x => x != null);
     if (!need.length) return null;
-    return { target: 50, need: Math.max(...need), planned: false, have: range };
+    return { target: 50, need: Math.max(...need), planned: false, ...(isUnregistered(design) ? { retrospective: true } : {}), have: range };
   }
 
   return { esc, MINUS, signed, plural, trim, approx, nameParts, family, isContract, normalize, verdict, verdictSides, powerLine, correction, actText,
-    isDecided, decidedLeader, playerId, rateOf, targetEdge };
+    isDecided, decidedLeader, playerId, rateOf, targetEdge, isUnregistered, scenarios, conversationsShort };
 });

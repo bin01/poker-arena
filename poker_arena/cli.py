@@ -15,31 +15,50 @@ def cmd_play(args):
     players = load_players(args.players, effort=args.effort)
     game = get_game(args.game)({'hands_per_match': args.deals})
     seeds = [args.seed + k for k in range(args.deals)]
-    res = asyncio.run(run_duplicate(game, (args.a, players[args.a]), (args.b, players[args.b]), seeds, Path(args.out)))
+    res = asyncio.run(run_duplicate(game, (args.a, players[args.a]), (args.b, players[args.b]), seeds, Path(args.out),
+                                    allow_code_change=args.allow_code_change))
     for label, r in zip(('a-first', 'b-first'), res):
         print(label, dict(zip(r['players'], r['net'])))
     from .ratings import ratings, summary
     print(summary(ratings(args.out, boot=100)))
 
 
+def _power_table(d) -> str:
+    from .ratings import _pct
+    rows = [f'  {x["scenario"]:12} ICC {x["assumed_icc"]:<5} AR(1) {x["assumed_ar1"]:<4} spread of a conversation '
+            f'{x["sd_conversation_bb100"]:>5.1f} bb/100   power {_pct(x["power"])}' for x in d.get('power_scenarios') or []]
+    return '\n'.join(['Power at the target edge, by how dependent the deals turn out to be:'] + rows)
+
+
 def cmd_plan(args):
     from .ratings import design_line, normalize_design
     design = {k: v for k, v in (('alpha', args.alpha), ('max_rounds', args.max_rounds), ('block', args.block),
-                                ('target_edge_bb100', args.target_edge)) if v is not None}
+                                ('target_edge_bb100', args.target_edge), ('prior_sd_bb100', args.prior_sd),
+                                ('assumed_icc', args.assumed_icc), ('assumed_ar1', args.assumed_ar1),
+                                ('budget_deals', args.budget_deals)) if v is not None}
     plan = make_plan(args.players_list, deals=args.deals, seed=args.seed, out=args.out, players_file=args.players,
                      concurrency=args.concurrency, design=design, replicates=args.replicates)
+    if args.max_rounds is None:
+        plan['design'].pop('max_rounds', None)          # from the power target, not a fixed default
+    d = normalize_design(plan)
+    plan['design'].update(max_rounds=d['max_rounds'], max_rounds_basis=d['max_rounds_basis'])   # preregistered
     text = json.dumps(plan, indent=2)
     if args.write:
         Path(args.write).write_text(text + '\n')
-        d, n = normalize_design(plan), len(plan['matchups'])
+        n = len(plan['matchups'])
         per_round = 2 * n * args.deals * d['replicates']
-        print(f'wrote {args.write}: {n} pairings, {per_round} hands per round, at most {d["max_rounds"]} rounds '
-              f'({per_round * d["max_rounds"]} hands); a pairing stops once decided (at most {d["alpha"]:.0%} chance '
-              f'of any false verdict over all pairings)')
+        print(f'wrote {args.write}: {n} pairings, {per_round:,} hands per round, at most {d["max_rounds"]} rounds '
+              f'({per_round * d["max_rounds"]:,} hands); a pairing stops once decided (at most {d["alpha"]:.0%} chance '
+              f'of any false verdict over all pairings; see docs/methodology.md for the assumptions)')
         print(design_line(d))
-        if d['power_at_max'] < 0.8:
-            print(f'To reach 80% power at the target, allow about {d["deals_needed"]:,} deals per pairing, e.g. '
-                  f'--max-rounds {-(-d["deals_needed"] // (args.deals * d["replicates"]))} with --replicates {d["replicates"]}.')
+        print(_power_table(d))
+        if d['underpowered']:
+            if d.get('deals_needed'):
+                print(f'To reach 80% power with the assumed dependence, allow about {d["deals_needed"]:,} deals per '
+                      f'pairing: drop --max-rounds/--budget-deals, or --max-rounds '
+                      f'{-(-d["deals_needed"] // (args.deals * d["replicates"]))} with --replicates {d["replicates"]}.')
+            else:
+                print('80% power at this target is out of reach of any plan of this shape; raise --target-edge.')
         try:
             specs = load_players(args.players)
         except (OSError, ValueError):
@@ -56,7 +75,10 @@ def cmd_tournament(args):
     if args.effort:
         plan['effort'] = args.effort
     if args.until_decided:
-        plan['until_decided'] = args.until_decided
+        design = dict(plan.get('design') or {'round_deals': plan['deals']})
+        reps = int(plan.get('replicates') or design.get('replicates') or 1)
+        design.update(max_rounds=max(1, args.until_decided // (plan['deals'] * reps)), max_rounds_basis='given')
+        plan['design'] = design
     if args.dry_run:
         d = normalize_design(plan)
         reps = d['replicates'] if d else plan.get('replicates', 1)
@@ -67,8 +89,11 @@ def cmd_tournament(args):
         if d:
             from .ratings import design_line
             print(design_line(d))
+            print(_power_table(d))
+        else:
+            print('No design in this plan: one round, no stopping rule, and no result of it is a test.')
         return
-    asyncio.run(run_plan(plan, only=args.only, concurrency=args.concurrency))
+    asyncio.run(run_plan(plan, only=args.only, concurrency=args.concurrency, allow_code_change=args.allow_code_change))
     from .ratings import ratings, summary
     print(summary(ratings(plan['out'])))
 
@@ -82,9 +107,11 @@ def cmd_ratings(args):
         print('No finished duplicate deals yet.')
         return
     print(summary(r))
-    print(f'\n{r["deals"]} duplicate deals ({r["hands"]} hands), {r["observations"]} distinct. Verdicts: the '
-          f'preregistered sequential test on {r["objective"]}; strengths: descriptive; session Elo: share of '
-          f'{r["session_deals"]}-deal sessions won (secondary, descriptive).')
+    test = ('the preregistered sequential test on ' + r['objective']) if (r.get('design') or {}).get('registered') \
+        else 'none (no preregistered design: everything is descriptive)'
+    print(f'\n{r["deals"]} duplicate deals ({r["hands"]} hands), {r["observations"]} distinct. Verdicts: {test}; '
+          f'strengths: descriptive; session Elo: share of {r["session_deals"]}-deal sessions won (secondary, '
+          f'descriptive).')
 
 
 def cmd_view(args):
@@ -199,6 +226,8 @@ def main(argv=None):
     p.add_argument('--players', default='players.toml')
     p.add_argument('--out', default='runs/play')
     p.add_argument('--effort', help='reasoning level for every model (default: each player\'s own, else high)')
+    p.add_argument('--allow-code-change', action='store_true',
+                   help='resume a run started by other code (the change is recorded in the run)')
     p.set_defaults(fn=cmd_play)
 
     p = sub.add_parser('plan', help='write a round-robin tournament plan')
@@ -209,12 +238,20 @@ def main(argv=None):
     p.add_argument('--players', default='players.toml')
     p.add_argument('--concurrency', type=int, default=2)
     p.add_argument('--write', help='file to write the plan to (default: print it)')
-    p.add_argument('--max-rounds', type=int, help='rounds of --deals a pairing may play before it stops undecided (default 6)')
+    p.add_argument('--max-rounds', type=int, help='rounds of --deals a pairing may play before it stops undecided '
+                                                  '(default: the fewest that give 80%% power at the target edge under '
+                                                  'the assumed dependence)')
+    p.add_argument('--budget-deals', type=int, help='cap on deals per pairing; a plan it cuts short is marked underpowered')
+    p.add_argument('--prior-sd', type=float, help='per-deal spread in bb/100 assumed when planning (default 350)')
+    p.add_argument('--assumed-icc', type=float, help='share of the per-deal variance that is a conversation effect, '
+                                                     'for planning (default 0.01)')
+    p.add_argument('--assumed-ar1', type=float, help='memory between consecutive deals of a conversation, AR(1), for '
+                                                     'planning (default 0.2)')
     p.add_argument('--alpha', type=float, help='chance of naming any false winner across the whole tournament (default 0.05)')
     p.add_argument('--block', type=int, help='deals per block in the within-conversation intervals (default 10)')
-    p.add_argument('--replicates', type=int, default=2,
+    p.add_argument('--replicates', type=int, default=4,
                    help='independent duplicate pairs (conversations) per pairing per round, each with fresh memories '
-                        '(default 2: a verdict needs at least 2 conversations)')
+                        '(default 4; a verdict needs at least 8 conversations, more when few are added per look)')
     p.add_argument('--target-edge', type=float, help='the edge in bb/100 the plan is powered to detect (default 50)')
     p.set_defaults(fn=cmd_plan)
 
@@ -225,8 +262,10 @@ def main(argv=None):
     p.add_argument('--dry-run', action='store_true')
     p.add_argument('--effort', help='reasoning level for every model, e.g. high (overrides players.toml and the plan)')
     p.add_argument('--until-decided', type=int, metavar='MAX_DEALS',
-                   help='play the plan\'s deals as rounds, stopping each pairing once its edge is settled, '
-                        'or at MAX_DEALS deals')
+                   help='set the plan\'s max_rounds so that a pairing plays at most MAX_DEALS deals (it stops '
+                        'earlier once decided)')
+    p.add_argument('--allow-code-change', action='store_true',
+                   help='resume a run started by other code (the change is recorded in the run)')
     p.set_defaults(fn=cmd_tournament)
 
     p = sub.add_parser('ratings', help='verdicts per pairing (the sequential test), descriptive strengths (bb/100) and '

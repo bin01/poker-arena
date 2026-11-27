@@ -6,9 +6,12 @@ sync) and never removes anything, so a run whose folder is deleted keeps its pla
 
 The all-time leaderboard rates a player by what it is, not by its id in one run's players.toml: its model,
 reasoning level and protocol (`claude:claude-sonnet-5-5:high#1a2b3c4d`, the protocol being the fingerprint of
-every setting that changes play, as the runner records it), or its bot and settings (`bot:rule:sims=200`).
-Only identical protocols pool: the same model with other instructions, isolation, tool policy or retry
-policy is another player, and so is a player from before protocols were recorded. A player whose model was
+every setting that changes play, as the runner records it, the match horizon and memory resets included), or
+its bot and settings (`bot:rule:sims=200`). Only identical protocols pool: the same model with other
+instructions, isolation, tool policy, retry policy or conversation length is another player, and so is a
+player from before protocols were recorded. A model whose recorded protocol predates the horizon carries it
+in its identity instead (`...#1a2b3c4d~h50`: 50 hands per conversation, memory reset at every match), so
+conversations of different lengths never pool. A player whose model was
 not recorded, or only as a bare alias (`sonnet`), and a player for whom a different model answered than the
 one configured (in that run), is quarantined: listed, but left out of the all-time fit. Only deals played
 under the same game settings pool (blinds and stacks change what bb/100 means); runs under other settings
@@ -29,6 +32,7 @@ Tables:
 from __future__ import annotations
 import hashlib
 import json
+import re
 import sqlite3
 import time
 from collections import defaultdict
@@ -36,7 +40,7 @@ from pathlib import Path
 
 from .stats import add, summarize, tally
 
-SCHEMA = 3
+SCHEMA = 4
 DB_NAME = 'arena.db'
 ALL = '*'   # the run name the viewer uses for the all-time leaderboard
 
@@ -57,17 +61,28 @@ CREATE TABLE IF NOT EXISTS tallies (
 """
 
 
-def identity(pid: str, spec: dict, protocol: str | None = None) -> str:
+def identity(pid: str, spec: dict, protocol: str | None = None, horizon: int | None = None) -> str:
     """What a player is, whatever its id: backend, model, reasoning level and the first 8 characters of its
-    protocol fingerprint when one was recorded, or bot and settings."""
+    protocol fingerprint when one was recorded, plus `~h<hands>` (`horizon`: hands per conversation) when that
+    protocol does not include the match horizon; or bot and settings."""
     if 'bot' in spec:
         extra = ''.join(f':{k}={spec[k]}' for k in sorted(spec) if k not in ('bot', 'label'))
         return f'bot:{spec["bot"]}{extra}'
     backend = spec.get('backend', 'unknown')
-    tag = f'#{protocol[:8]}' if protocol else ''
+    tag = (f'#{protocol[:8]}' if protocol else '') + (f'~h{horizon}' if horizon else '')
     if spec.get('model'):
         return f'{backend}:{spec["model"]}:{spec.get("effort") or "default"}{tag}'
     return f'{backend}:{pid}{tag}'   # a CLI or command without a model setting: only its id says what it is
+
+
+def legacy_horizon(cfg: dict, pid: str) -> int | None:
+    """The hands per conversation of a match whose recorded protocol for `pid` leaves the horizon out (older
+    runs), so the identity can carry it; None when the protocol has it."""
+    p = cfg.get('protocol')
+    p = p.get(pid) if isinstance(p, dict) and 'fingerprint' not in p else p
+    if isinstance(p, dict) and isinstance(p.get('settings'), dict) and 'horizon' in p['settings']:
+        return None
+    return len(cfg.get('seeds') or []) or None
 
 
 def game_key(game: dict) -> str:
@@ -85,7 +100,7 @@ def connect(db) -> sqlite3.Connection:
             con.execute('ALTER TABLE deals ADD COLUMN fp TEXT')
             con.execute("UPDATE matches SET stamp = ''")
     row = con.execute("SELECT v FROM meta WHERE k = 'schema'").fetchone()
-    if row and int(row[0]) < 3:   # schema 2: identities gain the protocol, so read every folder again
+    if row and int(row[0]) < 4:   # schemas 2-3: identities gain the protocol and horizon: read every folder again
         with con:
             con.execute("UPDATE matches SET stamp = ''")
     with con:
@@ -155,7 +170,7 @@ def sync(root, db=None) -> dict:
                 con.execute('DELETE FROM tallies WHERE match_id = ?', (mid,))
                 con.execute('DELETE FROM deals WHERE run = ? AND matchup = ?', (run, mdir.name))
             pids, specs = cfg.get('players', []), cfg.get('specs', {})
-            ids = [identity(p, specs.get(p, {}), protocol_of(cfg, p)) for p in pids]
+            ids = [identity(p, specs.get(p, {}), protocol_of(cfg, p), legacy_horizon(cfg, p)) for p in pids]
             hands = _lines(_read(d / 'hands.jsonl'))
             gk = game_key(cfg.get('game', {}))
             con.execute('INSERT OR REPLACE INTO matches VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', (
@@ -192,7 +207,7 @@ def _sync_deals(con, mdir: Path, run: str, gk) -> int:
     players = cfg.get('players') or ['?', '?']
     a, b = players[:2]
     specs = cfg.get('specs', {})
-    ids = [identity(p, specs.get(p, {}), protocol_of(cfg, p)) for p in (a, b)]
+    ids = [identity(p, specs.get(p, {}), protocol_of(cfg, p), legacy_horizon(cfg, p)) for p in (a, b)]
     game = cfg.get('game', {})
     bb = game.get('big_unit') or game.get('bb') or 1
     seeds = cfg.get('seeds', [])
@@ -218,7 +233,7 @@ def current_labels(players_file='players.toml') -> dict:
 
 
 def _base(ident: str) -> str:
-    return ident.split('!served=', 1)[0].split('#', 1)[0]
+    return re.split(r'[#~!]', ident, maxsplit=1)[0]
 
 
 def all_time(db, boot=200, players_file='players.toml', seed=0) -> dict:
@@ -324,8 +339,9 @@ def all_time(db, boot=200, players_file='players.toml', seed=0) -> dict:
     unversioned = sorted(run for run in included if None in runs[run]['code_versions'])
     if unversioned:
         r['notes'].insert(0, f'From before code versions were recorded: {", ".join(unversioned)}.')
+    from .stats import LABELS, POSITIONS
     r.update({
-        'all_time': True, 'labels': labels, 'kinds': kinds,
+        'all_time': True, 'labels': labels, 'kinds': kinds, 'stat_labels': LABELS, 'position_labels': POSITIONS,
         'ids': {i: sorted(p) for i, p in pids.items()},
         'game': json.loads(main) if main else None,
         'runs': sorted(({'run': run, 'deals': x['deals'], 'self_play': x['self_play'], 'started': x['started'],
@@ -361,7 +377,9 @@ def _disambiguate(labels: dict):
     def protocol(ident):
         if '!served=' in ident:
             return 'answered by ' + ident.split('!served=', 1)[1]
-        return f'protocol {ident.split("#", 1)[1][:8]}' if '#' in ident else 'protocol not recorded'
+        h = re.search(r'~h(\d+)', ident)
+        h = f', {h.group(1)} hands per conversation' if h else ''
+        return (f'protocol {ident.split("#", 1)[1][:8]}' if '#' in ident else 'protocol not recorded') + h
     by = defaultdict(list)
     for ident, lab in labels.items():
         by[lab].append(ident)
