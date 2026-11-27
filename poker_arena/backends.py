@@ -110,13 +110,18 @@ class Backend:
         raise NotImplementedError
 
     # ---- running a CLI -----------------------------------------------------------------------
+    def folder(self) -> str:
+        """This seat's work folder: empty apart from files the backend puts there (no project files or
+        instructions), and kept for the match, since CLIs key their sessions by folder."""
+        if not self.workdir:
+            self.workdir = tempfile.mkdtemp(prefix='poker-arena-')
+        return self.workdir
+
     async def run(self, cmd: list[str], stdin: str | None = None, cwd: str | None = None) -> str:
         exe = shutil.which(cmd[0])
         if not exe:
             raise BackendError(f'{cmd[0]!r} is not installed or not on PATH')
-        if not cwd and not self.workdir:
-            self.workdir = tempfile.mkdtemp(prefix='poker-arena-')  # empty: no project files or instructions
-        workdir = cwd or self.workdir
+        workdir = cwd or self.folder()
         proc = await asyncio.create_subprocess_exec(
             exe, *cmd[1:], cwd=workdir, stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -136,18 +141,21 @@ class ClaudeCLI(Backend):
     """Claude Code in print mode. The first turn sets the system prompt and opens a session; later turns
     resume it, so the model keeps its own earlier replies (and the CLI handles caching and compaction).
     Tools and MCP servers are switched off, and only project settings load (the folder is empty), so your
-    own hooks and settings don't run inside the eval. Set `isolate = false` on the player to keep them."""
+    own hooks and settings don't run inside the eval. Set `isolate = false` on the player to keep them.
+    Thinking is shown as summaries (`--thinking-display summarized`) so the viewer can show it."""
     stateful = True
 
-    def __init__(self, system, *, isolate: bool = True, **kw):
+    def __init__(self, system, *, isolate: bool = True, thinking_display: str | None = 'summarized', **kw):
         super().__init__(system, **kw)
-        self.isolate = isolate
+        self.isolate, self.thinking_display = isolate, thinking_display
 
     async def _call(self, text):
         cmd = ['claude', '-p', '--output-format', 'stream-json', '--verbose', '--tools', '',
                '--strict-mcp-config', '--system-prompt', self.system]
         if self.isolate:
             cmd += ['--setting-sources', 'project']
+        if self.thinking_display:  # otherwise thinking blocks arrive with empty text
+            cmd += ['--thinking-display', self.thinking_display]
         if self.model:
             cmd += ['--model', self.model]
         if self.session:
@@ -177,15 +185,24 @@ class ClaudeCLI(Backend):
 
 class CodexCLI(Backend):
     """Codex CLI (`codex exec`), read-only sandbox in an empty folder. The system prompt goes in the
-    first message (exec has no system-prompt flag); later turns resume the same thread."""
+    The game's system prompt replaces Codex's built-in coding instructions (`model_instructions_file`); later
+    turns resume the same thread. Codex's tools can't be switched off, so the read-only sandbox is the guard.
+    Reasoning comes back as short summary titles."""
     stateful = True
 
-    def __init__(self, system, *, effort: str | None = 'high', summary: str | None = 'auto', **kw):
+    def __init__(self, system, *, effort: str | None = 'high', summary: str | None = 'auto',
+                 replace_instructions: bool = True, **kw):
         super().__init__(system, **kw)
-        self.effort, self.summary = effort, summary
+        self.effort, self.summary, self.replace_instructions = effort, summary, replace_instructions
 
     async def _call(self, text):
         flags = ['--json', '--skip-git-repo-check']
+        if self.replace_instructions:
+            path = os.path.join(self.folder(), 'instructions.md')
+            if not os.path.exists(path):
+                with open(path, 'w') as f:
+                    f.write(self.system)
+            flags += ['-c', f'model_instructions_file="{path}"']
         if self.model:
             flags += ['-m', self.model]
         if self.effort:
@@ -198,7 +215,7 @@ class CodexCLI(Backend):
             prompt = text
         else:
             cmd = ['codex', 'exec', '--sandbox', 'read-only', *flags, '-']
-            prompt = self.system + '\n\n=== THE MATCH BEGINS ===\n' + text
+            prompt = text if self.replace_instructions else self.system + '\n\n=== THE MATCH BEGINS ===\n' + text
         out = await self.run(cmd, stdin=prompt)
         messages, thinking, usage = [], [], {}
         for line in out.splitlines():
@@ -227,20 +244,67 @@ class CodexCLI(Backend):
         return Reply(messages[-1], '\n'.join(thinking), usage, meta={'session': self.session})
 
 
-class AgyCLI(Backend):
-    """Google Antigravity CLI (`agy -p`), signed in with a Google account: Gemini models. The system prompt goes
-    in the first message (there is no flag for it); later turns continue the same conversation by id. stdin is
-    closed (scripted output can go missing otherwise) and `--sandbox` limits terminal use. agy keeps its own
-    tools loaded (there is no flag to drop them); in headless mode anything needing approval is refused."""
-    stateful = True
+AGY_AGENT = """---
+name: poker
+description: A player in a poker match. Answers with one JSON object.
+tools: []
+subagent: false
+---
 
-    def __init__(self, system, *, effort=None, print_timeout='15m', **kw):
+"""
+AGY_DENY = {'permissions': {'deny': ['mcp(*)', 'command(*)', 'read_url(*)', 'execute_url(*)', 'read_file(*)',
+                                     'write_file(*)']}}
+
+
+class AgyCLI(Backend):
+    """Google Antigravity CLI (`agy -p`), signed in with a Google account: Gemini models.
+
+    The game's system prompt is an agent definition in the seat's folder (`.agents/agents/poker/agent.md`,
+    with `tools: []`), selected with `--agent poker`; a deny list in `--settings` blocks MCP servers, commands,
+    files and URLs, and `--sandbox` limits the terminal. Later turns continue the conversation by id. stdin is
+    closed (scripted output can go missing otherwise). The model is passed on every call: agy's default comes
+    from your own settings and can be a non-Gemini model. Thinking isn't in agy's output, so it is read from
+    the conversation's transcript, along with the model that actually answered."""
+    stateful = True
+    BRAIN = os.path.expanduser('~/.gemini/antigravity-cli/brain')
+
+    def __init__(self, system, *, effort=None, print_timeout='15m', lockdown: bool = True, **kw):
         super().__init__(system, **kw)
-        self.effort, self.print_timeout = effort, print_timeout
+        self.effort, self.print_timeout, self.lockdown = effort, print_timeout, lockdown
+
+    def _agent(self):
+        d = os.path.join(self.folder(), '.agents', 'agents', 'poker')
+        path = os.path.join(d, 'agent.md')
+        if not os.path.exists(path):
+            os.makedirs(d, exist_ok=True)
+            with open(path, 'w') as f:
+                f.write(AGY_AGENT + self.system + '\n')
+
+    def _transcript(self):
+        """(thinking, model) of the latest model step in this conversation's transcript, if agy wrote one."""
+        path = os.path.join(self.BRAIN, self.session or '', '.system_generated', 'logs', 'transcript.jsonl')
+        try:
+            with open(path) as f:
+                lines = f.read().splitlines()
+        except OSError:
+            return '', None
+        for line in reversed(lines):
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if rec.get('type') == 'PLANNER_RESPONSE':
+                return rec.get('thinking') or '', rec.get('model')
+        return '', None
 
     async def _call(self, text):
-        prompt = text if self.session else self.system + '\n\n=== THE MATCH BEGINS ===\n' + text
         cmd = ['agy', '--output-format', 'json', '--sandbox', '--print-timeout', self.print_timeout]
+        if self.lockdown:
+            self._agent()
+            cmd += ['--agent', 'poker', '--settings', json.dumps(AGY_DENY)]
+            prompt = text
+        else:
+            prompt = text if self.session else self.system + '\n\n=== THE MATCH BEGINS ===\n' + text
         if self.model:
             cmd += ['--model', self.model]
         if self.effort:
@@ -256,7 +320,9 @@ class AgyCLI(Backend):
         if data.get('status') != 'SUCCESS':
             raise BackendError(f'agy {data.get("status")}: {json.dumps(data.get("error") or data)[:1500]}')
         self.session = data.get('conversation_id') or self.session
-        return Reply(data.get('response') or '', '', data.get('usage') or {}, meta={'session': self.session})
+        thinking, served = self._transcript()
+        meta = {'session': self.session, **({'served_model': served} if served else {})}
+        return Reply(data.get('response') or '', thinking, data.get('usage') or {}, meta=meta)
 
 
 class GeminiCLI(Backend):

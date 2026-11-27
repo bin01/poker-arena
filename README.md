@@ -69,9 +69,9 @@ Players live in [`players.toml`](players.toml): a `backend` and optional `model`
 
 | backend | tool | plan | memory |
 |---|---|---|---|
-| `claude` | Claude Code, `claude -p` | Claude Pro / Max | the CLI keeps the session (`--resume`); tools off |
-| `codex` | Codex CLI, `codex exec` | ChatGPT Plus / Pro | the CLI keeps the thread (`exec resume`); read-only sandbox |
-| `agy` | Google Antigravity CLI, `agy -p` | Google account (Gemini) | the CLI keeps the conversation (`--conversation`) |
+| `claude` | Claude Code, `claude -p` | Claude Pro / Max | the CLI keeps the session (`--resume`); tools off; thinking summaries shown |
+| `codex` | Codex CLI, `codex exec` | ChatGPT Plus / Pro | the CLI keeps the thread (`exec resume`); the game prompt replaces Codex's coding instructions; read-only sandbox |
+| `agy` | Google Antigravity CLI, `agy -p` | Google account (Gemini) | the CLI keeps the conversation (`--conversation`); the game prompt is a tool-less agent; MCP, commands, files and URLs denied; thinking read from its transcript |
 | `gemini` | Gemini CLI, `gemini -p` (older installs) | Google account | the transcript is re-sent each turn |
 | `command` | any CLI reading a prompt on stdin, e.g. `["pi", "-p"]`, `["ollama", "run", "{model}"]` | yours | transcript re-sent |
 | `openai_compat` | OpenRouter, Ollama, LM Studio, vLLM (an API, not a subscription) | API key | transcript re-sent |
@@ -141,9 +141,14 @@ plugged in as a `command` backend if you want to compare harnesses.
 
 ## Caveats
 
-- CLI backends add their own system prompts and limits (Codex's default prompt is about 21K tokens, agy's about 15K), and expose
-  reasoning unevenly (`claude -p` shows no thinking, `codex` shows reasoning summaries when asked, `agy` none; agy also keeps its own tools loaded, with anything needing approval refused),
-  which is why every reply carries its own `reasoning` field.
-- Elo needs whole sessions (10 deals each), so a matchup needs at least 5 deals to count and 10+ to mean much.
+- What each CLI lets you control (tested on claude 2.1.332, codex 0.172.0, agy 1.5.14):
+  - `claude`: system prompt replaced, tools and MCP off, your settings and hooks skipped, thinking shown as summaries.
+  - `codex`: its coding instructions are replaced by the game prompt, but its tools can't be switched off (the
+    read-only sandbox and the empty folder are the guard), and its reasoning comes back only as short titles.
+  - `agy`: the game prompt runs as an agent with no tools of its own, and MCP servers, commands, files and URLs
+    are denied; agy can still add its own system notes to a conversation. Always set a Gemini `model`: agy's
+    default comes from your own settings and may not be Gemini (`doctor` shows which model answered). Thinking
+    is a condensed version read from agy's transcript.
+  Every reply also carries its own `reasoning` field, so the viewer has something for every model.
 - Results from different backends of the same model (CLI vs API) shouldn't be mixed on one leaderboard.
 - 50 deals per matchup separates large skill gaps; close models need several hundred.

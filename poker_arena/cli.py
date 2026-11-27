@@ -89,7 +89,8 @@ def cmd_doctor(args):
             j2 = parse_json(r2.text) or {}
             remembered = word in str(j2.get('word', r2.text)).lower()
             return (f'{pid:24} OK  json={"yes" if j1 else "NO"}  memory={"yes" if remembered else "NO"}  '
-                    f'latency={r1.latency:.0f}s/{r2.latency:.0f}s  reasoning-visible={"yes" if r2.thinking else "no"}')
+                    f'latency={r1.latency:.0f}s/{r2.latency:.0f}s  reasoning-visible={"yes" if r2.thinking else "no"}'
+                    + (f'  served-by={r2.meta["served_model"]}' if r2.meta.get('served_model') else ''))
         except Exception as e:  # report and carry on
             return f'{pid:24} FAIL {str(e)[:300]}'
 
