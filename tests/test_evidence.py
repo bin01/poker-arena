@@ -246,6 +246,26 @@ class TestRecordVerifier(RealRun):
         self.assertEqual(conv['provisional']['b-first'], [5, 6, 7, 8, 9])
         self.assertEqual(stats.collect(self.folder(1, 1))['rule']['population']['provisional_hands'], 10)
 
+    def test_every_written_hand_has_one_status(self):
+        """R7-#7: the shared reader says verified, provisional or rejected for every hand either play wrote, and
+        totals over the verified ones, for the viewer to use without the ratings."""
+        k = self.tamper()
+        d = self.folder(1, 2) / 'a-first'
+        state = json.loads((d / 'state.json').read_text())
+        state['hands_committed'] = 8
+        (d / 'state.json').write_text(json.dumps(state))
+        R._VERIFIED.clear()
+        conv = R.read_conversation(self.folder(1, 2))
+        st = conv['status']
+        self.assertEqual(st['a-first'][k], 'rejected')
+        self.assertEqual(st['b-first'][k], 'rejected')
+        self.assertEqual((st['a-first'][8], st['b-first'][9]), ('provisional', 'provisional'))
+        self.assertEqual(sorted(h for h, s in st['a-first'].items() if s == 'verified'), conv['verified'])
+        self.assertIn('replay', conv['reasons'][k])
+        ha, hb = conv['hands']
+        self.assertEqual(conv['totals'], {'deals': len(conv['verified']),
+                                          'net_a': sum(ha[h]['net'][0] + hb[h]['net'][1] for h in conv['verified'])})
+
     def test_a_missing_verifier_fails_closed(self):
         with mock.patch('poker_arena.games.holdem.Holdem.verify', side_effect=RuntimeError('broken')):
             report = []
@@ -354,31 +374,24 @@ class TestFundamentals(unittest.TestCase):
     mixed into strengths or verdicts; plans are told to include the reference bot."""
 
     def test_separate_section(self):
-        """R6-#4, #5: scores are recounted from the answers (a fallback never counts, even where folding was
-        best; valid-answer accuracy apart), carry their provenance, attach to a run's player only when eligible,
-        and the fixed basics get counts, not population intervals."""
-        call = {'attempt': 0, 'raw': {'stdout': '{}'}, 'identity_match': 'match'}
-        ans = lambda spot, executed, outcome='valid', cat='basics': {
-            'spot': spot, 'category': cat, 'executed': executed, 'outcome': outcome, 'fallback': outcome != 'valid',
-            'correct': executed == 'fold', 'ev_loss_bb': 0.0 if executed == 'fold' else 1.0, 'identity_match': 'match',
-            'audit': 'verified', 'calls': [call]}
-        answers = [ans('b1', 'fold'), ans('b2', 'fold', 'fallback'), ans('b3', 'call'), ans('c1', 'fold', cat='close')]
-        doc = {'version': 'quiz-2', 'spots_hash': 'h', 'spots': [{'id': k, 'correct': 'fold'} for k in ('b1', 'b2', 'b3', 'c1')],
-               'categories': {'basics': {'population': None}, 'close': {'population': 'generated', 'estimand': 'share'}},
-               'players': {
-                   'opus': {'spec': {'backend': 'claude', 'model': 'claude-x-1', 'effort': 'high'}, 'kind': 'model',
-                            'answered': 3, 'correct': 2, 'answers': answers, 'protocol': {'fingerprint': 'p1'},
-                            'implementation': {'fingerprint': 'i1'}, 'cli_version': '2.0',
-                            'eligibility': {'status': 'eligible', 'reasons': []}},
-                   'old': {'spec': {'backend': 'claude', 'model': 'claude-z-1', 'effort': 'high'}, 'answered': 30,
-                           'correct': 24, 'accuracy': 0.8, 'ev_loss_bb': 12.5, 'fallbacks': 0}}}
+        """R6-#4, #5, R7-#3, #5: scores are recounted from the answers as the judge re-derives them (a fallback
+        never counts, even where folding was best; valid-answer accuracy apart), carry their provenance, attach to
+        a run's player only when eligible, and are counts, not population intervals, unless sampled independently."""
+        from test_fundamentals import CALL, CALL_B, FOLD_B, SHOVE, answer, player, quiz_doc, reply
+        fold_b, call_b = FOLD_B, CALL_B
+        miss = answer(fold_b, None, 'fold', text='no JSON here', error='Your reply was not a JSON object.')
+        p = player([answer(SHOVE, 'call', 'call'), miss, answer(call_b, 'fold', 'fold'), answer(CALL, 'call', 'call')])
+        doc = quiz_doc({'opus': p, 'old': {'spec': {'backend': 'claude', 'model': 'claude-z-1', 'effort': 'high'},
+                                           'answered': 30, 'correct': 24, 'accuracy': 0.8, 'ev_loss_bb': 12.5,
+                                           'fallbacks': 0}}, spots=(SHOVE, fold_b, call_b, CALL))
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             (root / 'quiz.json').write_text(json.dumps(doc))
             f = R.fundamentals(root, {'m1': 'claude:claude-x-1:high#abcd1234@ffff0000',
                                       'm2': 'claude:claude-z-1:high#abcd1234@ffff0000'})
             bad = json.loads(json.dumps(doc))
-            bad['players']['opus']['answers'][0]['identity_match'] = 'mismatch'
+            text = reply('fold')
+            bad['players']['opus']['answers'][0]['calls'][0].update(output=text)
             (root / 'quiz.json').write_text(json.dumps(bad))
             g = R.fundamentals(root, {'m1': 'claude:claude-x-1:high#abcd1234@ffff0000'})
         self.assertEqual(f['label'], 'poker fundamentals')
@@ -386,7 +399,7 @@ class TestFundamentals(unittest.TestCase):
         self.assertEqual((x['quiz_player'], x['attached'], x['correct'], x['answered'], x['fallbacks']), ('opus', True, 1, 3, 1))
         self.assertEqual((x['valid_correct'], x['valid_answers'], x['valid_accuracy']), (1, 2, 0.5))
         self.assertIsNone(x['categories']['basics']['interval95'])
-        self.assertIsNotNone(x['categories']['close']['interval95'])
+        self.assertIsNone(x['categories']['close']['interval95'])
         self.assertEqual(x['provenance']['implementation'], 'i1')
         self.assertEqual(x['eligibility']['status'], 'eligible')
         self.assertNotIn('m2', f['players'])                               # no answers kept: not attached
@@ -396,7 +409,7 @@ class TestFundamentals(unittest.TestCase):
         text = R.fundamentals_text(f)
         self.assertIn('apart from match results', text)
         self.assertIn('1/3', text)
-        self.assertNotIn('95%', text.split('close')[0])
+        self.assertNotIn('95%', text)
         self.assertIsNone(R.fundamentals(Path(tempfile.gettempdir()) / 'no-such-run'))
 
     def test_reference_edge_and_warning(self):
@@ -546,6 +559,34 @@ class TestOneMatcher(unittest.TestCase):
         ok = run(deals_between('x', 'y', 300, 50, np.random.default_rng(4), sd=100, rounds=4, reps=2), p,
                  who={'x': MODEL})
         self.assertEqual(next(q for q in ok['players'] if q['player'] == 'x')['identity_match'], 'match')
+
+
+from test_runner_linked import Linked, TestReplayedDecisions
+
+
+class TestJudgeReplaysDecisions(Linked):
+    """R7-#2, judge side: the ratings' own audit of each decision (verify_play's linked_audit) replays the accepted
+    reply against the engine state before its action, so a reply raising to 4 never verifies a raise to 200."""
+    script = TestReplayedDecisions.script
+    doctor_reply = TestReplayedDecisions.doctor_reply
+    first_thought = TestReplayedDecisions.first_thought
+
+    def audit(self, out):
+        d = self.match(out)
+        cfg = json.loads((d / 'config.json').read_text())
+        R._VERIFIED.clear()
+        v = R.verify_play(d, cfg, R._hands(d))
+        return {k: x['audit'] for k, x in v.items()}
+
+    def test_a_raise_to_4_reply_linked_to_a_raise_to_200(self):
+        self.script({'action': 'raise', 'amount': 200})
+        out = self.play(deals=(1,))
+        t = self.first_thought(out)
+        clean = self.audit(out)
+        self.assertTrue(all(not s['problems'] for x in clean.values() for s in x.values()), clean)
+        self.doctor_reply(out, t['accepted_call'], lambda o: {**o, 'amount': 4})
+        bad = [p for x in self.audit(out).values() for s in x.values() for p in s['problems']]
+        self.assertTrue(any('inconsistent' in p and t['decision_id'] in p for p in bad), bad)
 
 
 if __name__ == '__main__':

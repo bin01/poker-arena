@@ -136,6 +136,21 @@ class TestCommitted(Linked):
         self.assertTrue(all(c['hand'] < 2 for c in part['calls']))
 
 
+    def test_the_judge_reads_the_conversation_as_every_reader_does(self):
+        out = self.play()
+        rows = committed_records(self.match(out))
+        self.assertEqual(rows['conversation'], {'verified': [0, 1, 2], 'provisional': [], 'rejected': []})
+        self.assertTrue(self.facts(out)['verification']['ok'])
+        cfg = self.match(out, 'b-first') / 'config.json'
+        doc = json.loads(cfg.read_text())
+        doc['specs']['station'] = {**doc['specs']['station'], 'note': 'edited'}   # the hands still replay
+        cfg.write_text(json.dumps(doc))
+        self.assertEqual(committed_records(self.match(out))['conversation']['rejected'], 'all')
+        f = self.facts(out)
+        self.assertFalse(f['verification']['ok'])
+        self.assertTrue(any('conversation reader' in p for p in f['problems']))
+
+
 class TestCliMidRun(Linked):
     seats = (('m', {'backend': 'command', 'command': FAKE, 'model': 'x'}), ('station', {'bot': 'station'}))
 
@@ -175,3 +190,127 @@ class TestCliMidRun(Linked):
         self.assertIn('changed while a match was running', reg['void_reason'])
         f = runner.eligibility(self.d / 'plan', ['m__vs__station'], ('m', 'station'), reg)
         self.assertTrue(any(c.get('mid_run') for c in f['implementation_changes']))
+
+
+class TestReplayedDecisions(Linked):
+    """R7-#2: the accepted reply is replayed against the engine state before the action and must produce exactly the
+    executed record (action, amount, speech, correction); a refused reply must still be refused."""
+
+    def script(self, first, then=None):
+        from test_runner import FakeCLI, passive
+
+        def run(n, text):
+            if n == 1:
+                return first
+            return then(n, text) if then else passive(text)
+        FakeCLI.script = staticmethod(run)
+
+    def doctor_reply(self, out, call_id, fn):
+        d = self.match(out)
+
+        def calls(rows):
+            for r in rows:
+                if r['call_id'] == call_id:
+                    r['output'] = json.dumps(fn(json.loads(r['output'])))
+            return rows
+
+        def raw(rows):
+            for r in rows:
+                if r.get('call_id') == call_id and 'failed_try' not in r:
+                    r['synthetic']['text'] = json.dumps(fn(json.loads(r['synthetic']['text'])))
+            return rows
+        self.edit(d / 'calls.jsonl', calls)
+        self.edit(d / 'raw.jsonl', raw)
+
+    def first_thought(self, out):
+        return next(t for t in self.thoughts(self.match(out)) if t['player'] == 'm')
+
+    def test_a_reply_raising_to_4_does_not_verify_an_executed_raise_to_200(self):
+        self.script({'action': 'raise', 'amount': 200})
+        out = self.play(deals=(1,))
+        t = self.first_thought(out)
+        self.assertEqual((t['action'], t['amount']), ('raise', 200))
+        self.assertEqual(self.facts(out)['players']['m']['audit'], 'complete')
+        self.doctor_reply(out, t['accepted_call'], lambda o: {**o, 'amount': 4})
+        m = self.facts(out)['players']['m']
+        self.assertEqual(m['audit'], 'incomplete')
+        self.assertEqual(m['audit_counts'].get('inconsistent'), 1)
+        self.assertTrue(any('amount' in p and t['decision_id'] in p for p in m['problems']), m['problems'])
+
+    def test_the_speech_is_bound_too(self):
+        self.script({'action': 'call', 'say': 'hello'})
+        out = self.play(deals=(1,))
+        self.assertEqual(self.facts(out)['players']['m']['audit'], 'complete')
+        t = self.first_thought(out)
+        self.doctor_reply(out, t['accepted_call'], lambda o: {**o, 'say': 'goodbye'})
+        m = self.facts(out)['players']['m']
+        self.assertEqual(m['audit'], 'incomplete')
+        self.assertTrue(any('say' in p for p in m['problems']), m['problems'])
+
+    def test_a_sizing_correction_is_replayed(self):
+        self.script({'action': 'raise', 'amount': 3})
+        out = self.play(deals=(1,))
+        t = self.first_thought(out)
+        self.assertEqual((t['amount'], t['correction']['kind']), (4, 'sizing'))
+        self.assertEqual(self.facts(out)['players']['m']['audit'], 'complete')
+
+        def strip(rows):
+            for r in rows:
+                acts = r['actions'] if 'actions' in r else [r['data']] if r.get('kind') == 'action' else []
+                for a in acts:
+                    if a.get('decision_id') == t['decision_id']:
+                        for k in ('correction', 'requested', 'note'):
+                            a.pop(k, None)
+            return rows
+        d = self.match(out)
+        self.edit(d / 'events.jsonl', strip)
+        self.edit(d / 'hands.jsonl', strip)
+        f = self.facts(out)
+        self.assertTrue(f['verification']['ok'])            # the hand itself still replays
+        m = f['players']['m']
+        self.assertEqual(m['audit'], 'incomplete')
+        self.assertTrue(any('correction' in p for p in m['problems']), m['problems'])
+
+    def test_the_decision_record_is_recomputed(self):
+        self.script({'action': 'raise', 'amount': 3})
+        out = self.play(deals=(1,))
+        t = self.first_thought(out)
+
+        def relabel(rows):
+            for r in rows:
+                if r.get('kind') == 'thought' and r['data']['decision_id'] == t['decision_id']:
+                    r['data']['correction'] = None
+                    r['data']['requested'] = r['data']['accepted']
+            return rows
+        self.edit(self.match(out) / 'events.jsonl', relabel)
+        m = self.facts(out)['players']['m']
+        self.assertEqual(m['audit'], 'incomplete')
+        self.assertTrue(any('decision record' in p for p in m['problems']), m['problems'])
+
+    def test_a_refused_reply_must_still_be_refused(self):
+        self.script({'action': 'check'})        # facing the big blind: not playable, asked again, then calls
+        out = self.play(deals=(1,))
+        t = self.first_thought(out)
+        self.assertEqual((t['tries'], t['correction']['kind']), (2, 'retry'))
+        self.assertEqual(self.facts(out)['players']['m']['audit'], 'complete')
+        self.doctor_reply(out, t['call_ids'][0], lambda o: {**o, 'action': 'call'})
+        m = self.facts(out)['players']['m']
+        self.assertEqual(m['audit'], 'incomplete')
+        self.assertTrue(any('refused' in p for p in m['problems']), m['problems'])
+
+    def test_a_fallback_is_the_engine_fallback(self):
+        from test_runner import FakeCLI
+        FakeCLI.script = staticmethod(lambda n, text: {'action': 'dance'})
+        out = self.play(deals=(1,))
+        t = self.first_thought(out)
+        self.assertTrue(t['fallback'])
+        self.assertEqual(self.facts(out)['players']['m']['audit'], 'complete')
+
+
+class TestResumeCliChange(Linked):
+    def test_a_resume_records_the_file_it_replaces(self):
+        before = {'codex': {'path': '/bin/codex', 'version': '1', 'sha256': 'a'}}
+        after = {'codex': {'path': '/bin/codex', 'version': '1', 'sha256': 'b'}}
+        ch = runner.check_versions({'cli_versions': {'codex': '1'}, 'cli_artifacts': before}, {'codex': '1'}, 'm',
+                                   True, after)
+        self.assertEqual((ch['artifacts_from'], ch['artifacts_to']), (before, after))

@@ -75,7 +75,8 @@ def _track_text(track: str, plan: dict, d: dict, args) -> list[str]:
         return out
     out.append(f'OFFICIAL track -> {plan["out"]} (fresh conversations; assumption-free verdicts, the only ones that '
                f'rank): ' + _cost(plan, d) + f'. At most {d["alpha"]:.0%} chance of any false verdict over all pairings, '
-               f'for any distribution of results, given independent conversations (fresh memories): a betting '
+               f'for any distribution of results, given independent conversations (fresh memories) and a conditional '
+               f'null (each conversation\'s expected edge, given the ones before, at most the null value): a betting '
                f'confidence sequence on conversation means bounded by the stacks (+-{d["outcome_bound_bb100"]:,.0f} '
                f'bb/100), valid at every look (docs/methodology.md).')
     out.append(design_line(d))
@@ -458,6 +459,9 @@ def main(argv=None):
                    help='only this category (repeat for more; default: all)')
     p.add_argument('--limit', type=int, help='only the first N spots of each category')
     p.add_argument('--concurrency', type=int, default=4, help='spots asked at once per player (default 4)')
+    p.add_argument('--allow-unattested', action='append', metavar='BACKEND',
+                   help='a backend whose replies name no model may still be eligible (repeat for more; the same '
+                        'policy as a match design\'s allow_unattested)')
     p.set_defaults(fn=lambda a: __import__('poker_arena.quiz', fromlist=['main']).main(a))
 
     args = ap.parse_args(argv)

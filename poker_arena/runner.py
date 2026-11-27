@@ -193,7 +193,7 @@ def artifact_drift(pinned: dict | None, fresh: dict | None) -> list[str]:
 def check_versions(doc: dict, fresh: dict, where, allow: bool, artifacts: dict | None = None) -> dict | None:
     """None when the CLIs are the versions `doc` (a config or plan) recorded, last change included, and (when
     `artifacts` is given) the same files (path and sha256, `cli_artifacts`). Otherwise ResumeMismatch, or with
-    `allow` the change to record: {t, from, to, clis, artifacts_to}."""
+    `allow` the change to record: {t, from, to, clis, artifacts_from, artifacts_to}."""
     changes = doc.get('cli_version_changes') or []
     pinned = changes[-1]['to'] if changes else doc.get('cli_versions')
     drift = version_drift(pinned, fresh) + artifact_drift(doc.get('cli_artifacts'), artifacts)
@@ -204,7 +204,7 @@ def check_versions(doc: dict, fresh: dict, where, allow: bool, artifacts: dict |
                              f'the recorded version, use a new folder, or pass --allow-code-change to continue with '
                              f'this one (the change is recorded and voids the registration)')
     return {'t': round(time.time()), 'from': pinned, 'to': {**(pinned or {}), **fresh}, 'clis': drift,
-            **({'artifacts_to': artifacts} if artifacts else {})}
+            **({'artifacts_from': doc.get('cli_artifacts') or {}, 'artifacts_to': artifacts} if artifacts else {})}
 
 
 def _append(path: Path, obj):
@@ -283,8 +283,12 @@ def committed_records(d) -> dict:
     """A match folder's record split into what is committed and what is not: {hands_committed, finished,
     hands, events, calls, raw (the committed rows: hands 0 .. hands_committed-1), provisional: {file: rows of a
     hand still being played, or of one that was stopped or failed its replay check and was never committed},
-    interrupted: rows a resume moved aside}. Only committed rows are evidence; a reader shows provisional rows,
-    if at all, as live and unverified."""
+    interrupted: rows a resume moved aside, conversation: what `ratings.read_conversation` makes of this play's
+    hands ({verified, provisional, rejected} hand indices, from `ratings.verified_hands`; None outside an a-first
+    / b-first folder)}: `eligibility` requires every committed hand of a finished pairing to be one the shared
+    reader verifies, so the judge and every reader count the same hands. Only committed rows are evidence; a
+    reader shows provisional rows, if at all, as live and unverified."""
+    from .ratings import verified_hands
     d = Path(d)
     state = json.loads((d / 'state.json').read_text()) if (d / 'state.json').exists() else {}
     done = state.get('hands_committed', state.get('hands', 0))
@@ -296,6 +300,10 @@ def committed_records(d) -> dict:
         out[key] = [r for r in rows if isinstance(_row_hand(r), int) and _row_hand(r) < done]
         out['provisional'][key] = [r for r in rows if not (isinstance(_row_hand(r), int) and _row_hand(r) < done)]
     out['hands'] = out['hands'][:done]
+    conv = verified_hands(d) if d.name in ('a-first', 'b-first') else None
+    out['conversation'] = None if conv is None else {
+        'verified': sorted(conv['verified']), 'provisional': list(conv['provisional']),
+        'rejected': conv['rejected'] if conv['rejected'] == 'all' else list(conv['rejected'])}
     return out
 
 
@@ -305,17 +313,134 @@ def record_hash(rows: dict) -> str:
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
+def _plainj(x):
+    return json.loads(json.dumps(x, default=str))
+
+
+def _move(a: dict) -> dict:
+    kind = {'bet': 'raise'}.get(a.get('action'), a.get('action'))
+    return {'action': kind, 'amount': a.get('amount') if kind == 'raise' else None, 'say': a.get('say', '')}
+
+
+def replay_decisions(cfg: dict, hand: dict, events: list, calls: list, game=None) -> dict:
+    """One committed hand's model decisions re-derived from their replies: the engine state before each recorded
+    action is rebuilt from the seed and the actions before it, every refused reply (an `error` the engine gave) is
+    re-applied and must be refused with the same error, and the accepted reply (its JSON parsed from the call's
+    output, `say` capped as the seat capped it) is applied and must produce exactly the executed action, in
+    hands.jsonl and in its action event, with its amount, speech and correction; a decision with no accepted reply
+    must be the engine's fallback. The decision record's requested / executed / correction / retries are recomputed
+    from the replies. {decision_id: [problems]} for every model decision the replay reached."""
+    from .agents import Decision, ModelAgent, parse_json
+    ids, specs = cfg.get('players') or [], cfg.get('specs') or {}
+    effective = cfg.get('effective') or []
+    k = hand.get('hand')
+    seeds = cfg.get('seeds') or []
+    out = {}
+    if not isinstance(k, int) or k >= len(seeds):
+        return out
+    try:
+        game = game or game_of(cfg)
+    except (KeyError, TypeError, ValueError):
+        return out
+    start = next((e for e in events if e.get('kind') == 'hand_start'), None)
+    names = ((start or {}).get('data') or {}).get('names') or cfg.get('names') or [f'P{i}' for i in range(len(ids))]
+    ep = game.episode(k, seeds[k], list(names))
+    thoughts = {(e.get('data') or {}).get('decision_id'): e['data'] for e in events if e.get('kind') == 'thought'}
+    acted = {(e.get('data') or {}).get('decision_id'): e['data'] for e in events if e.get('kind') == 'action'}
+    by_did = {}
+    for c in calls:
+        by_did.setdefault(c.get('decision_id'), []).append(c)
+    strip = lambda a: {x: v for x, v in _plainj(a).items() if x != 'decision_id'}
+    for a in hand.get('actions') or []:
+        if ep.done or a.get('seat') != ep.to_act:
+            break
+        seat, did = a['seat'], a.get('decision_id')
+        spec = specs.get(ids[seat]) if seat < len(ids) else None
+        data = thoughts.get(did)
+        if did and data and spec and 'bot' not in spec:
+            p = out.setdefault(did, []).append
+            words = (effective[seat] if seat < len(effective) and isinstance(effective[seat], dict) else {}) \
+                .get('max_say_words', spec.get('max_say_words', 40))
+            mine = sorted(by_did.get(did) or [], key=lambda c: c.get('attempt') if isinstance(c.get('attempt'), int) else -1)
+            errors = []
+            for c in mine:
+                if not c.get('error') or c.get('call_id') == data.get('accepted_call'):
+                    continue
+                obj = parse_json(c.get('output') or '')
+                kind = c.get('rejected') if c.get('rejected') in ('tool_use', 'unverified') else 'invalid'
+                errors.append({'requested': None if obj is None else {'action': json_safe(obj.get('action')),
+                                                                      'amount': json_safe(obj.get('amount'))},
+                               'error': c['error'], 'kind': kind})
+                if kind != 'invalid':
+                    continue
+                if obj is None:
+                    again = 'Your reply was not a JSON object.'
+                else:
+                    obj['say'] = ModelAgent._cap(obj.get('say'), words)
+                    again = copy.deepcopy(ep).apply(seat, obj)
+                if again != c['error']:
+                    p(f'{c.get("call_id")}: refused with {c["error"]!r}, but the engine '
+                      + ('plays it' if again is None else f'says {again!r}'))
+            probe = copy.deepcopy(ep)
+            accepted = next((c for c in mine if c.get('call_id') == data.get('accepted_call')), None)
+            if data.get('accepted_call'):
+                obj = parse_json((accepted or {}).get('output') or '')
+                if obj is None:
+                    p(f'{did}: the accepted reply holds no JSON object')
+                    obj = {}
+                obj['say'] = ModelAgent._cap(obj.get('say'), words)
+                err = probe.apply(seat, obj)
+                fallback = False
+            else:
+                obj, err = {}, probe.apply(seat, probe.fallback(seat))
+                fallback = True
+            if err:
+                p(f'{did}: the accepted reply is not playable here ({err})')
+            else:
+                entry = strip(probe.history[-1])
+                for where, rec in (('hands.jsonl', a), ('its action event', acted.get(did))):
+                    got = strip(rec or {})
+                    diff = sorted(x for x in set(got) | set(entry) if got.get(x) != entry.get(x))
+                    if diff:
+                        p(f'{did}: {where} records ' + ', '.join(f'{x}={got.get(x)!r}' for x in diff)
+                          + '; the reply replays to ' + ', '.join(f'{x}={entry.get(x)!r}' for x in diff))
+                d = Decision(obj, fallback=fallback, errors=errors)
+                want = {**_plainj(_thought_fields(d, probe.history[-1], None)), 'fallback': fallback,
+                        'action': entry.get('action'), 'amount': entry.get('amount'),
+                        'accepted': None if fallback else {'action': json_safe(obj.get('action')),
+                                                           'amount': json_safe(obj.get('amount'))}}
+                have = _plainj({x: data.get(x) for x in want})
+                diff = sorted(x for x in want if have.get(x) != want[x])
+                if diff:
+                    p(f'{did}: the decision record says ' + ', '.join(f'{x}={have.get(x)!r}' for x in diff)
+                      + '; its replies give ' + ', '.join(f'{x}={want[x]!r}' for x in diff))
+        if ep.apply(seat, _move(a)):
+            break
+    return out
+
+
 def linked_audit(cfg: dict, rows: dict) -> dict:
     """Every committed decision of a record_version-2 match rebuilt from its links: the thought event, the calls
     and raw rows that carry its decision_id, and the executed action that names it. A model decision's audit
     status is derived here, not read from its label: each call is re-parsed from its raw output by its backend
     (backends.verify_call) and must agree with what calls.jsonl says, the accepted call must be the one the
-    decision names and carry the action it played, and the thought's own audit label must match the derived one.
+    decision names, and `replay_decisions` must re-derive the executed action and the decision record from the
+    replies against the engine; the thought's own audit label must match the derived one.
     {seat: {status_counts, identity_counts, observed_models, problems}}; statuses 'verified' | 'opaque' |
     'unverified' | 'inconsistent' | 'unverifiable' | 'unlinked' | 'bot'."""
-    from .agents import parse_json
     from .backends import verify_call
     ids, specs = cfg.get('players') or [], cfg.get('specs') or {}
+    replayed, ev_by, call_by = {}, {}, {}
+    for e in rows.get('events') or []:
+        ev_by.setdefault(e.get('episode'), []).append(e)
+    for c in rows.get('calls') or []:
+        call_by.setdefault(c.get('hand'), []).append(c)
+    try:
+        game = game_of(cfg)
+    except (KeyError, TypeError, ValueError):
+        game = None
+    for h in rows.get('hands') or [] if game else []:
+        replayed.update(replay_decisions(cfg, h, ev_by.get(h.get('hand'), []), call_by.get(h.get('hand'), []), game))
     out = {i: {'status_counts': {}, 'identity_counts': {}, 'observed_models': set(), 'problems': []}
            for i in range(len(ids))}
     bump = lambda dct, key: dct.__setitem__(key, dct.get(key, 0) + 1)
@@ -379,13 +504,13 @@ def linked_audit(cfg: dict, rows: dict) -> dict:
                                           or accepted.get('rejected') or accepted.get('error')):
             bad = 'inconsistent'
             p(f'{did}: the accepted call is not a reply that was played')
-        elif accepted:
-            obj = parse_json(accepted.get('output') or '') or {}
-            said = str(obj.get('action') or '').strip().lower().replace('-', '_').replace(' ', '_')
-            want = str((data.get('accepted') or {}).get('action') or '').strip().lower().replace('-', '_').replace(' ', '_')
-            if said != want:
-                bad = 'inconsistent'
-                p(f'{did}: the accepted reply says {said!r}, the decision {want!r}')
+        if did not in replayed:
+            bad = 'inconsistent'
+            p(f'{did}: its hand does not replay to this decision')
+        elif replayed[did]:
+            bad = 'inconsistent'
+            for why in replayed[did]:
+                p(why)
         derived = bad or (statuses[-1] if statuses else 'unlinked')
         if not bad and statuses and data.get('audit') != derived:
             derived = 'inconsistent'
@@ -972,6 +1097,15 @@ def eligibility(out: Path, folders: list[str], players, registration: dict | Non
             rows = committed_records(d)
             events, calls = rows['events'], rows['calls']
             hands = rows['hands']
+            conv = rows['conversation']
+            if conv is not None and rows['finished']:
+                if conv['rejected'] == 'all':
+                    record_problems.append(f'{where}: the conversation reader rejects every hand')
+                else:
+                    unread = [k for k in range(rows['hands_committed']) if k not in conv['verified']]
+                    if unread:
+                        record_problems.append(f'{where}: committed hands {unread[:10]} are not results for the '
+                                               f'conversation reader')
             check = verify_match(d, cfg, hands, events)
             committed = check['hands']
             record_hashes.append([where, record_hash(rows)])

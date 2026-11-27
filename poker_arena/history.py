@@ -9,9 +9,9 @@ reasoning level and protocol (`claude:claude-sonnet-5-5:high#1a2b3c4d`, the prot
 every setting that changes play, as the runner records it, the match horizon and memory resets included), or
 its bot and settings (`bot:rule:sims=200`), and the implementation that played it (`@5e6f7a8b`: the code that
 plays, i.e. the engine, agents, backends, runner and prompt template, not the judge, and for a model the
-version of its CLI). Only identical protocols and implementations pool: the same model with other
+version and file hash of its CLI). Only identical protocols and implementations pool: the same model with other
 instructions, isolation, tool policy, retry policy or conversation length is another player, and so is one
-played by other parsing, correction or tool-detection code or another CLI version, and a player from before
+played by other parsing, correction or tool-detection code or another CLI version or CLI file, and a player from before
 protocols were recorded. The implementation is taken hand by hand (`implementation_segments`): a code or CLI
 version change during a match splits the player at the hand it took effect, and a deal whose two plays
 straddle a change belongs to neither side. An explicit equivalence list (`equivalences.json` beside the database:
@@ -54,7 +54,7 @@ from pathlib import Path
 
 from .stats import add, summarize, tally
 
-SCHEMA = 6
+SCHEMA = 7
 DB_NAME = 'arena.db'
 ALL = '*'   # the run name the viewer uses for the all-time leaderboard
 
@@ -95,20 +95,52 @@ def identity(pid: str, spec: dict, protocol: str | None = None, horizon: int | N
     return f'{backend}:{pid}{tag}'   # a CLI or command without a model setting: only its id says what it is
 
 
-def _tag(impl: dict | None, cli_versions: dict | None, cfg: dict, pid: str) -> str | None:
+def _tag(impl: dict | None, cli_versions: dict | None, cfg: dict, pid: str, cli_files: dict | None = None) -> str | None:
     if not isinstance(impl, dict) or not impl.get('files'):
         return None
     files = {k: v for k, v in impl['files'].items() if not k.endswith('/ratings.py')}
     spec = (cfg.get('specs') or {}).get(pid) or {}
-    cli = None
+    cli = sha = None
     if 'bot' not in spec:
         players, eff = cfg.get('players') or [], cfg.get('effective') or []
         seat = players.index(pid) if pid in players else None
         exe = (eff[seat] or {}).get('exe') if seat is not None and seat < len(eff) else None
-        versions = cli_versions or {}
+        versions, shas = cli_versions or {}, cli_files or {}
         cli = versions.get(exe) if exe and exe in versions else (dict(sorted(versions.items())) or None)
+        sha = shas.get(exe) if exe and exe in shas else (dict(sorted(shas.items())) or None)
     key = {'files': files, 'prompt_template': impl.get('prompt_template'), 'cli': cli}
+    if sha:
+        key['cli_file'] = sha
     return hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:8]
+
+
+UNRECORDED = 'unrecorded'   # a CLI file the record lost (replaced by a later one): kept apart from every known file
+
+
+def _exes_changed(c: dict) -> set:
+    """The executables one recorded CLI change touched: the mid-run transition's, or those its drift names."""
+    out = {str(a.get('exe')) for a in (c.get('artifact_to'), c.get('artifact_from')) if isinstance(a, dict) and a.get('exe')}
+    return out | {str(x).split(':')[0] for x in c.get('clis') or [] if ':' in str(x)}
+
+
+def _files_at_start(cfg: dict, state: dict | None) -> dict:
+    """{exe: sha256} of the CLI files a match started with. The runner keeps the latest file in `cli_artifacts`,
+    so for a CLI that changed the start is the change's `artifact_from` / `artifacts_from`, else a resume's record
+    from before it, else UNRECORDED."""
+    shas = {e: (a or {}).get('sha256') for e, a in (cfg.get('cli_artifacts') or {}).items() if isinstance(a, dict)}
+    resumes = sorted((state or {}).get('resumes') or [], key=lambda r: int(r.get('after_hand') or 0))
+    done = set()
+    for c in sorted(cfg.get('cli_version_changes') or [], key=lambda c: int(c.get('after_hand') or 0)):
+        at = int(c.get('after_hand') or 0)
+        for e in _exes_changed(c) - done:
+            done.add(e)
+            frm = c.get('artifact_from') if (c.get('artifact_from') or {}).get('exe') == e else \
+                (c.get('artifacts_from') or {}).get(e)
+            if not isinstance(frm, dict):
+                frm = next(((r.get('cli_artifacts') or {}).get(e) for r in resumes
+                            if int(r.get('after_hand') or 0) < at and (r.get('cli_artifacts') or {}).get(e)), None)
+            shas[e] = (frm or {}).get('sha256') or UNRECORDED
+    return {e: v for e, v in shas.items() if v}
 
 
 def implementation_segments(cfg: dict, pid: str, state: dict | None = None) -> list[tuple[int, str | None]]:
@@ -116,20 +148,31 @@ def implementation_segments(cfg: dict, pid: str, state: dict | None = None) -> l
     and CLI versions the match started with, then each accepted code change (implementation_changes), CLI
     version change (cli_version_changes) and CLI version seen at a resume (state.json `resumes`) from the hand
     it took effect. A tag is the first 8 characters of a hash of the code that plays (every recorded
-    implementation file but the judge, ratings.py), the prompt template and, for a model, the version of its CLI
-    (every recorded CLI version when its executable is not recorded)."""
+    implementation file but the judge, ratings.py), the prompt template and, for a model, the version and the
+    file (sha256, `cli_artifacts` and each change's artifacts) of its CLI (every recorded CLI when its executable
+    is not recorded), so a rebuilt CLI that keeps its version string is another implementation too."""
     impl, clis = cfg.get('implementation'), dict(cfg.get('cli_versions') or {})
+    shas = _files_at_start(cfg, state)
     steps = [(int(c.get('after_hand') or 0), 0, 'impl', c.get('to')) for c in cfg.get('implementation_changes') or []]
-    steps += [(int(c.get('after_hand') or 0), 1, 'cli', c.get('to')) for c in cfg.get('cli_version_changes') or []]
-    steps += [(int(r.get('after_hand') or 0), 2, 'cli', r.get('cli_versions'))
-              for r in (state or {}).get('resumes') or [] if r.get('cli_versions')]
-    out = [(0, _tag(impl, clis, cfg, pid))]
+    steps += [(int(c.get('after_hand') or 0), 1, 'cli', c) for c in cfg.get('cli_version_changes') or []]
+    steps += [(int(r.get('after_hand') or 0), 2, 'resume', r) for r in (state or {}).get('resumes') or []
+              if r.get('cli_versions') or r.get('cli_artifacts')]
+    out = [(0, _tag(impl, clis, cfg, pid, shas))]
     for at, _, kind, value in sorted(steps, key=lambda x: (x[0], x[1])):
         if kind == 'impl' and isinstance(value, dict):
             impl = value
-        elif kind == 'cli' and isinstance(value, dict):
-            clis = {**clis, **value}
-        tag = _tag(impl, clis, cfg, pid)
+        elif kind == 'cli':
+            if isinstance(value.get('to'), dict):
+                clis = {**clis, **value['to']}
+            to = {**(value.get('artifacts_to') or {})}
+            if isinstance(value.get('artifact_to'), dict) and value['artifact_to'].get('exe'):
+                to[value['artifact_to']['exe']] = value['artifact_to']
+            shas = {**shas, **{e: a.get('sha256') for e, a in to.items() if isinstance(a, dict) and a.get('sha256')}}
+        elif kind == 'resume':
+            clis = {**clis, **(value.get('cli_versions') or {})}
+            shas = {**shas, **{e: a.get('sha256') for e, a in (value.get('cli_artifacts') or {}).items()
+                               if isinstance(a, dict) and a.get('sha256')}}
+        tag = _tag(impl, clis, cfg, pid, shas)
         if tag != out[-1][1]:
             out = [x for x in out if x[0] < at] + [(at, tag)]
     return out
@@ -191,7 +234,7 @@ def connect(db) -> sqlite3.Connection:
             con.execute('ALTER TABLE deals ADD COLUMN fp TEXT')
             con.execute("UPDATE matches SET stamp = ''")
     row = con.execute("SELECT v FROM meta WHERE k = 'schema'").fetchone()
-    if row and int(row[0]) < 6:   # identities gain the protocol, horizon, implementation and its changes: read again
+    if row and int(row[0]) < 7:   # identities gain the protocol, horizon, implementation, its changes, CLI files: read again
         with con:
             con.execute('DROP TABLE players')
             con.executescript(TABLES)

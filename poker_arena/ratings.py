@@ -39,7 +39,10 @@ and Ville's inequality bounds the chance it ever reaches 2 / alpha_pairing by al
 whenever play stops, with no assumption on the shape of the results. 'a' is a's bettor against m = 0 reaching
 that bar, 'b' the mirror one, 'even' both bettors against the margins (+-EQUIV_BB100) reaching it. Whatever the
 true edge, a false verdict needs at most two of those bettors, each valid for it, to reach the bar, so a pairing
-gives one with chance at most alpha_pairing (Bonferroni over the pairings: alpha over all of them). `model_based` is the round 6 gate (a conversation-level
+gives one with chance at most alpha_pairing (Bonferroni over the pairings: alpha over all of them). The null
+is conditional: E[Y_t | the conversations before t] <= m at every t (a common mean is one case of it). When the
+edge drifts, 'a' means that a's expected edge was positive for at least part of the run, not that the run's
+average favours it; `drift` (early against late conversations) is reported beside every verdict. `model_based` is the round 6 gate (a conversation-level
 t and a sign-flip test with bars calibrated for a family of shapes): secondary, descriptive, never official.
 
 Planning. A design's power is that of the official test, simulated (`procedure`): the chance that the better
@@ -73,6 +76,7 @@ import numpy as np
 OBJECTIVE = 'bb/100 over duplicate deals'
 BLOCK = 10                  # deals per aligned block in the within-conversation bootstrap and session Elo
 EQUIV_BB100 = 15            # margin of the equivalence test behind 'even'
+DRIFT_ALPHA = 0.01          # the drift diagnostic flags early and late conversations this unlikely to share a mean
 DEFAULT_DESIGN = {'alpha': 0.05, 'round_deals': 50, 'block': BLOCK}   # max_rounds: from the power target
 TARGET_EDGE = 50            # bb/100: the edge a plan is powered to detect unless it says otherwise
 PRIOR_SD = 350              # bb/100: the per-deal spread assumed when planning (first model runs: about 340)
@@ -103,9 +107,12 @@ TERMINAL = ('a', 'b', 'even', 'ineligible')   # verdicts that stop a pairing bef
 ALLOW_UNATTESTED = ('codex',)   # backends that cannot report the model that answered, allowed unless a design says otherwise
 ASSUMPTIONS = ('With no edge, a pairing is called for either player with chance at most alpha / n_pairings (so at '
                'most alpha over all of them), at every look and whenever play stops, for any distribution of '
-               'results: the official test is a betting confidence sequence for bounded outcomes, which needs only '
-               'that conversations are independent (fresh memories, no deal repeated across them) and that no '
-               'duplicate deal moves more than the stacks allow; "even" (within the equivalence margin) has the '
+               'results: the official test is a betting confidence sequence for bounded outcomes, which needs that '
+               'conversations are independent (fresh memories, no deal repeated across them), that no duplicate '
+               'deal moves more than the stacks allow, and that the null holds conditionally (given the '
+               'conversations before it, each one\'s expected edge is at most the null value; a common mean is one '
+               'case). If the edge drifts, a verdict means a player was ahead for part of the run, not on average; '
+               'the drift diagnostic beside each verdict flags that. "even" (within the equivalence margin) has the '
                'same guarantee. Each verdict reports those checks. The model-based result shown beside it (a t and '
                'sign-flip test calibrated for a family of shapes) is secondary and never official.')
 GUARANTEE = ASSUMPTIONS
@@ -284,7 +291,9 @@ def _json(p: Path):
 
 def _hands(d: Path):
     """{hand: record} of a match folder's committed hands: rows past state.json's hands_committed (a hand
-    written before an interruption, which a resume replays) are not part of the record."""
+    written before an interruption, which a resume replays) are not part of the record. A folder without a
+    state.json is a legacy record (written before commits were recorded): every hand it holds is taken as
+    committed, and still counts only if it verifies (`read_conversation` says so in `commit`)."""
     out = {}
     p = d / 'hands.jsonl'
     state = _json(d / 'state.json') if (d / 'state.json').exists() else None
@@ -399,14 +408,17 @@ def _rows_by_hand(p: Path, key: str) -> dict | None:
     return out
 
 
-def linked_audit(cfg: dict, hand: int, events: list, calls: list, raw: list) -> dict:
+def linked_audit(cfg: dict, hand: int, events: list, calls: list, raw: list, replayed: dict | None = None) -> dict:
     """The audit of one hand's model decisions, derived from the records linked to each by its `decision_id`:
     the decision record (a `thought` event), the action it led to, every call attempt and every raw backend
     output row. Per seat: {'decisions', 'linked', 'verified', 'opaque', 'problems'}. A decision is verified when
     its id is on its action and on at least one call, its accepted (last) call says 'verified' and has a raw
     output row of its own (the same `call_id`, or the same decision id and attempt; a failed try's row does not
     count), and the decision record's own audit says the same; 'opaque' when
-    the accepted call comes from a backend that exposes no record. Bots make no decisions here."""
+    the accepted call comes from a backend that exposes no record. With `replayed` (`runner.replay_decisions`:
+    {decision id: problems} from replaying each accepted reply against the engine state before its action), a
+    decision also needs a clean replay: its reply must reproduce the executed action, amount, correction and
+    speech, else it is inconsistent. Bots make no decisions here."""
     ids = cfg.get('players') or []
     specs = cfg.get('specs') or {}
     out = {}
@@ -439,6 +451,11 @@ def linked_audit(cfg: dict, hand: int, events: list, calls: list, raw: list) -> 
             x['problems'].append(f'hand {hand} decision {did}: ' + '; '.join(why))
             continue
         x['linked'] += 1
+        got = None if replayed is None else replayed.get(did, replayed.get('*'))
+        if replayed is not None and got != []:
+            x['problems'].append(f'hand {hand} decision {did}: inconsistent: '
+                                 + ('; '.join(got[:2]) if got else 'the replay of its hand did not reach it'))
+            continue
         last = mine[-1]
         audit = last.get('audit')
         has_raw = bool(by_raw.get(last.get('call_id') or (did, last.get('attempt'))))
@@ -450,6 +467,17 @@ def linked_audit(cfg: dict, hand: int, events: list, calls: list, raw: list) -> 
             x['problems'].append(f'hand {hand} decision {did}: accepted call audit {audit!r}'
                                  + ('' if has_raw else ', no raw output row'))
     return out
+
+
+def _replayed(replay, cfg, h, evs, calls) -> dict | None:
+    """`runner.replay_decisions` of one hand, or None when there is nothing to replay against (no replayer, no
+    events, or a record from before decisions were linked); a replayer that fails says so for every decision."""
+    if replay is None or not evs or not any((e.get('data') or {}).get('decision_id') for e in evs):
+        return None
+    try:
+        return replay(cfg, h, evs, calls)
+    except Exception as e:
+        return {'*': [f'the replay failed: {e!r}'[:200]]}
 
 
 def verify_play(d: Path, cfg: dict, hands: dict) -> dict:
@@ -468,6 +496,10 @@ def verify_play(d: Path, cfg: dict, hands: dict) -> dict:
     events = _rows_by_hand(d / 'events.jsonl', 'episode')
     calls = _rows_by_hand(d / 'calls.jsonl', 'hand') or {}
     raw = _rows_by_hand(d / 'raw.jsonl', 'hand') or {}
+    try:
+        from .runner import replay_decisions
+    except ImportError:
+        replay_decisions = None
     out = {}
     for k, h in hands.items():
         evs = None if events is None else events.get(k, [])
@@ -480,7 +512,8 @@ def verify_play(d: Path, cfg: dict, hands: dict) -> dict:
                             sort_keys=True, default=str)
         out[k] = {**v, 'digest': hashlib.sha256(blob.encode()).hexdigest()[:24],
                   'digest_linked': hashlib.sha256(linked.encode()).hexdigest()[:24],
-                  'audit': linked_audit(cfg, k, evs or [], calls.get(k, []), raw.get(k, []))}
+                  'audit': linked_audit(cfg, k, evs or [], calls.get(k, []), raw.get(k, []), _replayed(
+                      replay_decisions, cfg, h, evs, calls.get(k, [])))}
     if len(_VERIFIED) > 4096:
         _VERIFIED.clear()
     _VERIFIED[key] = out
@@ -524,7 +557,10 @@ def read_conversation(mdir) -> dict | None:
     `check_pair`, and whose two plays replay from their seeds through `verify_play`: the only results), 'checks'
     (each play's `verify_play`), 'rejected' ([{'hand' (None: the whole conversation), 'reason'}]), 'provisional'
     ({'a-first': [...], 'b-first': [...]}: hands written but not yet results: past the play's commit point, or
-    committed while the other play has not finished that hand)}. None when the folder holds no a-first config."""
+    committed while the other play has not finished that hand), 'status' ({side: {hand: 'verified' |
+    'provisional' | 'rejected'}} for every hand either play wrote), 'reasons' ({hand (None: the whole
+    conversation): why it was rejected}), 'totals' ({'deals', 'net_a'}: a's chips over the verified deals, both
+    plays), 'commit' (per play: what its commit point comes from: state.json, or legacy, see `_hands`)}. None when the folder holds no a-first config."""
     mdir = Path(mdir)
     a_dir, b_dir = mdir / 'a-first', mdir / 'b-first'
     ca = _json(a_dir / 'config.json')
@@ -557,6 +593,15 @@ def read_conversation(mdir) -> dict | None:
         out['provisional'][side] = sorted(k for k in written[side] if isinstance(k, int) and not whole
                                           and k not in out['verified'] and k not in bad
                                           and (k not in mine or k not in other))
+    out['commit'] = {side: 'state.json' if (d / 'state.json').exists() else
+                     'legacy: no state.json, so every written hand is taken as committed and counts only if it verifies'
+                     for side, d in (('a-first', a_dir), ('b-first', b_dir))}
+    good = set(out['verified'])
+    out['status'] = {side: {k: 'verified' if k in good else 'rejected' if whole or k in bad else 'provisional'
+                            for k in sorted(x for x in written[side] if isinstance(x, int))}
+                     for side in ('a-first', 'b-first')}
+    out['reasons'] = {x['hand']: x['reason'] for x in out['rejected']}
+    out['totals'] = {'deals': len(good), 'net_a': sum(ha[k]['net'][0] + hb[k]['net'][1] for k in out['verified'])}
     return out
 
 
@@ -1118,6 +1163,37 @@ def _bet(Y, m, bound, state=None, prior_var=BET_PRIOR_VAR, cap=BET_CAP):
     lam = np.clip(gap / (var + gap * gap), 0.0, cap / (bound + m))
     path = lk[:, None] + np.cumsum(np.log1p(lam * (Y - m)), 1)
     return path, (n0 + T, c1[:, -1], c2[:, -1], path[:, -1])
+
+
+def drift(ys) -> dict:
+    """Whether a pairing's edge held still: its conversation means in play order, the first half against the
+    second (Welch t, two-sided). {'status' ('stable' | 'drift detected' | 'unknown': fewer than 4 conversations),
+    'early', 'late', 'difference', 'p', 'conversations' ([early, late]), 'meaning'}. A diagnostic beside the
+    verdict, not a test of it: the official verdict stays valid under drift, but then says only that the edge
+    was on that side for part of the run."""
+    y = np.asarray(ys, float)
+    C = len(y)
+    out = {'status': 'unknown', 'early': None, 'late': None, 'difference': None, 'p': None, 'conversations': None,
+           'alpha': DRIFT_ALPHA, 'meaning': 'too few conversations to compare early and late play'}
+    if C < 4:
+        return out
+    e, l = y[:C // 2], y[C // 2:]
+    me, ml = float(e.mean()), float(l.mean())
+    ve, vl = float(e.var(ddof=1)) / len(e), float(l.var(ddof=1)) / len(l)
+    diff = ml - me
+    if ve + vl <= 1e-12 * (1 + diff * diff):
+        p = 0.0 if abs(diff) > 1e-9 else 1.0
+    else:
+        df = (ve + vl) ** 2 / ((ve * ve / (len(e) - 1) if ve else 0.0) + (vl * vl / (len(l) - 1) if vl else 0.0))
+        p = min(1.0, 2 * t_sf(abs(diff) / math.sqrt(ve + vl), max(df, 1.0)))
+    found = p < DRIFT_ALPHA
+    out.update(status='drift detected' if found else 'stable', early=round(me, 1), late=round(ml, 1),
+               difference=round(diff, 1), p=round(p, 6), conversations=[len(e), len(l)],
+               meaning=(f'the edge changed during play ({me:+.0f} bb/100 in the first {len(e)} conversations, '
+                        f'{ml:+.0f} in the last {len(l)}): a verdict means a player was ahead for part of the run, '
+                        f'not that the run\'s average favours it') if found else
+               'no change of the edge between early and late conversations was detected')
+    return out
 
 
 def min_conversations(alpha_pairing: float, cap: float = BET_CAP) -> int:
@@ -1730,7 +1806,8 @@ def decide(xs, design=None, n_pairings=1, looks_used=None, groups=None) -> dict:
     'exhausted' (the last planned look, undecided), 'open' (undecided, looks remain, or no look yet), 'early'
     (a completed look with fewer conversations than any verdict could come from). `capital` is each bettor's
     best capital so far against the bar `official_test.threshold`; `cs` the anytime-valid interval for the edge
-    (level `cs_level`). The other numbers describe all the deals given (`ci95` is an ordinary t interval, not a
+    (level `cs_level`). `drift` compares early and late conversations (a diagnostic beside the verdict: under
+    drift a verdict holds for the conditional null, see `drift`). The other numbers describe all the deals given (`ci95` is an ordinary t interval, not a
     test); with one conversation `basis` is 'blocks' and it is conditional on it. `model_based` is the round 6
     gate on the same data, secondary and never official (None for designs it was never calibrated for)."""
     d = {**DEFAULT_DESIGN, 'max_rounds': 1, **(design or {})}
@@ -1761,7 +1838,8 @@ def decide(xs, design=None, n_pairings=1, looks_used=None, groups=None) -> dict:
            'assumption_free': True, 'bound_bb100': bound,
            'out_of_bound': sum(abs(x) > bound * (1 + 1e-9) for x in xs), 'capital': None, 'cs': None,
            'cs_level': round(1 - alpha_p, 6), 'conversation_share': None, 'sd_per_deal': None, 'reason': None,
-           'model_based': None, 'power': {'deals_for_80pct': {str(e): None for e in POWER_EDGES}}}
+           'model_based': None, 'power': {'deals_for_80pct': {str(e): None for e in POWER_EDGES}},
+           'drift': drift(np.clip(sums / np.maximum(sizes, 1), -bound, bound))}
     if C >= 2:
         m, se = _cr1(sizes, sums)
         df, basis = C - 1, 'conversations'
@@ -1889,7 +1967,7 @@ MODEL_DIAGNOSTICS = {'supported': 'diagnostics passed; distribution assumptions 
 # The adjudicator: the only function whose verdicts stop, record or decide anything.
 
 DIAGNOSTICS = {'supported': 'checks passed: the guarantee holds for any distribution of results within the '
-                            'game\'s bound, given independent conversations',
+                            'game\'s bound, given independent conversations and the conditional null (see drift)',
                'unsupported': 'checks failed: deals are repeated across conversations, so they are not shown to be '
                               'independent',
                'unknown': 'checks incomplete: some could not be made'}
@@ -1926,6 +2004,26 @@ def assumptions(v: dict, fps=None, groups=None) -> dict:
     return {'status': status, 'summary': DIAGNOSTICS[status], 'checks': checks}
 
 
+ATTESTATION = {'attested': 'the backend reported which model answered, and it is the requested one',
+               'unattested': 'the backend did not report which model answered',
+               'mismatch': 'the backend reported another model than the requested one',
+               'bot': 'a bot: no model to attest', 'none': 'no reply was recorded'}
+
+
+def attestation(backend: str | None, identity_match: str | None, allow=ALLOW_UNATTESTED) -> dict:
+    """The one attestation policy, for games and the quiz alike: from an `identity_match` ('match' | 'mismatch' |
+    'unattested' | 'bot' | None), {'status' ('attested' | 'unattested' | 'mismatch' | 'bot' | 'none'), 'allowed',
+    'meaning', 'policy'}. Attested and bots are allowed; a mismatch and no reply never are; unattested is allowed
+    only for a backend in `allow` (a design's `allow_unattested`; by default ALLOW_UNATTESTED, the backends that
+    cannot report the model) and is shown as unattested wherever it is allowed."""
+    status = {'match': 'attested', 'mismatch': 'mismatch', 'unattested': 'unattested', 'bot': 'bot'}.get(
+        identity_match or '', 'none')
+    allow = sorted(allow or ())
+    allowed = status in ('attested', 'bot') or (status == 'unattested' and backend in allow)
+    return {'status': status, 'allowed': allowed, 'meaning': ATTESTATION[status],
+            'policy': f'unattested allowed for: {", ".join(allow) or "no backend"}'}
+
+
 def _player_problems(p: str, x: dict | None, design: dict) -> list[str]:
     if not x:
         return [f'{p}: no eligibility facts']
@@ -1937,14 +2035,14 @@ def _player_problems(p: str, x: dict | None, design: dict) -> list[str]:
         out.append(f'{p}: no model recorded, so which model played is unknown')
     elif str(model) in ALIASES:
         out.append(f'{p}: bare alias "{model}", so the model version behind it is unknown')
-    ident = _identity_of(x)
     wrong = [m for m in x.get('observed_models') or [] if identity_match(model, m) == 'mismatch']
-    if ident == 'mismatch' or wrong:
+    att = attestation(backend, 'mismatch' if wrong else _identity_of(x), design.get('allow_unattested') or ())
+    if att['status'] == 'mismatch':
         out.append(f'{p}: answered by {", ".join(wrong or x.get("observed_models") or ["another model"])}, not the '
                    f'requested {model}')
-    elif ident is None:
+    elif att['status'] == 'none':
         out.append(f'{p}: no replies recorded')
-    elif ident == 'unattested' and backend not in (design.get('allow_unattested') or ()):
+    elif not att['allowed']:
         out.append(f'{p}: its backend ({backend}) did not attest which model answered, and the design does not '
                    f'allow unattested {backend}')
     audit = x.get('audit')
@@ -2055,6 +2153,8 @@ def adjudicate(pairing_data: dict, design: dict, n_pairings: int, look: int, eli
             'identity_status': {p: (players.get(p) or {}).get('identity') for p in named},
             'audit_status': {p: (players.get(p) or {}).get('audit') for p in named},
             'identity_match': {p: _identity_of(players.get(p)) for p in named},
+            'attestation': {p: attestation((players.get(p) or {}).get('backend'), _identity_of(players.get(p)),
+                                           (design or {}).get('allow_unattested') or ()) for p in named},
             'judge_fingerprint': judge, 'judge': judge, 'calibration_id': cal,
             'registered_judge': (reg or {}).get('judge_fingerprint'), 'official': registered and not adaptation,
             'evidence_hash': data.get('evidence_hash'), 'judged_evidence_hash': data.get('evidence_hash'),
@@ -3025,54 +3125,210 @@ def _wilson(k: int, n: int) -> list[float] | None:
     return [round(max(0.0, c - h), 3), round(min(1.0, c + h), 3)]
 
 
-def _quiz_score(answers: list[dict], best: dict) -> dict:
-    """Counts from the answers themselves: a valid answer is one the player gave (no fallback, no backend
-    failure); it is correct only if it is the spot's computed best option. A fallback never counts as correct,
-    whatever the fallback did."""
-    valid = [x for x in answers if x.get('outcome', 'fallback' if x.get('fallback') else 'valid') == 'valid'
-             and not x.get('fallback')]
-    right = sum(1 for x in valid if (x.get('executed') == best[x['spot']] if x.get('spot') in best
-                                     else bool(x.get('correct'))))
+def _outcome(a: dict) -> str:
+    return a.get('outcome', 'fallback' if a.get('fallback') else 'valid')
+
+
+def _quiz_score(answers: list[dict]) -> dict:
+    """Counts from (verified) answers: a valid answer is one the player gave and the judge re-derived from its raw
+    output; only those can be correct. A fallback, a backend failure and an answer the judge could not verify
+    are never correct, and lose the worst option's value."""
+    valid = [x for x in answers if _outcome(x) == 'valid']
+    right = sum(1 for x in valid if x.get('correct'))
     n = len(answers)
     return {'answered': n, 'correct': right, 'accuracy': round(right / n, 4) if n else None,
             'valid_answers': len(valid), 'valid_correct': right,
-            'valid_accuracy': round(right / len(valid), 4) if valid else None, 'fallbacks': n - len(valid),
+            'valid_accuracy': round(right / len(valid), 4) if valid else None,
+            'fallbacks': sum(_outcome(x) in ('fallback', 'error') for x in answers),
+            'unverified_answers': sum(_outcome(x) == 'unverified' for x in answers),
             'ev_loss_bb': round(sum(float(x.get('ev_loss_bb') or 0) for x in answers), 3)}
 
 
-def _quiz_eligibility(x: dict) -> dict:
-    """Whether a quiz player's scores can be attached to it: its answers carry their evidence (raw output,
-    identity and audit per answer) and its provenance (protocol, implementation, CLI version), and the quiz's
-    own eligibility, rechecked from the answers, holds. {'status': 'eligible' | 'bot' | 'ineligible' |
-    'unverified', 'reasons'}."""
+def _answer_key(doc: dict) -> tuple[dict, list[str]]:
+    """({spot id: spot}, problems) of a quiz's answer key: the spots must hash to the recorded `spots_hash` (the
+    key the quiz was asked with, unaltered), and each spot's `correct` must be its best option by `ev_bb`."""
+    spots = [x for x in doc.get('spots') or [] if isinstance(x, dict)]
+    problems = []
+    if not spots:
+        return {}, ['the quiz keeps no answer key']
+    if hashlib.sha256(json.dumps(spots, sort_keys=True).encode()).hexdigest()[:16] != doc.get('spots_hash'):
+        problems.append('the answer key is not the one its spots_hash names (altered after the quiz)')
+    for x in spots:
+        ev = x.get('ev_bb') or {}
+        if not ev or x.get('correct') not in ev or ev[x['correct']] < max(ev.values()) or \
+                sorted(ev) != sorted(x.get('options') or []):
+            problems.append(f'spot {x.get("id")}: its answer is not its best option')
+    return {x.get('id'): x for x in spots}, problems
+
+
+def _check_answer(a: dict, spot: dict | None, spec: dict, effective: dict | None, cli: dict | None) -> dict:
+    """One answer re-derived from its record by the quiz's own verifier (`quiz.verify_answer`: the spot rebuilt
+    from its id and compared with the copy kept, every call checked against its raw output by its backend's
+    parser, every refused reply re-applied and the accepted one played in the engine, so the request, option,
+    correctness, outcome and loss must be what the replies give), plus the CLI each call ran compared with the
+    player's recorded CLI file. Returns the answer as served: the claims replaced by the verified representation
+    ('outcome' 'unverified', never correct, when any check failed), with 'verified', 'problems',
+    'identity_match', 'audit' and the calls without their raw payloads."""
+    from .backends import BACKENDS, Backend, artifact_changed
+    from .quiz import verify_answer
+    try:
+        v = verify_answer(a, spec, effective, spot)
+    except Exception as e:      # a record the verifier cannot even read is not verified
+        v = {'status': 'unverifiable', 'identity_match': None, 'answer': None,
+             'problems': [f'the quiz verifier failed: {e!r}'[:300]]}
+    problems = list(v.get('problems') or [])
+    calls = [c for c in a.get('calls') or [] if isinstance(c, dict)]
+    needs_cli = bool((BACKENDS.get(spec.get('backend')) or Backend).exe)
+    for c in calls:
+        if c.get('backend_failed'):
+            continue
+        if (needs_cli or cli or c.get('cli')) and not (cli and isinstance(c.get('cli'), dict) and c['cli'].get('sha256')
+                                                         and not artifact_changed(cli, c['cli'])):
+            problems.append(f'attempt {c.get("attempt")}: its CLI is not the player\'s recorded CLI file')
+    if v.get('answer') is None and not problems:
+        problems.append(f'not verified ({v.get("status")})')
+    good = v.get('answer') is not None and v.get('status') in ('verified', 'bot') and not problems
+    ev_bb = (spot or {}).get('ev_bb') or {}
+    worst = round(max(ev_bb.values()) - min(ev_bb.values()), 3) if ev_bb else None
+    keep = {k: val for k, val in a.items() if k not in ('calls', 'correct', 'outcome', 'ev_loss_bb', 'ev_lost_bb',
+                                                       'identity_match', 'audit', 'audit_problems', 'executed',
+                                                       'action', 'fallback')}
+    got = v['answer'] if good else {'outcome': 'unverified', 'correct': False, 'fallback': bool(a.get('fallback')),
+                                    'executed': a.get('executed'), 'ev_loss_bb': worst}
+    return {**keep, **got, 'action': got.get('executed'), 'ev_lost_bb': got.get('ev_loss_bb'),
+            'identity_match': v.get('identity_match') or 'none', 'audit': v.get('status'), 'verified': good,
+            'problems': problems, 'calls': [{k: val for k, val in c.items() if k != 'raw'} for c in calls]}
+
+
+def verify_quiz_player(x: dict, key: dict, key_problems=(), allow=None) -> dict:
+    """A quiz player's record re-derived by the judge (`_check_answer` per answer, the answer key's integrity,
+    each spot asked once, provenance), whatever the record's own labels say. {'status' ('eligible' | 'bot' |
+    'ineligible' | 'unverified': no answers kept), 'reasons', 'attestation' (`attestation`: the same policy as
+    the games), 'answers' (as served)}."""
     answers = x.get('answers')
-    if x.get('kind') == 'bot' or 'bot' in (x.get('spec') or {}):
-        return {'status': 'bot', 'reasons': []}
+    spec = x.get('spec') or {}
+    backend = spec.get('backend')
+    if allow is None:
+        allow = ((x.get('eligibility') or {}).get('policy') or {}).get('allow_unattested', ALLOW_UNATTESTED)
+    if x.get('kind') == 'bot' or 'bot' in spec:
+        checked = [_check_answer(a, key.get(a.get('spot')), spec, x.get('effective'), None)
+                   for a in answers or [] if isinstance(a, dict)]
+        return {'status': 'bot', 'reasons': [], 'attestation': attestation(None, 'bot'), 'answers': checked}
     if not isinstance(answers, list) or not answers:
-        return {'status': 'unverified', 'reasons': ['the quiz record keeps no answers, so its score cannot be checked']}
-    why = list(((x.get('eligibility') or {}).get('reasons')) or [])
-    if (x.get('eligibility') or {}).get('status') not in (None, 'eligible'):
-        why.append(f'the quiz found it {(x.get("eligibility") or {}).get("status")}')
-    if any(a.get('identity_match') != 'match' for a in answers):
-        why.append(f'{sum(a.get("identity_match") != "match" for a in answers)} answers not attested as the requested model')
-    if any(a.get('audit') != 'verified' for a in answers):
-        why.append(f'{sum(a.get("audit") != "verified" for a in answers)} answers not verified against their raw output')
-    if any(not any('raw' in c or c.get('raw_ref') for c in a.get('calls') or []) for a in answers):
-        why.append('some answers keep no raw backend output')
+        return {'status': 'unverified', 'reasons': ['the quiz record keeps no answers, so its score cannot be checked'],
+                'attestation': attestation(backend, None, allow), 'answers': []}
+    cli = x.get('cli') if isinstance(x.get('cli'), dict) else None
+    checked = [_check_answer(a, key.get(a.get('spot')), spec, x.get('effective'), cli) for a in answers
+               if isinstance(a, dict)]
+    why = list(key_problems)
+    bad = [a for a in checked if not a['verified']]
+    if bad:
+        why.append(f'{len(bad)} answer{"s" if len(bad) != 1 else ""} not verified from the raw output '
+                   f'({bad[0]["spot"]}: {bad[0]["problems"][0]})')
+    seen = [a.get('spot') for a in checked]
+    if len(set(seen)) != len(seen):
+        why.append('a spot is answered more than once')
+    idents = {a['identity_match'] for a in checked}
+    ident = 'mismatch' if 'mismatch' in idents else 'match' if idents == {'match'} else \
+        'unattested' if 'unattested' in idents else None
+    att = attestation(backend, ident, allow)
+    if not att['allowed']:
+        why.append(f'{att["status"]}: {att["meaning"]} ({att["policy"]})')
+    audits = {a['audit'] for a in checked}
+    if audits - {'verified'}:
+        why.append(f'some answers\' turns are not verified for tool use ({", ".join(sorted(audits - {"verified"}))})')
     missing = [k for k in ('protocol', 'implementation', 'cli_version') if not x.get(k)]
     if missing:
         why.append('no ' + ', '.join(missing) + ' recorded')
-    return {'status': 'ineligible' if why else 'eligible', 'reasons': list(dict.fromkeys(why))}
+    if cli and x.get('cli_version') and x.get('cli_version') != cli.get('version'):
+        why.append(f'the recorded CLI version {x.get("cli_version")!r} is not its CLI file\'s {cli.get("version")!r}')
+    return {'status': 'ineligible' if why else 'eligible', 'reasons': list(dict.fromkeys(why)), 'attestation': att,
+            'answers': checked}
+
+
+def _quiz_categories(answers: list[dict], cats: dict) -> dict:
+    out = {}
+    for c in dict.fromkeys(a.get('category', 'basics') for a in answers):
+        sc = _quiz_score([a for a in answers if a.get('category', 'basics') == c])
+        meta = cats.get(c) or {}
+        design = meta.get('sampling')
+        design = design.get('design') if isinstance(design, dict) else design
+        iid = design == 'independent'
+        sc['interval95'] = _wilson(sc['correct'], sc['answered']) if iid else None
+        sc['estimand'] = meta.get('estimand') if iid else (
+            'descriptive: ' + ('the spots were kept by answer quotas or another non-independent rule, so they are not '
+                               'an independent sample of a population; counts, not a population interval'
+                               if meta.get('population') else 'a fixed set of spots; counts, not a population interval'))
+        out[c] = sc
+    return out
+
+
+def verified_quiz(doc: dict) -> dict:
+    """A quiz.json as it should be served: each player's answers re-derived by the judge (`verify_quiz_player`),
+    every score recounted from them (the headline fields from `scored_category`, the basics when asked, each
+    category with its own denominators), `eligibility` and `attestation` the judge's, never the record's."""
+    key, key_problems = _answer_key(doc)
+    cats = doc.get('categories') or {}
+    players = {}
+    for pid, x in (doc.get('players') or {}).items():
+        if not isinstance(x, dict):
+            continue
+        policy = (doc.get('protocol') or {}).get('allow_unattested') if isinstance(doc.get('protocol'), dict) else None
+        v = verify_quiz_player(x, key, key_problems, policy)
+        answers = v['answers']
+        by_cat = _quiz_categories(answers, cats) if answers else {}
+        scored = 'basics' if 'basics' in by_cat else 'all' if by_cat else None
+        head = by_cat['basics'] if scored == 'basics' else _quiz_score(answers) if answers else \
+            {'answered': x.get('answered'), 'correct': None, 'accuracy': None, 'valid_answers': None,
+             'valid_correct': None, 'valid_accuracy': None, 'fallbacks': x.get('fallbacks'), 'unverified_answers': None,
+             'ev_loss_bb': x.get('ev_loss_bb')}
+        n = head.get('answered') or 0
+        head = {**head, 'total': head.get('answered'), 'score': head.get('accuracy'), 'ev_lost_bb': head.get('ev_loss_bb'),
+                'fallback_rate': round(head['fallbacks'] / n, 4) if n and head.get('fallbacks') is not None else None,
+                'mean_ev_loss_bb': round(head['ev_loss_bb'] / n, 3) if n and head.get('ev_loss_bb') is not None else None}
+        players[pid] = {**{k: val for k, val in x.items() if k not in ('answers', 'categories', 'eligibility')},
+                        **head, 'scored_category': scored, 'categories': by_cat, 'answers': answers,
+                        'eligibility': {'status': v['status'], 'reasons': v['reasons'], 'checked_by': 'judge',
+                                        'identity_match': {'attested': 'match'}.get(v['attestation']['status'],
+                                                                                    v['attestation']['status'])},
+                        'attestation': v['attestation'], 'identity_match': v['attestation']['status'],
+                        'audit_status': None if not answers else 'verified' if all(a.get('audit') == 'verified' for a in answers) else 'incomplete'}
+    return {**doc, 'players': players, 'verified_by': 'judge',
+            'answer_key': {'status': 'altered' if key_problems else 'intact', 'problems': key_problems}}
+
+
+_QUIZ: dict = {}
+
+
+def verified_quiz_file(path) -> dict | None:
+    """`verified_quiz` of a quiz.json, cached by the file's size and time (the first check of a quiz solves its
+    spots, which takes seconds); None when it is not a readable quiz."""
+    path = Path(path)
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    key = (str(path.resolve()), st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino)
+    if key not in _QUIZ:
+        doc = _json(path)
+        if not isinstance(doc, dict):
+            return None
+        if len(_QUIZ) > 64:
+            _QUIZ.clear()
+        _QUIZ[key] = verified_quiz(doc)
+    return _QUIZ[key]
 
 
 def fundamentals(root, players: dict | None = None) -> dict | None:
     """Poker fundamentals, reported apart from match results: the quiz scores (quiz.py) found in quiz.json at
-    root or one folder below it. Scores are recounted from the answers (a fallback is never correct; accuracy
-    over every spot asked, and valid-answer accuracy apart), per category, each with its provenance (quiz
-    version and spots, protocol, implementation, CLI version) and `eligibility` (`_quiz_eligibility`). A score is
+    root or one folder below it, as the judge re-derives them (`verified_quiz`: every answer re-verified from its
+    raw output and bound to the scored option; a fallback or an unverified answer is never correct; accuracy over
+    every spot asked, valid-answer accuracy apart), per category, each with its provenance (quiz version and
+    spots, protocol, implementation, CLI version), `eligibility` and `attestation` (the games' policy). A score is
     attached to a run's player (`players`: {player id: identity}) only when it is eligible (or a bot's) and the
-    model and reasoning level are the same; otherwise it stays under its quiz name, unattached. Intervals only
-    where a category's spots are a sample from a defined population (its generator), never for a fixed set."""
+    model and reasoning level are the same; otherwise it stays under its quiz name, unattached. Scores are
+    descriptive: an interval only where a category's spots are an independent sample of a defined population
+    (`sampling: 'independent'`), never for a fixed set or a sample kept by answer quotas."""
     from .history import identity as ident_of, _base
     root = Path(root)
     paths = [p for p in [root / 'quiz.json', *sorted(root.glob('*/quiz.json'))] if p.exists()]
@@ -3081,53 +3337,41 @@ def fundamentals(root, players: dict | None = None) -> dict | None:
     by_base = {_base(i): p for p, i in (players or {}).items()}
     out, versions = {}, set()
     for path in paths:
-        doc = _json(path) or {}
+        doc = verified_quiz_file(path)
+        if doc is None:
+            continue
         versions.add((doc.get('version'), doc.get('spots_hash')))
-        best = {sp.get('id'): sp.get('correct') for sp in doc.get('spots') or [] if isinstance(sp, dict)}
-        cats = doc.get('categories') or {}
-        for pid, x in (doc.get('players') or {}).items():
-            if not isinstance(x, dict) or 'answered' not in x and 'answers' not in x:
+        for pid, x in doc['players'].items():
+            if not x.get('answers') and x.get('answered') is None:
                 continue
             base = _base(ident_of(pid, x.get('spec') or {}))
-            elig = _quiz_eligibility(x)
-            answers = x.get('answers') if isinstance(x.get('answers'), list) else None
-            by_cat = {}
-            if answers:
-                for c in dict.fromkeys(a.get('category', 'basics') for a in answers):
-                    sc = _quiz_score([a for a in answers if a.get('category', 'basics') == c], best)
-                    pop = (cats.get(c) or {}).get('population')
-                    sc['interval95'] = _wilson(sc['correct'], sc['answered']) if pop else None
-                    sc['estimand'] = (cats.get(c) or {}).get('estimand') or (
-                        None if pop else 'none: a fixed set of spots; counts, not a population interval')
-                    by_cat[c] = sc
-                head = by_cat.get('basics') or _quiz_score(answers, best)
-            else:
-                head = {'answered': x.get('answered'), 'correct': None, 'accuracy': None, 'valid_answers': None,
-                        'valid_correct': None, 'valid_accuracy': None, 'fallbacks': x.get('fallbacks'),
-                        'ev_loss_bb': x.get('ev_loss_bb')}
+            elig = x['eligibility']
             attach = elig['status'] in ('eligible', 'bot') and base in by_base
             name = by_base[base] if attach else pid
             out[name] = {'quiz_player': pid, 'identity': base, 'attached': attach,
                          'attached_by': 'model and reasoning level' if attach else None,
-                         **{k: head.get(k) for k in ('answered', 'correct', 'accuracy', 'valid_answers', 'valid_correct',
-                                                     'valid_accuracy', 'fallbacks', 'ev_loss_bb')},
-                         'scored_category': 'basics' if 'basics' in by_cat else ('all' if by_cat else None),
-                         'categories': by_cat, 'eligibility': elig,
+                         **{k: x.get(k) for k in ('answered', 'correct', 'accuracy', 'valid_answers', 'valid_correct',
+                                                  'valid_accuracy', 'fallbacks', 'unverified_answers', 'ev_loss_bb')},
+                         'scored_category': x['scored_category'], 'categories': x['categories'],
+                         'eligibility': {k: elig[k] for k in ('status', 'reasons')}, 'attestation': x['attestation'],
                          'provenance': {'quiz_version': doc.get('version'), 'spots_hash': doc.get('spots_hash'),
                                         'protocol': (x.get('protocol') or {}).get('fingerprint')
                                         if isinstance(x.get('protocol'), dict) else x.get('protocol'),
                                         'implementation': (x.get('implementation') or {}).get('fingerprint')
                                         if isinstance(x.get('implementation'), dict) else x.get('implementation'),
-                                        'cli_version': x.get('cli_version'), 'identity_match': x.get('identity_match'),
-                                        'audit': x.get('audit_status')},
+                                        'cli_version': x.get('cli_version'),
+                                        'cli_sha256': (x.get('cli') or {}).get('sha256') if isinstance(x.get('cli'), dict) else None,
+                                        'identity_match': x['identity_match'], 'audit': x['audit_status']},
                          'version': doc.get('version'), 'spots_hash': doc.get('spots_hash'),
                          'source': str(path.relative_to(root))}
     return {'label': 'poker fundamentals', 'separate_from': 'match results',
             'meaning': 'how often a player finds the computed best answer in decision spots with a fixed answer '
-                       'key (a fallback is never correct; valid-answer accuracy is shown apart); it measures '
-                       'fundamentals, not winnings against these opponents, and is never pooled with strengths or '
-                       'verdicts. A score is attached to a run\'s player only with its provenance and when its '
-                       'answers are eligible; the basics are a fixed set, so they carry counts, not intervals',
+                       'key (a fallback, or an answer the judge cannot re-derive from its raw output, is never '
+                       'correct; valid-answer accuracy is shown apart); it measures fundamentals in stated-range '
+                       'decisions, not winnings against these opponents and not overall poker strength, and is '
+                       'never pooled with strengths or verdicts. A score is attached to a run\'s player only with its '
+                       'provenance and when its answers are eligible; the scores are descriptive counts, with an '
+                       'interval only for a category sampled independently from a defined population',
             'versions': sorted([v for v in versions if v[0]], key=str), 'players': out}
 
 
@@ -3334,7 +3578,8 @@ def verdicts(r, labels=None) -> str:
                  f'registered judge {reg.get("judge_fingerprint") or "?"}: an assumption-free betting test, at most '
                  f'{d["alpha"]:.0%} chance of any false verdict over {d["n_pairings"]} '
                  f'pairing{"s" if d["n_pairings"] != 1 else ""} for any distribution of results, given independent '
-                 f'conversations):']
+                 f'conversations whose expected edge, given the ones before, is at most the null value; drift is '
+                 f'flagged per pairing):']
     for m in sorted(r['pairings'], key=lambda m: (order[m['verdict']], m['a'], m['b'])):
         a, b = name(m['a']), name(m['b'])
         head = f'  {a} vs {b}: '
@@ -3378,6 +3623,8 @@ def verdicts(r, labels=None) -> str:
         st = (m.get('assumptions') or {}).get('status')
         if m['verdict'] not in ('descriptive',) and st and st != 'supported':
             lines.append(f'      {DIAGNOSTICS[st]}')
+        if (m.get('drift') or {}).get('status') == 'drift detected':
+            lines.append(f'      drift detected: {m["drift"]["meaning"]}.')
         mb = m.get('model_based')
         if isinstance(mb, dict) and mb.get('verdict') and m['verdict'] != 'descriptive':
             lines.append(f'      model-based (secondary, never official; assumes a family of shapes): '
@@ -3423,8 +3670,9 @@ def fundamentals_text(f, labels=None) -> str:
     if not f or not f.get('players'):
         return ''
     name = lambda p: (labels or {}).get(p, p)
-    lines = ['Poker fundamentals (the quiz: decision spots with computed answers; reported apart from match results, '
-             'which measure winnings against these opponents; a fallback is never correct):']
+    lines = ['Poker fundamentals (the quiz: decision spots with computed answers, every answer re-verified from its raw '
+             'output; reported apart from match results, which measure winnings against these opponents; a fallback '
+             'is never correct; fundamentals in stated-range decisions, not overall poker strength):']
     for p, x in sorted(f['players'].items(), key=lambda kv: -(kv[1].get('accuracy') or 0)):
         st = (x.get('eligibility') or {}).get('status')
         head = f'  {name(p)}: '
@@ -3434,7 +3682,11 @@ def fundamentals_text(f, labels=None) -> str:
         head += (f'{x["correct"]}/{x["answered"]} right in {x.get("scored_category") or "the quiz"}'
                  + (f' ({x["valid_correct"]}/{x["valid_answers"]} of its valid answers)' if x.get('fallbacks') else '')
                  + f', {x["ev_loss_bb"]} bb lost to the best answers'
-                 + (f', {x["fallbacks"]} fallbacks' if x.get('fallbacks') else ''))
+                 + (f', {x["fallbacks"]} fallbacks' if x.get('fallbacks') else '')
+                 + (f', {x["unverified_answers"]} not verified from their raw output (never correct)'
+                    if x.get('unverified_answers') else '')
+                 + (', unattested (allowed by the policy)' if (x.get('attestation') or {}).get('status') == 'unattested'
+                    and st == 'eligible' else ''))
         if st not in ('eligible', 'bot'):
             head += f'; {st}, not attached to a player ({"; ".join(x["eligibility"]["reasons"][:2])})'
         lines.append(head)
@@ -3443,7 +3695,7 @@ def fundamentals_text(f, labels=None) -> str:
                 continue
             iv = y.get('interval95')
             lines.append(f'      {c}: {y["correct"]}/{y["answered"]}' + (f' (95% {iv[0]:.0%}-{iv[1]:.0%} of its '
-                                                                          f'generator\'s spots)' if iv else ''))
+                                                                          f'generator\'s spots)' if iv else ' (descriptive)'))
     return '\n'.join(lines)
 
 

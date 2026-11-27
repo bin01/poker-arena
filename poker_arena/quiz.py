@@ -23,10 +23,12 @@ runout) from the flop on, Monte Carlo with SIMS draws from a fixed seed before i
 
 The spots of the four harder categories are generated: draws from a seeded generator (GENERATOR_SEED, one stream
 per category), each kept only if it is a legal engine position whose best option beats the next one by the
-category's margin, until PER_CATEGORY are kept (no answer may be the best in more than MAX_SHARE of them). A
-category's spots are therefore an i.i.d. sample from that generator's accepted spots: its accuracy estimates the
-share of that population a player answers best (the `estimand` of each category). The basics have no sampling
-population.
+category's margin, until PER_CATEGORY are kept. Nothing else filters them (no quota on any answer, since quiz-3),
+so a category's spots are independent draws from that generator's accepted spots (`sampling` in quiz.json:
+design 'independent'): its accuracy estimates the share of that population a player answers best (the `estimand`
+of each category). quiz-2 capped any one best answer at MAX_SHARE of a category (design 'answer_quota'), so its
+generated spots are not an independent sample and its scores are descriptive. The basics have no sampling
+population. Spot ids name the same candidate in every version (`spot_def`).
 
 A player answers each spot in a fresh conversation, through its usual backend, with the game's JSON reply;
 the answer is checked by the engine (`apply`) and must be one of the spot's options, else it is sent back
@@ -40,7 +42,12 @@ values, and per player its effective settings, protocol fingerprint, implementat
 (path, version, sha256, re-checked on every call), every answer with its calls and their raw output, the answer's
 `identity_match` and `audit` (each call re-checked against its raw output by its backend's parser), and an
 `eligibility` status: 'eligible' only when every answer was given by the requested model, every call is verified
-against its raw output and the CLI never changed. Scores are kept per category (`categories`), with valid-answer
+against its raw output and the CLI never changed.
+`verify_answer` re-derives an answer from its record alone (the spot rebuilt from its id, every call re-parsed
+from its raw output, every refusal and the accepted reply replayed against the engine position): readers use it
+instead of the stored labels. Attestation follows the matches' policy: 'attested' | 'unattested' | 'mismatch' |
+'none'; a mismatch is never eligible, an unattested answer only from a backend the run allows (`allow_unattested`,
+default ratings.ALLOW_UNATTESTED, as for matches). Scores are kept per category (`categories`), with valid-answer
 accuracy apart from fallbacks; the top-level score is the basics'. The quiz is reported apart from match
 results, as "poker fundamentals".
 """
@@ -59,7 +66,7 @@ from .games import get_game, ranges
 from .games.base import Request
 from .cards import DECK, VALUE, evaluate
 
-VERSION = 'quiz-2'
+VERSION = 'quiz-3'
 SIMS = 40000
 MIN_GAP_BB = 1.0
 MIN_EQUITY_GAP = 0.04
@@ -67,7 +74,8 @@ CLOSE_GAP = (0.2, 1.0)        # close spots: the best option beats the other by 
 HARD_GAP_BB = (0.5, 10.0)     # multistreet, inference, sizing: the best option beats the next by 0.5 to 10 bb
 INFERENCE_EQUITY_GAP = (0.03, 0.3)   # inference: the equity is 3 to 30 points from the price (the line matters)
 PER_CATEGORY = 24
-MAX_SHARE = 0.5
+MAX_SHARE = 0.5               # quiz-2 only: the cap on one best answer per category
+QUOTA_VERSIONS = {'quiz-2'}
 GENERATOR_SEED = 7001
 FLOP = [('button', 'raise', 6), ('bb', 'call', None)]   # a 3 bb open, called: 6 bb in the pot on the flop
 
@@ -500,34 +508,65 @@ def _candidate(cat: str, rng: random.Random, i: int) -> dict:
 
 
 _GENERATED: dict = {}
+_STREAMS: dict = {}
+MAX_CANDIDATES = 5000
 
 
-def generated(cat: str) -> list[dict]:
+def candidate(cat: str, i: int) -> dict:
+    """Candidate i of a category's seeded stream (the same in every quiz version)."""
+    rng, made = _STREAMS.setdefault(cat, (random.Random(f'{GENERATOR_SEED}:{cat}'), []))
+    while len(made) <= i:
+        made.append(_candidate(cat, rng, len(made)))
+    return made[i]
+
+
+def _accepted(d: dict) -> dict | None:
+    try:
+        s = solve(d)
+    except ValueError:
+        return None
+    return s if s['clear_cut'] else None
+
+
+def generated(cat: str, version: str = VERSION) -> list[dict]:
     """The category's spots: candidates from its own seeded stream, kept while they solve and pass the
-    category's margin, until PER_CATEGORY (no answer best in more than MAX_SHARE of them)."""
-    if cat not in _GENERATED:
-        rng = random.Random(f'{GENERATOR_SEED}:{cat}')
+    category's margin, until PER_CATEGORY; in a QUOTA_VERSIONS quiz also no answer best in more than MAX_SHARE."""
+    quota = version in QUOTA_VERSIONS
+    key = (cat, quota)
+    if key not in _GENERATED:
         kept, best, i = [], {}, 0
-        while len(kept) < PER_CATEGORY and i < 5000:
-            d = _candidate(cat, rng, i)
+        while len(kept) < PER_CATEGORY and i < MAX_CANDIDATES:
+            d = candidate(cat, i)
             i += 1
-            try:
-                s = _solve(d)
-            except ValueError:
-                continue
-            if not s['clear_cut'] or best.get(s['correct'], 0) >= MAX_SHARE * PER_CATEGORY:
+            s = _accepted(d)
+            if s is None or (quota and best.get(s['correct'], 0) >= MAX_SHARE * PER_CATEGORY):
                 continue
             best[s['correct']] = best.get(s['correct'], 0) + 1
-            _SOLVED[d['id']] = s
             kept.append(d)
-        _GENERATED[cat] = kept
-    return _GENERATED[cat]
+        _GENERATED[key] = kept
+    return _GENERATED[key]
 
 
-def suite(categories=None) -> list[dict]:
+def suite(categories=None, version: str = VERSION) -> list[dict]:
     """Every spot definition, basics first, in category order."""
     cats = [c for c in CATEGORIES if not categories or c in categories]
-    return [d for c in cats for d in ([_basic(t) for t in SPOTS] if c == 'basics' else generated(c))]
+    return [d for c in cats for d in ([_basic(t) for t in SPOTS] if c == 'basics' else generated(c, version))]
+
+
+def spot_def(sid) -> dict | None:
+    """The definition a spot id names: a basics spot, or candidate i of a generated category ('<cat>-<i>')."""
+    for t in SPOTS:
+        if t[0] == sid:
+            return _basic(t)
+    m = re.fullmatch(r'([a-z]+)-(\d{3,})', str(sid))
+    if not m or m.group(1) not in CATEGORIES or m.group(1) == 'basics' or int(m.group(2)) >= MAX_CANDIDATES:
+        return None
+    return candidate(m.group(1), int(m.group(2)))
+
+
+def spot_sha(spot: dict) -> str:
+    """Names a solved spot's content: what an answer is bound to."""
+    return hashlib.sha256(json.dumps(spot, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
 def spots(categories=None) -> list[dict]:
@@ -643,15 +682,7 @@ def _answer_audit(spec: dict, calls: list) -> tuple[str, str, list]:
     return ident, audit, problems
 
 
-async def ask(pid: str, spec: dict, spot_def, seed: int = 0) -> dict:
-    """One answer: the player's reply to one spot, in a fresh conversation, with every call's raw output."""
-    from .agents import make_agent
-    from .backends import BackendError
-    spot = solve(spot_def)
-    ep, hero, _, _ = build(spot_def)
-    agent = make_agent(pid, spec, seed=seed)
-    agent.start(SYSTEM, get_game('holdem')().response_schema())
-
+def _validator(spot: dict, ep, hero):
     def validate(action):
         option, err = _executed(ep, hero, action)
         if err:
@@ -661,6 +692,102 @@ async def ask(pid: str, spec: dict, spot_def, seed: int = 0) -> dict:
                     f'{" or ".join(spot["options"])}' + (' (a bet is "raise" with that "amount")'
                                                           if spot['kind'] == 'sizing' else '') + '.')
         return None
+    return validate
+
+
+def _loss(spot: dict, option, fallback: bool) -> float:
+    ev = spot['ev_bb']
+    return round(max(ev.values()) - (min(ev.values()) if fallback else ev.get(option, min(ev.values()))), 3)
+
+
+def attestation(identity_match: str) -> str:
+    """The matches' terms (runner.eligibility `identity`) for an identity_match."""
+    return {'match': 'attested', 'mismatch': 'mismatch', 'none': 'none', 'bot': 'bot'}.get(identity_match, 'unattested')
+
+
+def verify_answer(answer: dict, spec: dict, effective: dict | None = None, spot: dict | None = None) -> dict:
+    """An answer re-derived from its record alone, without trusting its labels: the spot rebuilt from its id (and
+    checked against `spot`, the copy a quiz.json keeps, and the answer's `spot_sha`), every call re-checked against
+    its raw output by its backend (`_answer_audit`), every refused reply re-applied to the engine position (it must
+    be refused with the recorded error) and the accepted one (the last call, its JSON parsed from the output) played
+    there; the option it amounts to, whether that is the computed best, the outcome and the loss must be what the
+    answer records. {status: 'verified' | 'opaque' | 'inconsistent' | 'unverifiable' | 'unverified' | 'no_reply' |
+    'bot', identity_match, attestation, problems, answer: the verified representation (spot, spot_sha, category,
+    executed, correct, outcome, fallback, ev_loss_bb), or None unless status is 'verified' or 'opaque'}."""
+    from .agents import ModelAgent, parse_json
+    bad = []
+    sid = answer.get('spot')
+    d = spot_def(sid)
+    solved = _accepted(d) if d else None
+    if solved is None:
+        return {'status': 'inconsistent', 'identity_match': answer.get('identity_match'),
+                'attestation': attestation(answer.get('identity_match')), 'answer': None,
+                'problems': [f'{sid!r} names no spot of this quiz']}
+    sha = spot_sha(solved)
+    if spot is not None and spot_sha(spot) != sha:
+        bad.append(f'{sid}: the recorded spot is not the one its id names')
+    if answer.get('spot_sha') not in (None, sha):
+        bad.append(f'{sid}: answered a spot with another content ({answer.get("spot_sha")})')
+    if answer.get('category') != solved['category']:
+        bad.append(f'{sid}: recorded under {answer.get("category")!r}, the spot is {solved["category"]!r}')
+    calls = answer.get('calls') or []
+    if 'bot' in spec:
+        ident, audit, problems = 'bot', 'bot', []
+    else:
+        ident, audit, problems = _answer_audit(spec, calls)
+    ep, hero, _, _ = build(d)
+    validate = _validator(solved, ep, hero)
+    words = (effective or {}).get('max_say_words', spec.get('max_say_words', 40))
+    accepted = None
+    for k, c in enumerate(calls):
+        if c.get('backend_failed') or c.get('rejected') in ('tool_use', 'unverified'):
+            continue
+        obj = parse_json(c.get('output') or '')
+        if obj is not None:
+            obj['say'] = ModelAgent._cap(obj.get('say'), words)
+        err = 'Your reply was not a JSON object.' if obj is None else validate(obj)
+        if c.get('error'):
+            if err != c['error']:
+                bad.append(f'attempt {c.get("attempt")}: refused with {c["error"]!r}, but the engine '
+                           + ('accepts it' if err is None else f'says {err!r}'))
+        elif err:
+            bad.append(f'attempt {c.get("attempt")}: recorded as accepted, but the engine says {err!r}')
+        elif k != len(calls) - 1:
+            bad.append(f'attempt {c.get("attempt")}: a playable reply was followed by another call')
+        else:
+            accepted = obj
+    if 'bot' in spec:
+        req = answer.get('requested')
+        accepted = req if isinstance(req, dict) and not validate(dict(req)) else None
+    fallback = accepted is None
+    option, _ = _executed(ep, hero, ep.fallback(hero) if fallback else accepted)
+    failed = bool(calls) and bool(calls[-1].get('backend_failed'))
+    want = {'executed': option, 'correct': not fallback and option == solved['correct'],
+            'outcome': 'error' if failed else 'fallback' if fallback else 'valid', 'fallback': fallback,
+            'ev_loss_bb': _loss(solved, option, fallback)}
+    if 'bot' not in spec:
+        want['requested'] = None if accepted is None else {'action': accepted.get('action'),
+                                                           'amount': accepted.get('amount')}
+    for key, val in want.items():
+        if json.loads(json.dumps(answer.get(key))) != json.loads(json.dumps(val)):
+            bad.append(f'{sid}: records {key}={answer.get(key)!r}, its replies give {val!r}')
+    if bad and audit not in ('unverifiable', 'no_reply'):
+        audit = 'inconsistent'
+    good = audit in ('verified', 'opaque', 'bot')
+    return {'status': audit, 'identity_match': ident, 'attestation': attestation(ident), 'problems': problems + bad,
+            'answer': {'spot': sid, 'spot_sha': sha, 'category': solved['category'], **want} if good else None}
+
+
+async def ask(pid: str, spec: dict, definition, seed: int = 0) -> dict:
+    """One answer: the player's reply to one spot, in a fresh conversation, with every call's raw output. Its
+    `audit` and `identity_match` are `verify_answer`'s of the finished record."""
+    from .agents import make_agent
+    from .backends import BackendError
+    spot = solve(definition)
+    ep, hero, _, _ = build(definition)
+    agent = make_agent(pid, spec, seed=seed)
+    agent.start(SYSTEM, get_game('holdem')().response_schema())
+    validate = _validator(spot, ep, hero)
 
     req = ep.request(hero)
     req = Request(question(spot, ep, hero), [o for o in req.legal if o in spot['options'] or
@@ -676,18 +803,19 @@ async def ask(pid: str, spec: dict, spot_def, seed: int = 0) -> dict:
     fallback = d.fallback or bool(validate(d.action))
     action = ep.fallback(hero) if fallback else d.action
     option, _ = _executed(ep, hero, action)
-    ev = spot['ev_bb']
-    loss = round(max(ev.values()) - (min(ev.values()) if fallback else ev.get(option, min(ev.values()))), 3)
-    ident, audit, problems = _answer_audit(spec, d.calls)
+    loss = _loss(spot, option, fallback)
     say = str(d.action.get('say') or '') if d.action else ''
-    return {'spot': spot['id'], 'category': spot['category'],
-            'requested': {'action': d.action.get('action'), 'amount': d.action.get('amount')} if d.action else None,
-            'executed': option, 'action': option, 'correct': not fallback and option == spot['correct'],
-            'outcome': 'error' if error else 'fallback' if fallback else 'valid',
-            'ev_loss_bb': loss, 'ev_lost_bb': loss, 'say': say, 'fallback': fallback, 'reasoning': d.reasoning,
-            'errors': d.errors + ([{'error': error, 'kind': 'backend'}] if error else []),
-            'seconds': round(time.time() - t, 1), 'identity_match': ident, 'audit': audit,
-            'audit_problems': problems, 'calls': d.calls}
+    answer = {'spot': spot['id'], 'spot_sha': spot_sha(spot), 'category': spot['category'],
+              'requested': {'action': d.action.get('action'), 'amount': d.action.get('amount')} if d.action else None,
+              'executed': option, 'action': option, 'correct': not fallback and option == spot['correct'],
+              'outcome': 'error' if error else 'fallback' if fallback else 'valid',
+              'ev_loss_bb': loss, 'ev_lost_bb': loss, 'say': say, 'fallback': fallback, 'reasoning': d.reasoning,
+              'errors': d.errors + ([{'error': error, 'kind': 'backend'}] if error else []),
+              'seconds': round(time.time() - t, 1), 'calls': d.calls,
+              'accepted_attempt': None if fallback or not d.calls else d.calls[-1].get('attempt')}
+    v = verify_answer(answer, spec, agent.describe(), spot)
+    return {**answer, 'identity_match': v['identity_match'], 'attestation': v['attestation'], 'audit': v['status'],
+            'audit_problems': v['problems']}
 
 
 def score(answers: list[dict]) -> dict:
@@ -723,20 +851,33 @@ def implementation() -> dict:
     return out
 
 
-def eligibility(kind: str, answers: list[dict], cli_start: dict | None) -> dict:
-    """'eligible' only when every answer is a model's, from the requested model, every call verified against its
-    raw output, and the CLI the same file on every call; 'bot' for bots; else 'ineligible' with the reasons."""
+def eligibility(kind: str, answers: list[dict], cli_start: dict | None, backend: str | None = None,
+                allow_unattested=None) -> dict:
+    """The matches' policy: 'eligible' only when every answer is a model's, none answered by another model, every
+    one attested as the requested model (or unattested from a backend in `allow_unattested`), every call verified
+    against its raw output, and the CLI the same file on every call; 'bot' for bots; else 'ineligible' with the
+    reasons. `attestation` 'attested' | 'unattested' | 'mismatch' | 'none'."""
     from .backends import artifact_changed
+    from .ratings import ALLOW_UNATTESTED
+    policy = {'allow_unattested': sorted(ALLOW_UNATTESTED if allow_unattested is None else allow_unattested)}
     if kind == 'bot':
-        return {'status': 'bot', 'reasons': [], 'identity_match': 'bot', 'audit': 'bot'}
+        return {'status': 'bot', 'reasons': [], 'identity_match': 'bot', 'audit': 'bot', 'attestation': 'bot',
+                'policy': policy}
     reasons = []
     idents = {a['identity_match'] for a in answers}
     audits = {a['audit'] for a in answers}
-    ident = 'mismatch' if 'mismatch' in idents else 'match' if idents == {'match'} else 'unattested'
+    ident = ('none' if not answers else 'mismatch' if 'mismatch' in idents else 'match' if idents == {'match'}
+             else 'unattested')
     audit = 'verified' if audits == {'verified'} else 'opaque' if audits <= {'verified', 'opaque'} else 'incomplete'
-    if ident != 'match':
+    if ident == 'mismatch':
+        n = sum(a['identity_match'] == 'mismatch' for a in answers)
+        reasons.append(f'{n} answer(s) given by another model than the requested one')
+    elif ident == 'none':
+        reasons.append('no answers')
+    elif ident == 'unattested' and backend not in policy['allow_unattested']:
         n = sum(a['identity_match'] != 'match' for a in answers)
-        reasons.append(f'{n} answer(s) not attested as the requested model ({", ".join(sorted(idents - {"match"}))})')
+        reasons.append(f'{n} answer(s) not attested as the requested model ({", ".join(sorted(idents - {"match"}))}), '
+                       f'and unattested {backend} is not allowed')
     if audit != 'verified':
         n = sum(a['audit'] != 'verified' for a in answers)
         reasons.append(f'{n} answer(s) not verified against their raw output ({", ".join(sorted(audits - {"verified"}))})')
@@ -745,17 +886,19 @@ def eligibility(kind: str, answers: list[dict], cli_start: dict | None) -> dict:
     if moved:
         reasons.append(f'the CLI changed during the quiz (now {", ".join(moved)})')
     return {'status': 'ineligible' if reasons else 'eligible', 'reasons': reasons, 'identity_match': ident,
-            'audit': audit}
+            'audit': audit, 'attestation': attestation(ident), 'policy': policy}
 
 
 async def run_quiz(players: dict, ids: list[str], out, *, limit: int | None = None, categories=None,
-                   concurrency: int = 4, log=print) -> dict:
+                   concurrency: int = 4, log=print, allow_unattested=None) -> dict:
     """Ask every player in `ids` every spot of the chosen categories (the first `limit` of each), each in its own
     conversation, and write <out>/quiz.json (existing players' results are kept, a player asked again is
-    replaced)."""
+    replaced; a quiz.json of other spots is kept whole under `superseded`)."""
     from .agents import make_agent
     from .backends import backend_exe, cli_artifact
     from .runner import _public, _write
+    from .ratings import ALLOW_UNATTESTED
+    allow_unattested = tuple(ALLOW_UNATTESTED if allow_unattested is None else allow_unattested)
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     unknown = [c for c in categories or [] if c not in CATEGORIES]
@@ -767,7 +910,8 @@ async def run_quiz(players: dict, ids: list[str], out, *, limit: int | None = No
     path = out / 'quiz.json'
     doc = json.loads(path.read_text()) if path.exists() else {}
     if doc.get('spots_hash') not in (None, spots_hash()):
-        doc = {'replaced': {'version': doc.get('version'), 'spots_hash': doc.get('spots_hash')}}
+        doc = {'replaced': {'version': doc.get('version'), 'spots_hash': doc.get('spots_hash')},
+               'superseded': doc.get('superseded', []) + [{k: v for k, v in doc.items() if k != 'superseded'}]}
     counts = {c: sum(s['category'] == c for s in every) for c in CATEGORIES}
     doc.update(version=VERSION, suite={'name': 'Poker fundamentals', 'version': VERSION}, spots_hash=spots_hash(),
                label='poker fundamentals',
@@ -778,14 +922,22 @@ async def run_quiz(players: dict, ids: list[str], out, *, limit: int | None = No
                       f'equity {INFERENCE_EQUITY_GAP[0]:g} to {INFERENCE_EQUITY_GAP[1]:g} from the price)',
                categories={c: {**meta, 'spots': counts[c],
                                **({'generator': {'seed': GENERATOR_SEED, 'per_category': PER_CATEGORY,
-                                                 'max_share_of_one_answer': MAX_SHARE}} if meta['population'] else {})}
+                                                 'max_share_of_one_answer': None},
+                                   'sampling': {'design': 'independent', 'quota': None,
+                                                'about': 'consecutive accepted draws of the category\'s seeded '
+                                                         'generator; no answer quota or other filter'}}
+                                  if meta['population'] else
+                                  {'sampling': {'design': 'fixed', 'quota': None,
+                                                'about': 'a hand-picked set: descriptive counts only'}})}
                            for c, meta in CATEGORIES.items()},
                protocol={'version': VERSION, 'system_prompt_sha1': hashlib.sha1(SYSTEM.encode()).hexdigest()[:12],
                          'conversation': 'a fresh one per spot', 'scoring': 'per category; the top-level score is '
                          'the basics\'; a fallback (no playable answer after the retries) or a backend failure is '
                          'never correct and its loss is the worst option\'s; valid-answer accuracy is reported apart',
-                         'eligibility': 'every answer from the requested model, every call verified against its raw '
-                                        'output, the CLI unchanged'},
+                         'eligibility': 'the matches\' attestation policy: no answer from another model, every '
+                                        'answer attested (or unattested from an allowed backend), every answer '
+                                        're-derived from its raw output (verify_answer), the CLI unchanged',
+                         'allow_unattested': sorted(allow_unattested)},
                implementation=implementation(), spots=every)
     doc.setdefault('players', {})
     sem = asyncio.Semaphore(concurrency)
@@ -810,13 +962,14 @@ async def run_quiz(players: dict, ids: list[str], out, *, limit: int | None = No
         by_cat = {c: score([a for a in answers if a['category'] == c]) for c in CATEGORIES
                   if any(a['category'] == c for a in answers)}
         head = [a for a in answers if a['category'] == 'basics'] or answers
-        elig = eligibility(kind, answers, cli)
+        elig = eligibility(kind, answers, cli, spec.get('backend'), allow_unattested)
         doc['players'][pid] = {'spec': _public(spec), 'effective': agent.describe(), 'kind': kind,
                                'started': started, 'finished': round(time.time()), **score(head),
                                'scored_category': 'basics' if 'basics' in by_cat else 'all',
                                'categories': by_cat, 'protocol': protocol(agent), 'implementation': doc['implementation'],
                                'cli': cli, 'cli_version': (cli or {}).get('version'),
                                'identity_match': elig['identity_match'], 'audit_status': elig['audit'],
+                               'attestation': elig['attestation'],
                                'eligibility': elig, 'answers': answers}
         _write(path, doc, indent=2)
     return doc
@@ -830,7 +983,7 @@ def main(args):
         raise SystemExit(f'not in {args.players}: {", ".join(missing)}')
     out = Path(args.out) if '/' in str(args.out) else Path('runs') / args.out
     doc = asyncio.run(run_quiz(players, args.ids, out, limit=args.limit, categories=args.category,
-                               concurrency=args.concurrency))
+                               concurrency=args.concurrency, allow_unattested=args.allow_unattested))
     for pid in args.ids:
         r = doc['players'][pid]
         cats = ', '.join(f'{c} {x["correct"]}/{x["answered"]}' for c, x in r['categories'].items())

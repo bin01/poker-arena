@@ -74,8 +74,14 @@ class TestSpots(unittest.TestCase):
             spots = [s for s in every if s['category'] == cat]
             self.assertEqual(len(spots), quiz.PER_CATEGORY, cat)
             best = Counter(s['correct'] for s in spots)
-            self.assertLessEqual(max(best.values()), quiz.MAX_SHARE * quiz.PER_CATEGORY, cat)
             self.assertGreaterEqual(len(best), 2, cat)
+            ids = [d['id'] for d in quiz.suite([cat])]          # no quota: the first accepted draws, in order
+            first = [d['id'] for d in (quiz.candidate(cat, i) for i in range(int(ids[-1].split('-')[1]) + 1))
+                     if quiz._accepted(d)]
+            self.assertEqual(ids, first, cat)
+            old = Counter(quiz.solve(d)['correct'] for d in quiz.suite([cat], version='quiz-2'))
+            self.assertLessEqual(max(old.values()), quiz.MAX_SHARE * quiz.PER_CATEGORY, cat)
+            self.assertTrue(all(quiz.spot_def(d['id']) == d for d in quiz.suite([cat], version='quiz-2')))
             for s in spots:
                 lo, hi = quiz.CLOSE_GAP if cat == 'close' else quiz.HARD_GAP_BB
                 self.assertTrue(lo <= s['gap_bb'] <= hi, s['id'])
@@ -239,7 +245,10 @@ class TestAnswers(unittest.TestCase):
         self.assertEqual((a['outcome'], a['identity_match'], a['audit']), ('valid', 'match', 'verified'))
         self.assertIn('synthetic', a['calls'][0]['raw'])                 # the raw output stays with the answer
         self.assertEqual(o['eligibility'], {'status': 'eligible', 'reasons': [], 'identity_match': 'match',
-                                            'audit': 'verified'})
+                                            'audit': 'verified', 'attestation': 'attested',
+                                            'policy': {'allow_unattested': ['codex']}})
+        self.assertEqual(doc['categories']['close']['sampling']['design'], 'independent')
+        self.assertEqual(doc['categories']['basics']['sampling']['design'], 'fixed')
         self.assertEqual(len(o['protocol']['fingerprint']), 16)
         self.assertEqual(o['implementation']['fingerprint'], doc['implementation']['fingerprint'])
         self.assertIn('quiz', doc['implementation'])
@@ -282,6 +291,74 @@ class TestAnswers(unittest.TestCase):
         self.assertEqual(doc['players']['folder']['answered'], 2)
         self.assertEqual(doc['players']['oracle']['answered'], n)
         self.assertEqual(len(doc['spots']), len(quiz.spots()))
+
+    def test_answers_are_rederived_from_their_record(self):
+        Oracle.WRONG = {'river-call-bluffcatcher'}
+        players = {'oracle': {'backend': 'oracle', 'model': 'o-1'}, 'station': {'bot': 'station'}}
+        doc = asyncio.run(quiz.run_quiz(players, ['oracle', 'station'], self.out, categories=['basics'],
+                                        log=lambda *a: None))
+        spots = {s['id']: s for s in doc['spots']}
+        for pid in players:
+            r = doc['players'][pid]
+            for a in r['answers']:
+                v = quiz.verify_answer(a, players[pid], r['effective'], spots[a['spot']])
+                self.assertEqual((v['status'], v['problems']), (a['audit'], []), (pid, a['spot']))
+                self.assertEqual({k: a[k] for k in v['answer']}, v['answer'])
+        o = doc['players']['oracle']
+        a = next(x for x in o['answers'] if x['spot'] == 'river-call-bluffcatcher')
+        spec, eff = players['oracle'], o['effective']
+
+        def doctored(answer, k, fn):
+            calls = [dict(c) for c in answer['calls']]
+            out = json.dumps(fn(json.loads(calls[k]['output'])))
+            calls[k] = {**calls[k], 'output': out, 'raw': {**calls[k]['raw'],
+                                                           'synthetic': {**calls[k]['raw']['synthetic'], 'text': out}}}
+            return {**answer, 'calls': calls}
+        other = 'fold' if a['executed'] != 'fold' else 'call'
+        v = quiz.verify_answer(doctored(a, 1, lambda r: {**r, 'action': other}), spec, eff)
+        self.assertEqual(v['status'], 'inconsistent')               # the reply says another option than was scored
+        self.assertIsNone(v['answer'])
+        v = quiz.verify_answer(doctored(a, 0, lambda r: {**r, 'action': a['executed'], 'amount': None}), spec, eff)
+        self.assertEqual(v['status'], 'inconsistent')               # a playable reply recorded as refused
+        self.assertTrue(any('refused' in p for p in v['problems']))
+        other_spot = next(s for s in doc['spots'] if s['id'] != a['spot'] and s['correct'] != a['executed'])
+        for bad in ({**a, 'spot': other_spot['id']}, {**a, 'category': 'close'}, {**a, 'spot_sha': 'x'},
+                    {**a, 'correct': not a['correct']}, {**a, 'ev_loss_bb': 9.0}):
+            self.assertEqual(quiz.verify_answer(bad, spec, eff)['status'], 'inconsistent')
+        self.assertEqual(quiz.verify_answer(a, spec, eff, other_spot)['status'], 'inconsistent')
+        self.assertEqual(quiz.verify_answer({**a, 'spot': 'close-9999'}, spec, eff)['status'], 'inconsistent')
+        nul = {**a, 'calls': [dict(c, raw=None) for c in a['calls']]}
+        self.assertEqual(quiz.verify_answer(nul, spec, eff)['status'], 'unverifiable')
+        legacy = {k: v for k, v in a.items() if k not in ('spot_sha', 'accepted_attempt')}   # a quiz-2 answer
+        self.assertEqual(quiz.verify_answer(legacy, spec, eff)['status'], 'verified')
+
+    def test_one_attestation_policy(self):
+        players = {'folder': {'backend': 'folder'}}
+        doc = asyncio.run(quiz.run_quiz(players, ['folder'], self.out, categories=['basics'], limit=2,
+                                        log=lambda *a: None))
+        e = doc['players']['folder']['eligibility']
+        self.assertEqual((e['status'], e['attestation']), ('ineligible', 'unattested'))
+        doc = asyncio.run(quiz.run_quiz(players, ['folder'], self.out, categories=['basics'], limit=2,
+                                        log=lambda *a: None, allow_unattested=['folder']))
+        e = doc['players']['folder']['eligibility']
+        self.assertEqual((e['status'], e['attestation'], e['policy']),
+                         ('eligible', 'unattested', {'allow_unattested': ['folder']}))
+        self.assertEqual(doc['protocol']['allow_unattested'], ['folder'])
+        self.assertEqual(quiz.eligibility('model', [], None, 'codex')['policy'], {'allow_unattested': ['codex']})
+        Oracle.ANSWER = 'other-9'
+        doc = asyncio.run(quiz.run_quiz({'o': {'backend': 'oracle', 'model': 'o-1'}}, ['o'], self.out,
+                                        categories=['basics'], limit=1, log=lambda *a: None, allow_unattested=['oracle']))
+        self.assertEqual(doc['players']['o']['eligibility']['attestation'], 'mismatch')
+        self.assertEqual(doc['players']['o']['eligibility']['status'], 'ineligible')   # a mismatch never passes
+
+    def test_a_quiz_of_other_spots_is_kept(self):
+        self.out.mkdir(parents=True)
+        (self.out / 'quiz.json').write_text(json.dumps({'version': 'quiz-2', 'spots_hash': 'old',
+                                                        'players': {'x': {'answered': 1}}}))
+        doc = asyncio.run(quiz.run_quiz({'station': {'bot': 'station'}}, ['station'], self.out,
+                                        categories=['basics'], limit=1, log=lambda *a: None))
+        self.assertEqual(doc['superseded'][0]['players'], {'x': {'answered': 1}})
+        self.assertEqual(set(doc['players']), {'station'})
 
     def test_provenance_fails_closed(self):
         players = {'oracle': {'backend': 'oracle', 'model': 'o-1'}}

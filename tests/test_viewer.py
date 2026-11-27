@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -187,6 +188,7 @@ class TestViewerData(unittest.TestCase):
         try:
             q = server.quiz(self.runs, 'pilot')
             self.assertTrue(q['fixture'])
+            self.assertEqual(q.get('verified_by'), 'judge')                     # the judge's representation, not the stored file
             self.assertEqual(q['labels']['reference'], 'Reference bot')
             self.assertEqual(q['labels']['rule'], 'Rule bot')                  # names from the run fill in the rest
             self.assertTrue(server.runs(self.runs)[0]['quiz'])
@@ -304,6 +306,106 @@ class TestViewerData(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError):
             urllib.request.urlopen(base + '/api/match?id=../x')
 
+
+
+class TestPairing(unittest.TestCase):
+    """One-deal conversations (the official track's shape): the pairing's deals in order, verified totals, and
+    an inventory that reads each conversation once."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.tmp.name).resolve()
+        players = cls.root / 'players.toml'
+        players.write_text('[players.rule]\nbot = "rule"\nsims = 40\n[players.station]\nbot = "station"\n')
+        plan = make_plan(['rule', 'station'], deals=1, out=str(cls.root / 'runs' / 'one'), players_file=str(players),
+                         design={'max_rounds': 2, 'min_conversations': 100}, replicates=3)
+        asyncio.run(run_plan(plan, log=lambda *a: None))
+        cls.runs = cls.root / 'runs'
+        (cls.runs / 'other' / 'x__vs__y' / 'a-first').mkdir(parents=True)
+        (cls.runs / 'other' / 'x__vs__y' / 'a-first' / 'config.json').write_text('{"players": ["x", "y"], "seeds": [1]}')
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_pairing_in_playing_order(self):
+        pr = server.pairing(self.runs, 'one', 'rule', 'station')
+        convs = pr['conversations']
+        self.assertEqual(len(convs), 6)                   # 2 rounds x 3 replicates, one deal each
+        self.assertEqual([(c['round'], c['replicate']) for c in convs], sorted((c['round'], c['replicate']) for c in convs))
+        self.assertTrue(all(len(c['deals']) == 1 and c['deals'][0][2] == 'verified' for c in convs))
+        self.assertEqual(pr['totals']['verified'], 6)
+        self.assertAlmostEqual(pr['totals']['net_bb'], sum(c['deals'][0][1] for c in convs), places=6)
+        flipped = server.pairing(self.runs, 'one', 'station', 'rule')
+        self.assertAlmostEqual(flipped['totals']['net_bb'], -pr['totals']['net_bb'], places=6)
+        self.assertIsNone(server.pairing(self.runs, '../..', 'rule', 'station'))
+        mt = server.match(self.runs, convs[0]['id'] + '/a-first')
+        self.assertEqual((mt['status'], mt['checked']), ({'0': 'verified'}, True))
+
+    def test_rejected_deal_counts_nowhere(self):
+        with tempfile.TemporaryDirectory() as d:
+            runs = Path(d).resolve()
+            shutil.copytree(self.runs / 'one', runs / 'one')
+            convs = server.pairing(runs, 'one', 'rule', 'station')['conversations']
+            hands = runs / convs[0]['id'] / 'b-first' / 'hands.jsonl'
+            rows = [json.loads(x) for x in hands.read_text().splitlines()]
+            rows[0]['net'] = [x + 7 for x in rows[0]['net']]                 # chips that no longer add up
+            hands.write_text(''.join(json.dumps(x) + '\n' for x in rows))
+            pr = server.pairing(runs, 'one', 'rule', 'station')
+            self.assertEqual(pr['conversations'][0]['deals'][0][2], 'rejected')
+            self.assertIsNone(pr['conversations'][0]['deals'][0][1])
+            self.assertEqual((pr['totals']['verified'], pr['totals']['rejected']), (5, 1))
+            self.assertAlmostEqual(pr['totals']['net_bb'], sum(c['deals'][0][1] for c in pr['conversations'][1:]), places=6)
+            self.assertTrue(pr['conversations'][0]['rejected'])
+
+    def test_inventory_reads_each_conversation_once(self):
+        reads = []
+        real = server.Inventory._read
+        def counting(root, m):
+            reads.append(m)
+            return real(root, m)
+        with tempfile.TemporaryDirectory() as d:
+            runs = Path(d).resolve()
+            shutil.copytree(self.runs, runs, dirs_exist_ok=True)
+            orig, server.Inventory._read = server.Inventory.__dict__['_read'], staticmethod(counting)
+            try:
+                ms = server.index(runs, 'one')
+                self.assertTrue(reads and all('other' not in m.parts for m in reads))   # the index reads its own run only
+                n = len(reads)
+                server.index(runs, 'one')
+                server.runs(runs)
+                self.assertEqual(len([m for m in reads[n:] if 'one' in m.parts]), 0)      # nothing changed: nothing read again
+                hands = runs / ms[0]['id'] / 'a-first' / 'hands.jsonl'
+                hands.write_text(hands.read_text() + '\n')
+                server.index(runs, 'one')
+                self.assertEqual(reads[-1], runs / ms[0]['id'])
+            finally:
+                server.Inventory._read = orig
+        m = ms[0]
+        self.assertFalse([k for k in m if k.startswith('_')])
+        self.assertEqual(set(m['matches'][0]), set(server.MATCH_KEYS))
+
+    def test_http_and_export(self):
+        import socket
+        with socket.socket() as s:
+            s.bind(('127.0.0.1', 0))
+            port = s.getsockname()[1]
+        threading.Thread(target=server.serve, args=(self.runs, port), daemon=True).start()
+        base = f'http://127.0.0.1:{port}'
+        for _ in range(50):
+            try:
+                urllib.request.urlopen(base + '/api/runs')
+                break
+            except OSError:
+                time.sleep(0.05)
+        pr = json.loads(urllib.request.urlopen(base + '/api/pairing?p=' + urllib.parse.quote('one|rule|station')).read())
+        self.assertEqual(len(pr['conversations']), 6)
+        with self.assertRaises(urllib.error.HTTPError):
+            urllib.request.urlopen(base + '/api/pairing?p=one|rule')
+        with tempfile.TemporaryDirectory() as d:
+            server.export(self.runs, d)
+            self.assertTrue((Path(d) / 'data' / f"pairing-{server.key('one|rule|station')}.json").exists())
 
 
 class TestHistory(unittest.TestCase):
@@ -731,7 +833,7 @@ class TestViewerLogic(unittest.TestCase):
         self.assertEqual([p[0] for p in r[2]], ['reference', 'rule', 'station', 'random'])
         self.assertAlmostEqual(r[2][1][3], 0.8)
         alt = r[3]
-        self.assertEqual((alt['spots'][0]['best'], alt['players'][0]['correct'], alt['players'][0]['ev_lost_bb'], alt['players'][0]['score']), ('fold', 0, 2, 0.5))
+        self.assertEqual((alt['spots'][0]['best'], alt['players'][0]['correct'], alt['players'][0]['ev_lost_bb'], alt['players'][0]['score']), ('fold', 0, 2, 0))   # the score is the counts' own
         self.assertIsNone(r[4])
 
     def test_quiz_fallbacks_categories_provenance(self):
@@ -747,13 +849,52 @@ class TestViewerLogic(unittest.TestCase):
                         ' return [m.correct, m.score, m.valid, m.fallbacks, m.valid_accuracy, m.by_category, m.answers.s3.correct, m.provenance,'
                         ' q.categories, q.players.find(p => p.player === "b").provenance.status, Core.quizOf({players: {x: {answers: []}}}).players[0].provenance.status];')
         self.assertEqual(r[:5], [2, 2 / 3, 2, 1, 1.0])                   # a fallback that happened to be best gets no credit
-        self.assertEqual(r[5], {'pot_odds': {'correct': 1, 'total': 1, 'valid': 1, 'fallbacks': 0},
-                                'sizing': {'correct': 1, 'total': 2, 'valid': 1, 'fallbacks': 1}})
+        self.assertEqual(r[5], {'pot_odds': {'correct': 1, 'total': 1, 'valid': 1, 'fallbacks': 0, 'answered': 1, 'ev_lost_bb': 0},
+                                'sizing': {'correct': 1, 'total': 2, 'valid': 1, 'fallbacks': 1, 'answered': 2, 'ev_lost_bb': 0}})
         self.assertFalse(r[6])
         self.assertEqual((r[7]['status'], r[7]['reasons']), ('ineligible', ['identity mismatch']))
         self.assertIn('CLI 2.1', r[7]['facts'])
         self.assertEqual(r[8], ['pot_odds', 'sizing'])
         self.assertEqual((r[9], r[10]), ('bot', 'unrecorded'))
+
+    def test_quiz_headline_is_one_category(self):
+        # R7-#1: the headline counted right answers in every category over the basics' denominator (122/32)
+        spots = [{'id': f'b{i}', 'category': 'basics', 'correct': 'call'} for i in range(4)] + \
+                [{'id': f'c{i}', 'category': 'close', 'correct': 'fold'} for i in range(3)]
+        answers = [{'spot': f'b{i}', 'action': 'call', 'correct': True, 'ev_lost_bb': 0} for i in range(4)] + \
+                  [{'spot': 'c0', 'action': 'fold', 'correct': True, 'ev_lost_bb': 0}, {'spot': 'c1', 'action': 'call', 'correct': False, 'ev_lost_bb': 2.5},
+                   {'spot': 'c2', 'action': 'fold', 'correct': True, 'fallback': True, 'ev_lost_bb': 1}]
+        raw = {'spots': spots, 'categories': {'basics': {'title': 'Basics'}, 'close': {'title': 'Close calls'}},
+               'players': {'m': {'correct': 4, 'total': 4, 'scored_category': 'basics', 'ev_lost_bb': 0, 'answers': answers}}}
+        r = self.run_js(f'const q = Core.quizOf({json.dumps(raw)}); const m = q.players[0];'
+                        ' return [m.correct, m.total, m.valid, m.fallbacks, m.ev_lost_bb, m.score, m.valid_accuracy, m.others, m.by_category.close, q.scored_category];')
+        self.assertEqual(r[:7], [4, 4, 4, 0, 0, 1, 1])      # every headline figure from the basics only
+        self.assertEqual(r[7], {'correct': 1, 'total': 3, 'fallbacks': 1, 'categories': 1})
+        self.assertEqual((r[8]['correct'], r[8]['total'], r[8]['fallbacks'], r[8]['ev_lost_bb']), (1, 3, 1, 3.5))
+        self.assertEqual(r[9], 'basics')
+        real = Path(__file__).resolve().parents[1] / 'runs' / 'fair-high' / 'quiz.json'
+        if real.exists():                                  # the reviewer's probe, on the real run when it is here
+            r = self.run_js(f'return Core.quizOf(require({json.dumps(str(real))})).players.map(p => [p.correct, p.total, p.correct <= p.total]);')
+            for c, t, ok in r:
+                self.assertTrue(ok, (c, t))
+                self.assertEqual(t, 32)
+
+    def test_deal_sequence_crosses_conversations(self):
+        # R7-#6: auto-next and the arrows walk the pairing's deals, not one conversation's
+        pr = {'a': 'x', 'b': 'y', 'conversations': [
+            {'id': 'r/x__vs__y', 'round': 1, 'replicate': 1, 'deals_total': 1, 'deals': [[0, 2.5, 'verified', 'flop']]},
+            {'id': 'r/x__vs__y__x2', 'round': 1, 'replicate': 2, 'deals_total': 1, 'deals': [[0, -1, 'verified', 'river']]},
+            {'id': 'r/x__vs__y__r2', 'round': 2, 'replicate': 1, 'deals_total': 1, 'deals': [[0, None, 'rejected', None]]},
+            {'id': 'r/x__vs__y__x2__r2', 'round': 2, 'replicate': 2, 'deals_total': 1, 'deals': [[0, 4, 'provisional', 'showdown']]}]}
+        r = self.run_js(f'const s = Core.dealSequence({json.dumps(pr)}, {{"r/x__vs__y__x2__r2": [1]}});'
+                        ' const i = s.findIndex(x => x.id === "r/x__vs__y" && x.deal === 0);'
+                        ' return [s.map(x => [x.id, x.deal, x.status]), s[i + 1].id, Core.sequenceTotals(s), Core.sequenceSwings(s).map(x => x.net)];')
+        self.assertEqual([x[0] for x in r[0]], ['r/x__vs__y', 'r/x__vs__y__x2', 'r/x__vs__y__r2', 'r/x__vs__y__x2__r2', 'r/x__vs__y__x2__r2'])
+        self.assertEqual(r[0][-1], ['r/x__vs__y__x2__r2', 1, 'playing'])
+        self.assertEqual(r[1], 'r/x__vs__y__x2')         # the next deal is in the next conversation
+        t = r[2]
+        self.assertEqual((t['counted'], t['net'], t['won'], t['lost'], t['provisional'], t['rejected'], t['playing']), (2, 1.5, 1, 1, 1, 1, 1))
+        self.assertEqual(r[3], [2.5, -1])                 # swings come from counted deals only
 
     def test_decided_order_first(self):
         ps = [{'player': 'rule', 'rank': 2, 'rank_kind': 'decided', 'strength': 221},
@@ -786,13 +927,30 @@ class TestViewerLogic(unittest.TestCase):
                         ' design: {registered: true}}); const q = rt.pairings[0]; const v = Core.verdict(q);'
                         ' return [q.assumption.status, v.decided, v.secondary && v.secondary.short, v.long, rt.groups[0].leader, rt.groups[0].leader_assumption,'
                         ' Core.testOf({}, {test: "t-test"}).free];')
-        self.assertEqual(r[0], 'free')                 # the official test needs no distribution assumption
+        self.assertEqual(r[0], 'unsupported')          # a failed check stands, whatever the method (R7-#9)
         self.assertTrue(r[1])
         self.assertEqual(r[2], 'Undecided')            # the model-based gate is shown, secondary
-        self.assertIn('independent', r[3])
+        self.assertIn('check it needs failed', r[3])
         self.assertIn('secondary, never decides', r[3])
-        self.assertEqual((r[4], r[5]), ('x', 'free'))  # an assumption-free win makes a decided leader
+        self.assertEqual((r[4], r[5]), (None, 'unsupported'))  # so it makes no decided leader
         self.assertFalse(r[6])
+
+    def test_method_apart_from_evidence(self):
+        base = {'a': 'x', 'b': 'y', 'edge': 80, 'verdict': 'a', 'official_test': {'name': 'betting confidence sequence', 'assumption_free': True}}
+        checks = lambda indep: {'status': 'unsupported' if indep != 'supported' else 'supported', 'checks': {
+            'conversations': {'status': 'supported', 'value': 30, 'limit': 10}, 'independent_deals': {'status': indep, 'value': 2, 'limit': 0}}}
+        cases = [{**base, 'assumptions': checks('supported')}, {**base, 'assumptions': checks('unsupported')},
+                 {**base, 'assumptions': {'status': 'unknown', 'checks': {'conversations': {'status': 'unknown', 'value': 3, 'limit': 10}}}}, base]
+        r = self.run_js(f'const cs = {json.dumps(cases)}; return cs.map(p => {{ const q = Core.normalize({{players: [{{player: "x", strength: 1}}, {{player: "y", strength: -1}}],'
+                        ' pairings: [p], design: {registered: true}}); const a = q.pairings[0].assumption;'
+                        ' return [a.method, a.status, a.failed, a.open, a.label, Core.verdict(q.pairings[0]).qualifier || "", q.groups[0].leader, q.groups[0].qualified_leader]; });')
+        self.assertEqual(r[0][:4], ['free', 'free', [], []])
+        self.assertEqual((r[0][6], r[0][7]), ('x', None))
+        self.assertEqual(r[1][:4], ['free', 'unsupported', ['independent deals'], []])   # the failed check is named
+        self.assertIn('independent deals', r[1][4])
+        self.assertEqual((r[1][5], r[1][6], r[1][7]), ('check failed', None, 'x'))
+        self.assertEqual(r[2][:4], ['free', 'incomplete', [], ['conversations']])
+        self.assertEqual((r[3][0], r[3][1]), ('free', 'free'))                          # no checks recorded: the method alone
 
     def test_population(self):
         r = self.run_js('return [Core.populationOf({rejected: [{}, {}], population: {committed: 400, provisional: 6}, stats_population: "verified committed"}),'

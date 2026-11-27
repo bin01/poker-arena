@@ -1,8 +1,8 @@
 # How Poker Arena decides who wins
 
 This page explains how results become verdicts and standings, which of them are tests and which are only
-descriptions, what the test's error rate rests on (independent conversations and the stacks, nothing about the
-shape of the results), what that costs, and what it cannot tell you. The code is `poker_arena/ratings.py` (the design, the test, the standings) and
+descriptions, what the test's error rate rests on (independent conversations, a conditional null and the stacks,
+nothing about the shape of the results), what that costs, and what it cannot tell you. The code is `poker_arena/ratings.py` (the design, the test, the standings) and
 `poker_arena/history.py` (all-time standings). The calibration claims below are checked by
 `tests/test_calibration.py`: small seeded versions on every test run, and the larger runs reported here with
 `POKER_ARENA_HEAVY=1 python -m pytest -s tests/test_calibration.py` (about 2 minutes). The evidence rules (record
@@ -79,13 +79,26 @@ refresh, would answer differently at a different moment, and are never called a 
 With no edge between two players, the official test calls a winner for that pairing with chance at most
 `alpha_pairing = alpha / n_pairings`, so that over the tournament the chance of any false verdict is at most
 `alpha` (5% by default; Bonferroni, which needs no independence between pairings). The same bound holds for a
-false *even*. It holds **at every look and whenever play stops, for any distribution of results**, given two
-things, both true by construction:
+false *even*. It holds **at every look and whenever play stops, for any distribution of results**, given three
+things:
 
 1. **Conversations are independent**: fresh memories, no shared state, no deal repeated across the pairing's
-   conversations (checked: `independent_deals`). They need not be identically distributed, and anything may
-   happen inside one (memory, tilt, a read formed early, heavy tails, exact zeros, skew).
-2. **A conversation's mean edge is bounded by the stacks**, which is a rule of the game, not an assumption
+   conversations (checked: `independent_deals`). Anything may happen inside one (memory, tilt, a read formed
+   early, heavy tails, exact zeros, skew).
+2. **The null holds conditionally.** What the bettor against "a's edge is at most m" needs is
+   E[Y_t | Y_1, ..., Y_{t−1}] ≤ m for every conversation t, where Y_t is conversation t's mean edge: given what
+   came before, the next conversation's expected edge is at most m. Independence and the bound alone do not
+   give that: conversations need not share a distribution, but under the null each one's expected edge must be
+   at most m. A common mean (the same expected edge for every conversation) is the usual case of it, and the
+   null "no edge" is then the plain statement that a and b are equally good. **The estimand under drift.** If
+   the edge changes during a run (a provider updates the model, a rate limit changes the effort), "a's edge is
+   at most 0 at every conversation" can be false while the run's average edge is zero, and the test rejects it
+   correctly: a verdict for a then means *a's expected edge was positive during at least part of the run*, not
+   *the run's average favours a*. The round 7 reviewer's sequence shows it: +100 bb/100 for 700 conversations,
+   then −100 for 700, mean 0; with 3 pairings the bettor calls a at conversation 536, which is right about the
+   first 700 and says nothing about the last 700. So the guarantee is stated for the conditional null, and
+   every verdict carries a **drift diagnostic** (`drift`, below) that says when the edge did not hold still.
+3. **A conversation's mean edge is bounded by the stacks**, which is a rule of the game, not an assumption
    about it: each of a duplicate deal's two plays wins or loses at most one stack (stacks reset every hand), so
 
        |x| = |net chips of a over both plays| / bb / 2 × 100  ≤  100 × stack / bb
@@ -113,6 +126,14 @@ that floor; deals inside a conversation cannot be bet on one by one (the null "a
 higher" says nothing about each deal given the ones before it, so a per-deal martingale is not valid for the
 question asked); the levers that remain are the number of deals per conversation (*Planning*: shorter is far
 cheaper in deals), the stacks (the bound is proportional to them), the target edge and alpha.
+
+**Drift.** `drift` compares the pairing's conversations in play order, the first half against the second (Welch
+t, two-sided): `{status: 'stable' | 'drift detected' | 'unknown' (fewer than 4 conversations), early, late,
+difference, p, conversations, alpha, meaning}`, flagged at p < `DRIFT_ALPHA` = 1% (about 1 false flag in 100
+steady pairings; seeded check in `tests/test_calibration.py`, `TestDrift`). It is reported beside the verdict
+and printed with it ("drift detected: ..."); it does not change the verdict, whose guarantee holds for the
+conditional null either way, but it changes what the verdict means. It is a diagnostic: it can miss drift that
+reverses within each half, and a steady pairing is flagged about 1% of the time.
 
 **Every verdict reports its checks** (`assumptions: {status, summary, checks}`, recorded with the decision):
 `bounded` (no deal beyond the bound), `independent_deals` (no deal repeated across the pairing's conversations)
@@ -144,7 +165,7 @@ player its kind, backend, requested model, protocols, the models its replies nam
 |---|---|
 | registration | no valid registration (as above), or a code change during the run |
 | identity resolved | no model recorded, or a bare alias (`sonnet`) |
-| identity matched | a reply reported another model (`identity_match: mismatch`, by `ratings.same_model`, rechecked by the judge from the models the facts name, whatever summary they carry); no reply at all; or the backend reported no model (`unattested`) and the design's `allow_unattested` (default `codex`, which cannot report it) does not name the backend. An allowed unattested player is shown as unattested everywhere: reporting some model is never a match. |
+| identity attested | by the one attestation policy, `ratings.attestation`, which judges the quiz the same way: `attested` (the backend reported the requested model), `unattested` (it reported none) or `mismatch` (another model, by `ratings.same_model`, rechecked by the judge from the models the facts name, whatever summary they carry). Ineligible on a mismatch, on no reply at all, or when unattested and the design's `allow_unattested` (default `codex`, which cannot report it) does not name the backend. An allowed unattested player is shown as unattested everywhere (`attestation` per player in each verdict): reporting some model is never a match. |
 | audit complete | a used reply whose turn could not be checked for tool use: `opaque` (the `command` backend) unless `allow_opaque` names the backend (default none), or unverified or unrecorded; and, where the records link each decision to its calls (`decision_id`), the audit the judge derives from those links is not complete (below) |
 | decision coverage | (from the runner's facts) a model action without exactly one decision record and its calls, decision records without an action, or no recorded actions at all |
 | protocol consistent | the player's settings differ between the pairing's matches, or a match records no protocol |
@@ -156,7 +177,10 @@ player its kind, backend, requested model, protocols, the models its replies nam
 `pairing_data`, the ratings, the history and the style statistics, and offered to the viewer
 (`ratings.verified_hands`): it says which hands are **verified results** and which are **provisional** (written
 but past the play's commit point, or committed while the other play has not finished that hand) or
-**rejected**. b-first must seat
+**rejected**: per hand of each play (`status: {side: {hand: 'verified' | 'provisional' | 'rejected'}}`, with
+`reasons` and `totals` over the verified deals), so the viewer marks and totals hands without the ratings. A
+folder without `state.json` is a legacy record: every hand it holds is taken as committed and counts only if
+it verifies (`commit` says so per play). b-first must seat
 a-first's players in the other order, with the same game settings, seeds, deal fingerprints, specs and
 protocols; each hand's recorded seed and fingerprint must match the configs and its chips must add up; and each
 play of the hand goes through the engine's record verifier (`games.holdem.verify_hand`), with the seed and
@@ -182,7 +206,11 @@ missing) a pairing is ineligible.
 record, the action it led to, every call attempt and every raw output row), the judge derives each accepted
 decision's audit from them (`ratings.linked_audit`): verified only when its action and at least one call carry
 the id, the accepted (last) attempt says `verified` and has a raw output row with the same id and attempt, and
-the decision record agrees; `opaque` when that attempt comes from a backend with no record. Per player over the
+the decision record agrees, and its accepted reply, replayed against the engine state before its action
+(`runner.replay_decisions`: the hand rebuilt from its seed and the actions before it), reproduces exactly the
+executed action, amount, correction and speech, and every refused reply is still refused with its recorded error
+(otherwise `inconsistent`: a reply raising to 4 never verifies an executed raise to 200); `opaque` when that
+attempt comes from a backend with no record. Per player over the
 pairing (`linked_audit`, `ratings.linked_status`): `complete`, `opaque`, `incomplete` (any decision unlinked,
 unverified or missing its raw row: the pairing is ineligible), `bot`, or `legacy` (records from before decision
 ids, judged by the runner's aggregate facts alone, and shown so).
@@ -371,8 +399,8 @@ pairing ineligible anyway). For a null mean m, a bettor against "the mean is at 
 K_n(m) = Π_{i≤n} (1 + λ_i (Y_i − m)), starting at 1. Its stake λ_i is the aGRAPA fraction (μ − m) / (v + (μ − m)²)
 from the mean μ and variance v of the conversations before i (v starts from 350², worth one conversation; μ
 starts at m, so the first stake is zero), clipped to [0, 0.9 / (B + m)]. The stake uses only the past, and
-1 + λ (Y − m) ≥ 0.1 for every Y ≥ −B, so under any distribution of independent conversations whose mean is at
-most m the capital is a nonnegative supermartingale, and by Ville's inequality the chance that it ever reaches
+1 + λ (Y − m) ≥ 0.1 for every Y ≥ −B, so whenever E[Y_i | the conversations before i] ≤ m for every i (whatever
+the distributions) the capital is a nonnegative supermartingale, and by Ville's inequality the chance that it ever reaches
 2 / alpha_pairing is at most alpha_pairing / 2. The mirror bettor (on −Y, against −m) tests "the mean is at
 least m". Four bettors run: against ≤ 0 (`a`), ≥ 0 (`b`), ≤ −15 and ≥ +15 (`even`).
 
@@ -524,11 +552,15 @@ different lengths never pool. A player from before protocols were recorded is ke
 
 The implementation is the first 8 characters of a hash of what played the seat (`history.implementation_tag`):
 the content hashes of the code that plays (engine, games, agents, backends, runner: everything the runner
-records but the judge, `ratings.py`), the prompt template, and for a model the version of its CLI. A change to
-parsing, corrections, tool detection or bot behaviour, or a new CLI version, makes another player, from the hand
+records but the judge, `ratings.py`), the prompt template, and for a model the version and the file (sha256,
+from `cli_artifacts`) of its CLI. A change to parsing, corrections, tool detection or bot behaviour, a new CLI
+version, or a CLI file rebuilt under the same version string, makes another player, from the hand
 it took effect (`history.implementation_segments`): a match records the implementation and CLI versions it
 started with, each accepted code change (`implementation_changes`) and CLI version change
-(`cli_version_changes`) with the hand after which it applied, and each resume's CLI versions (`state.json`); the
+(`cli_version_changes`, with the files before and after: `artifact_from` / `artifact_to` for a change seen
+mid-match, `artifacts_to` at a resume) with the hand after which it applied, and each resume's CLI versions and
+files (`state.json`); the runner keeps only the latest file in `cli_artifacts`, so a change whose earlier file
+was not recorded starts the match under an `unrecorded` file that pools with nothing; the
 history gives every deal its players' identities at that hand of both plays, so the deals before a change pool
 under the old identity, the deals after under the new one, and a deal whose two plays straddle the change gets an
 identity of its own (pooling with neither). A model whose executable was not recorded is tagged with every
@@ -568,15 +600,18 @@ different designs and stopped pairings at different times, so pooling them is no
 every pairing there has `verdict: 'descriptive'`, there is no leader and no rank, and the notes say so. Repeated
 deals are averaged; slates are matched by seed across runs, so runs on the same cards are resampled together.
 Every hand is replayed from its seed at sync time, as in a run; duplicate pairs or hands that fail validation
-or replay are kept in the `rejected` table and listed, never pooled. A database from before schema 6 is read
-again from the folders that still exist (identities gained the hand-level implementation split).
+or replay are kept in the `rejected` table and listed, never pooled. A database from before schema 7 is read
+again from the folders that still exist (identities gained the hand-level implementation split, and then the
+CLI file hash).
 Independent confirmation needs a new run with its own design.
 
 ## How good at poker: the reference bot and the quiz
 
 Every number above is **peer-relative**: a strength is bb/100 against the average opponent a player met, and a
-verdict compares two players. That says which model wins, not how good any of them is at poker. Two things
-answer that, and both are reported apart from the standings:
+verdict compares two players. That says which model wins, not how good any of them is at poker. Nothing here yet
+measures that in absolute terms: there is no solver- or expert-labelled calibration set and no strong,
+reproducible opponent benchmark, so results are described as **peer-relative winnings** and **fundamentals
+competence**, never as poker strength. Two things narrow the gap, both reported apart from the standings:
 
 - **The reference bot** (`bot = "reference"`, version `reference-1`): a fixed heuristic, **not a solver**:
   tight-aggressive, position-aware, equity against the range the opponent's betting implies, pot odds, a fixed
@@ -597,18 +632,33 @@ answer that, and both are reported apart from the standings:
   is not maximally exploitative, and how it does against strong play is unmeasured (no solver or expert
   comparison). A positive edge against it means *beats a solid fixed heuristic*, not *plays well*.
 - **Poker fundamentals** (`python -m poker_arena quiz`, written to `quiz.json`): decision spots with computed
-  answers, asked of each player through its own backend, each answer kept with its calls, raw output, identity
-  and audit. The ratings output carries them as `fundamentals`, **recounted from the answers**: a fallback (no
-  playable answer, or no reply) is never correct, whatever it did, even where folding was best; `accuracy` is
-  over every spot asked and `valid_accuracy` over the answers the player actually gave, with `fallbacks` apart;
-  per category, and the headline is the basics'. Each score carries its `provenance` (quiz version and spots,
-  protocol, implementation, CLI version, identity and audit) and `eligibility`: `eligible` only when every
-  answer was attested as the requested model and verified against its raw output and the provenance is
-  recorded (`unverified` when the record keeps no answers, as quizzes before round 7 did). A score is attached to
-  a run's player (same model and reasoning level) only when it is eligible; otherwise it stays under its quiz
-  name. The basics are a fixed, hand-picked set, so they carry counts, not intervals; a generated category, whose
-  spots are an i.i.d. sample from its generator, carries a 95% interval for that generator's spots, with the
-  estimand named. They are never pooled with strengths or verdicts.
+  answers against stated ranges and lines, asked of each player through its own backend, each answer kept with
+  its calls and raw output. It measures competence in stated-range decisions, not play against opponents who
+  hide their ranges. The judge never trusts the record's labels (`identity_match`, `audit`, `correct`,
+  `eligibility`): `ratings.verified_quiz` re-derives every answer with the quiz's own verifier
+  (`quiz.verify_answer`: the spot rebuilt from its id and compared with the copy kept, every call re-checked
+  against its raw output by its backend's parser, which also gives the identity, every refused reply re-applied
+  and the accepted one played in the engine position, so the request, the option it amounts to, correctness,
+  outcome and loss must be what the replies give), checks that the answer key hashes to the recorded
+  `spots_hash` and names each spot's best option, that each spot is answered once, and that every call ran the
+  player's recorded CLI file (path, version and sha256). An answer that fails any of it is `unverified`: never
+  correct, worth the worst option. The scores are recounted from the verified answers (`accuracy` over every
+  spot asked, `valid_accuracy` over the answers the player gave, `fallbacks` and `unverified_answers` apart), per
+  category, with every headline field from `scored_category` (the basics when asked) and each category with its
+  own denominators. `eligibility` is the judge's: `eligible` only when every answer verifies, the provenance is
+  recorded (protocol, implementation, CLI version matching its file) and the attestation passes the same policy
+  as the games (`ratings.attestation`: attested; unattested only from a backend the quiz's or the default
+  `allow_unattested` names, so unattested Codex is eligible and shown as unattested; a mismatch never);
+  `unverified` when no answers are kept. The served quiz (`ratings.verified_quiz_file`, cached) is that
+  representation, with the raw payloads left out. A score is attached to a run's player (same model and
+  reasoning level) only when it is eligible; otherwise it stays under its quiz name.
+
+  **Scores are descriptive.** A binomial interval needs spots drawn independently from a defined population. The
+  basics are a fixed, hand-picked set, and generated spots kept by answer quotas (no answer best in more than
+  half of them) are not an independent sample either, so both carry counts only (`interval95: null`, `estimand:
+  'descriptive: ...'`). Only a category whose metadata says `sampling: {design: 'independent'}` (each spot drawn
+  independently from its generator's accepted spots, no quotas) gets a 95% Wilson interval for that population,
+  with the estimand named. Quiz scores are never pooled with strengths or verdicts.
 
 ## Style statistics (tendencies, not quality)
 
@@ -648,10 +698,16 @@ call, result or not: a mismatch anywhere counts.)
   one thing the guarantee needs, and a model provider that carried state across conversations would break it.
 - **Additivity** of strengths is an assumption (see Strength).
 - **Identity is as good as the CLI's report.** A CLI that doesn't report which model answered (Codex) can't be
-  checked; it is eligible only because the default design allows it, and it is shown as unattested.
+  checked; it is eligible only because the attestation policy allows it by default, in games and the quiz
+  alike, and it is shown as unattested.
+- **Drift.** The guarantee is for the conditional null; an edge that changes during a run makes a verdict mean
+  "ahead for part of the run". The drift diagnostic flags large changes between early and late play, not every
+  change.
 - **Winnings are relative.** Strength and verdicts say how a model does against the players it met. The fixed
   reference bot gives every run a common, versioned opponent, and the quiz scores fundamentals against computed
   answers; neither is a measure of play against strong humans, and the reference is a heuristic, not a solver.
+  Saying how good a model is at poker needs a solver- or expert-calibrated set, reported separately, and a
+  reproducible strong opponent; neither exists here yet.
 - **The registration is a record, not a signature.** It proves the design was fixed before the first match
   started only as far as the files are honest: someone editing plan.json and every match config by hand could
   forge it.

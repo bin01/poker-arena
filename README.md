@@ -144,8 +144,14 @@ bettor stakes part of its capital on each new conversation, using only the earli
 lose without going broke; with no real edge its capital is a fair game, and it reaches the bar of 2 / alpha per
 pairing with chance at most alpha / 2, by Ville's inequality. So with no real edge the chance of any false
 verdict in the whole tournament stays under 5%, **for any distribution of results, at every look and whenever
-play stops**, given only that conversations are independent (fresh memories, no deal repeated). *even* (within
-±15 bb/100) has the same guarantee. Each verdict reports those checks, its bettors' capital against the bar and
+play stops**, given that conversations are independent (fresh memories, no deal repeated) and that the null is
+true conditionally: with no edge, each conversation's expected edge given the ones before it is zero (a common
+mean is one case of that). *even* (within ±15 bb/100) has the same guarantee. If the edge drifts (a provider
+changes the model mid-run, say), a verdict for a means a's expected edge was positive for at least part of the
+run, not that the run's average favours a: +100 bb/100 for 700 conversations and then −100 for 700 averages
+zero, yet a is rightly called at conversation 536 (with 3 pairings). So every verdict carries a **drift** diagnostic (the first
+half of its conversations against the second, Welch t, flagged at p < 1%), and a flagged one says *drift
+detected*. Each verdict reports those checks, its bettors' capital against the bar and
 an anytime-valid interval for the edge. Round 6's t and sign-flip gate, which a rare-loss distribution inside the
 chip bounds fooled 45% of the time, is still shown beside it as a **model-based** result: secondary, never
 official, never counted.
@@ -204,7 +210,10 @@ engine's record verifier: the deal is dealt again, the recorded actions are repl
 cards, board, pots, payouts and events must match. A hand edited after the fact (a duplicated ace, a payout no
 stack could cover) is rejected, here, in the history and in the style statistics, and the pairing can't be
 decided. One reader (`ratings.read_conversation`) says which hands are verified results and which are still
-provisional; everything that counts uses it.
+provisional; everything that counts uses it, and it gives each written hand one status (verified, provisional or
+rejected, with the reason) and the totals over verified deals, which the viewer shows. A model decision counts
+as audited only if its accepted reply, replayed against the engine state before its action, reproduces the
+executed action, amount, correction and speech.
 
 **An official verdict counts only while its evidence stands.** Every refresh checks each official decision
 against today's folders: the records it judged must all be there, replay, hash as they did, and pass today's
@@ -213,9 +222,11 @@ towards a decided rank or leader, with the reason: evidence *lost*, *changed*, *
 edited so that the same judge no longer reproduces it), or *fails today* (the same records, judged by checks
 that are stricter now).
 
-**Eligibility.** A pairing can only be decided when both players' model identity is resolved and **matched**
+**Eligibility.** A pairing can only be decided when both players' model identity is resolved and **attested**
 (the CLI reported the model that answered and `ratings.same_model` says it is the one requested; reporting some
-model is not enough; Codex can't report it, so the default design allows it and shows it as *unattested*), every
+model is not enough; Codex can't report it, so the default design allows it and shows it as *unattested*; one
+policy, `ratings.attestation`, judges games and the quiz alike: attested, unattested where allowed, mismatch
+never), every
 model action has exactly one decision record with its calls, every used reply was audited for tool use (the plain
 `command` backend can't be, so it is never decided unless a design allows it; where decisions are linked to
 their calls and raw output by a decision id, the judge derives each one's audit from those links), each player's
@@ -247,17 +258,24 @@ fitted to all its pairings, weighted by how many deals each has; every pairing s
 next to the edge it actually had, and a warning when they disagree by more than their uncertainty. The direct
 pairwise results come first.
 
-**Winning here and being good at poker are reported apart.** Strengths and verdicts are relative to the players
-met. Each player's direct edge against the reference bot (`vs_reference`) is shown when the group has one; the
+**Winning here and being good at poker are reported apart, and neither says how good a model is at poker
+overall.** Strengths and verdicts are relative to the players met: peer-relative winnings. There is no solver or
+expert calibration set and no strong reproducible opponent yet, so the results claim no absolute strength. Each player's direct edge against the reference bot (`vs_reference`) is shown when the group has one; the
 reference is a fixed heuristic, not a solver, measured against the other bots (+408 bb/100 against random, +290
 against the calling station, +169 against the rule bot, though it wins only half what the rule bot does from
 random), and the ratings output carries those limits (`reference`). `python -m poker_arena quiz` scores **poker
 fundamentals** (spots with computed answers, in separately scored categories: the clear-cut basics, close calls,
-multi-street lines, range inference from a described line, and bet sizing among 3+ options); `ratings` recounts
-them from the answers (a fallback is never correct, valid-answer accuracy apart), attaches a score to a run's
-player only with its provenance (quiz version, protocol, implementation, CLI version) and when its answers are
-eligible (attested model, verified against raw output), gives the fixed basics counts rather than intervals, and
-prints them as their own section, never mixed into the standings.
+multi-street lines, range inference from a described line, and bet sizing among 3+ options: competence in
+stated-range decisions); `ratings` re-derives every answer itself (`ratings.verified_quiz`: each call re-checked
+against its raw output, the accepted reply replayed in the spot's engine position, the spot key and the CLI
+file checked, whatever the record's labels say), recounts the scores from those answers (a fallback or an answer
+it cannot re-derive is never correct, valid-answer accuracy apart), attaches a score to a run's player only
+with its provenance (quiz version, protocol, implementation, CLI version and file) and when its answers are
+eligible under the same attestation policy as the games (attested, or unattested from a backend the policy
+allows, such as Codex; a mismatch never), and prints them as their own section, never mixed into the standings.
+The scores are descriptive counts: a category gets a binomial interval only if its spots were sampled
+independently from a defined population (`sampling: independent`), never for the fixed basics or spots kept by
+answer quotas.
 
 **How long it takes.** A model makes about 2–3 decisions per hand, and a CLI call takes roughly 5–30 seconds,
 so 100 hands take 30–90 minutes per model seat. The pilot is about 6,000 model calls: most of a day at
@@ -295,9 +313,10 @@ The all-time leaderboard rates a player by **what it is: its model, reasoning le
 implementation** (or a bot and its settings), not by its id in one run. The protocol is the fingerprint of every
 setting that changes play (instructions, isolation, tool policy, extra arguments, retries, and the conversation
 length the model is told); the implementation is the hash of the code that plays (engine, agents, backends,
-runner and prompt template, not the judge) and of the model's CLI version. So only identical setups pool: the
-same model at another level, with other settings, with longer conversations, played by other code or another CLI
-version, is a different player, and so is one from before protocols were recorded. The split happens at the hand
+runner and prompt template, not the judge) and of the model's CLI: its version and the sha256 of its file, so a
+rebuilt binary that keeps its version string still splits. So only identical setups pool: the same model at
+another level, with other settings, with longer conversations, played by other code or another CLI version or
+file, is a different player, and so is one from before protocols were recorded. The split happens at the hand
 a change took effect, even in the middle of a match (a CLI upgraded between a stop and a resume, or a code change
 accepted with `--allow-code-change`): deals before it, after it, and deals whose two plays straddle it are three
 different players. Every hand is replayed from its seed when it is indexed; one that doesn't replay is listed as
@@ -332,12 +351,15 @@ by the CLI that runs them. A player whose model wasn't recorded shows as, say, "
 
 Results never claim more than the evidence. **Decided** (a gold badge) marks only what the planned sequential test
 settled: a matchup's *wins* or *even*, a rank, or a group's leader with a decided win over every other player in its
-group. Every decided verdict carries its assumption status beside it, and the page never states the test's error bound
-without its assumptions. When the official verdict comes from the assumption-free test (an anytime-valid test for
-bounded results, valid if conversations are independent), the chip says *no distribution assumption; conversations
-independent*, and the older model-based gate's verdict is shown beside it as a dashed, secondary *model-based: ...*
-chip that never decides. Verdicts from the model-based gate alone say *diagnostics passed; distribution assumptions
-unverified*, *outside calibrated range* or *assumptions unchecked*. A
+group. Every decided verdict shows what it rests on as two separate things: the **method** (which test) and the
+**evidence** (whether the checks that test needs hold here), and the page never states the test's error bound without
+them. When the official verdict comes from the assumption-free test (an anytime-valid test for bounded results, valid
+if conversations are independent), the method chip says *assumption-free test* and the evidence chip says *checks
+passed*, or names what is wrong: *check failed: independent deals* (its error rate is then not established, and a
+leader resting on it is shown as *Leader, but a check failed*, not as decided) or *checks incomplete: conversations*.
+A failed or unmade check is never hidden by the method. The older model-based gate's verdict is shown beside it as a
+dashed, secondary *model-based: ...* chip that never decides. Verdicts from the model-based gate alone say
+*diagnostics passed; distribution assumptions unverified*, *outside calibrated range* or *assumptions unchecked*. A
 leader whose wins include one outside the calibrated range is shown as *Leader, outside the calibrated range*, not as a
 decided leader. A matchup the judge may not decide (identity, audit, protocol or registration) shows **Ineligible**
 with its reasons. A verdict recorded by the run's registered judge is marked *official*; a recomputation by today's
@@ -361,8 +383,9 @@ registration says so with its reason): nothing in it is decided, and any sample-
     ("Rule bot beat Random bot · 801 bb/100 · Decided") and shows the fitted strength only as a secondary, qualified
     number.
   - **Against the reference bot**: each player's bb/100 against the fixed, versioned reference policy with its range
-    and verdict, models first, and what the reference is and is not (a heuristic, not a solver), with its own record
-    against the baselines. A model-only group says plainly that it has no fixed yardstick.
+    and verdict, models first. What the reference is and is not (a heuristic, not a solver) and its own record against
+    the baselines are one click away under *What the reference bot is*. A model-only group says plainly that it has no
+    fixed yardstick.
   - **How this is judged**, folded: the test and its assumptions, the target edge ("Planned to detect a 50 bb/100
     edge: ~N deals per matchup; the matchups have M", or *retrospective*), power under the optimistic, moderate and
     pessimistic dependence assumptions, the words used on the page, and the ratings' notes. Caveats live here once.
@@ -380,8 +403,9 @@ registration says so with its reason): nothing in it is decided, and any sample-
     on, the checks used and conversations it has, and an *off the fit* line only where the fit's additivity check
     warns ("The strengths predict +502; this matchup's own result is +273"). Where too few matchups link the players
     to test the fit, it says *fit: insufficient evidence to assess* instead.
-  - **Poker fundamentals**, when the run has a `quiz.json`: one line with the best score and the reference policy's,
-    linking to its own tab.
+  - **Poker fundamentals**, when the run has a `quiz.json`: one line per model with its score on the scored
+    category and on the harder ones ("32/32 basics · 90/96 harder"), linking to its own tab. It is filled in after
+    the standings are on screen, so the standings never wait for it.
   - **More detail**, folded sections that remember whether they are open: **Head to head** (one matrix per group,
     shaded only where decided; on a phone the rows show monograms with a legend beneath), **How they play**
     (tendencies, not quality; on a phone a **Show** picker selects one tendency at a time) and the **Audit** (its
@@ -394,41 +418,52 @@ registration says so with its reason): nothing in it is decided, and any sample-
     means the reported model is the one asked for; a backend's bare "attested" (some model was reported) is never
     shown as confirmed.
 - **Fundamentals** (only for a run with `quiz.json`): every player answers the same spots, each with an answer worked
-  out from the cards. Per player: spots answered best, the share right among valid answers, fallbacks (no valid
-  answer after every retry: never counted right, even where folding was best), big blinds of expected value lost, and
-  a provenance chip (*provenance checked*, *ineligible* with reasons, or *provenance not recorded*). A **By category**
-  table scores each category separately. No error ranges are shown unless the quiz defines its sampling population.
+  out from the cards. The headline (**Scores · Basics**) is one category, the one the quiz scores (`scored_category`,
+  else the basics when there are others), and every figure in it comes from that category's own answers: spots
+  answered best out of its spots, the share right among valid answers, fallbacks (no valid answer after every retry:
+  never counted right, even where folding was best) and big blinds of expected value lost, with a provenance chip
+  (*provenance checked*, *ineligible* with reasons, or *provenance not recorded*). **Harder categories, scored
+  separately** gives every other category its own count out of its own spots, with fallbacks and bb lost; none of them
+  enters the headline. No error ranges are shown unless the quiz defines its sampling population.
   The reference policy is called out as the yardstick. Each spot opens on the same table component (the deciding seat's cards up, the opponent's down), with
   the pot, price, break-even share, equity, best answer and every player's choice, its EV lost and its reasoning.
   This is separate from the standings: fundamentals, not winnings against these opponents. A quiz file marked
   `"fixture": true` is labelled as made-up layout data (`tests/fixtures/quiz.json` is one).
-- **Watch.** Matchups are listed by pairing (full names, verdict, net), and the selected pairing opens into its
-  rounds and replicates (*Round 2 · Rep 1*), each with its own net. On a phone the list folds into an *All matchups*
-  button with the round pills beneath it. The header leads with the whole pairing across every round and replicate
-  (net big blinds, bb/100 and the cumulative verdict); the selected round and replicate's own score is labelled
-  beneath. The **deal map** has a chip per deal, coloured by who won it over both plays (folded on a phone). A
-  finished deal opens at its first step with **Watch from start**; a deal still being played follows the latest step.
-  Each deal shows **both plays at the table** (same cards, seats swapped). The felt says whose turn it is from the
-  engine's recorded `to_act`, the price to call and the break-even share (pot odds); each seat shows its made hand
-  ("a pair of queens", plus an open draw on the flop or turn), labelled as computed from both players' cards.
-  **The two plays, street by street** puts each street's choices side by side and marks where the model holding the
-  same cards chose differently; it fills in as the replay goes. On a wide screen they sit side by side
-  and move either **street by street** (both reach the flop, turn, river and result together; the one with fewer
-  actions waits) or **Play 1, then Play 2**; on a narrow one the same two modes apply with
-  one table on screen at a time. On a narrow screen a two-line strip shows **both plays at
-  the same moment** (what each just did and whether the same cards drew the same choices on this street); tapping a
-  line shows that play's table. Beside each table, a large line says the action just taken with the price it faced,
-  and who acts next and what a call needs. On a phone, pressing play folds the scoreboard to one line and brings the
-  table up, and a compact control bar (deal arrows, step, play, scrubber) stays pinned at the top. Under them, **Where they differ**
-  jumps to the first decision where the two models, holding the same cards, chose differently, and **Big swings**
-  lists the deals with the largest results (ringed on the deal map). **Speed** (slow, normal, fast) sets how long each
-  step stays on screen; opening a decision's **why?** pauses playback. The table marks whose turn it is (**to act**)
-  apart from the last action of each seat, and the winner lights up only at the end. With **Auto-next deal** on,
-  playback goes on into the next deal. Below each table is a one-line-per-action log with the table talk;
-  **why?** opens that decision's private reasoning and its record: identity (attested or not, and the model seen),
-  turn audit, tries and time, and each rejected try with what it asked and why; **Reasoning** opens all of them. A
-  call shows what it faced and the share it needed. When the game changed a move, the log says what the model asked
-  for, what was played and why (*resized*, *asked again*, *tool rejected*, *auto-played*).
+- **Watch.** The first screen, on a desktop and on a phone, is the table: a one-strip scoreboard (both players by
+  model and level, who is up and by how much, bb/100, how many verified deals that counts, and the verdict pill), one
+  row of replay controls, then both seats and the board. Everything else comes after the table.
+  - **One sequence per pairing.** The replay walks every deal of the pairing in playing order, round by round and
+    conversation by conversation (the server's `/api/pairing`). *Deal 226 of 275 · Round 10 · conversation 1*: the
+    deal arrows, <kbd>←</kbd> <kbd>→</kbd>, **Auto-next deal** and **Big swings** all cross conversations, so an
+    official run of one-deal conversations plays continuously.
+  - **Verified totals.** The scoreboard counts verified deals only (both plays committed, checked as a duplicate pair
+    and replayed from their seeds, by the same conversation reader the ratings use). A deal still in play or waiting
+    for its other play is *provisional*, and one the verifier rejected is *rejected · not counted*; both are marked on
+    the deal and counted apart ("2 provisional · not counted"), whether or not the ratings are available.
+  - **Matchups**, listed by pairing with the verdict and the edge over verified deals (bb/100, from the ratings). On a
+    phone the list folds into an *All matchups* button.
+  - **The deal map**, below the tables: every deal of the pairing as a small square, one row per conversation (or per
+    round of one-deal conversations), coloured by who won it over both plays, a gold edge for a showdown, hatched for
+    provisional and outlined red for rejected; ringed: the biggest swings. Clicking one opens it.
+  - **About this result**, folded: the verdict in full, what it rests on, which deals the totals count and the
+    verifier's reasons for any rejection.
+  - A finished deal opens at its first step with **Watch from start**; a deal still being played follows the latest
+    step. Each deal shows **both plays at the table** (same cards, seats swapped). The felt says whose turn it is from
+    the engine's recorded `to_act`, the price to call and the break-even share (pot odds); each seat shows its made hand
+    ("a pair of queens", plus an open draw on the flop or turn), labelled as computed from both players' cards. On a
+    wide screen the tables sit side by side and move either **street by street** (both reach the flop, turn, river and
+    result together; the one with fewer actions waits) or **Play 1, then Play 2**; on a narrower one, two tabs above
+    the table show what each play just did, tapping one shows its table, and a line says when the same cards drew
+    different choices. On a phone the control bar (deal arrows, step, play, scrubber) stays pinned at the top and the
+    secondary controls (speed, auto-next, reasoning, where they differ) sit behind **Options**.
+  - **Where they differ** jumps to the first decision where the two models, holding the same cards, chose
+    differently. **The two plays, street by street** puts each street's choices side by side and fills in as the
+    replay goes. **Speed** (slow, normal, fast) sets how long each step stays on screen; opening a decision's **why?**
+    pauses playback. Below each table is a one-line-per-action log with the table talk; **why?** opens that decision's
+    private reasoning and its record: identity (attested or not, and the model seen), turn audit, tries and time, and
+    each rejected try with what it asked and why; **Reasoning** opens all of them. When the game changed a move, the
+    log says what the model asked for, what was played and why (*resized*, *asked again*, *tool rejected*,
+    *auto-played*).
   Keys: <kbd>space</kbd> play or pause, <kbd>,</kbd> <kbd>.</kbd> step, <kbd>←</kbd> <kbd>→</kbd> deals,
   <kbd>d</kbd> where they differ, <kbd>r</kbd> reasoning. `?deal=12&step=4` in the address opens a deal at a step.
 - **Live.** Whether a run is running, between rounds, stopped or finished comes from the runner's `tournament.json`
@@ -440,7 +475,9 @@ registration says so with its reason): nothing in it is decided, and any sample-
   page's critical path: they are computed in a separate process, kept in `runs/.viewer-cache/` and served from there
   at once (marked *updating* while a newer version is computed), and the server warms every run when it starts. The
   replay never waits for them. A run computed for the first time shows its players and raw, unchecked matchup scores
-  until its standings arrive a few seconds later.
+  until its standings arrive a few seconds later. Listing runs and matchups never re-reads the archive: each
+  conversation is summarized once and kept until one of its record files changes, a run's page reads that run's
+  folder only, and the server checks every conversation in the background when it starts.
 
 The table (`viewer/table.js`) is its own component: it builds one snapshot per step from a hand's events and
 shows any snapshot, for two or three seats, with a seat's cards optionally face down, so a human seat can reuse it.

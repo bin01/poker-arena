@@ -5,20 +5,25 @@ one folder of matchups (a tournament's `out`, or a `play --out`); the leaderboar
 mixing a smoke test with a tournament makes neither readable.
     /api/runs                       every run: players, progress, pace and ETA, live or not
     /api/index?run=RUN              the run's matchups (both duplicate matches, and planned ones not started)
-    /api/match?id=RUN/MATCHUP/a-first   one match: config, finished hands, and every event by hand
+    /api/match?id=RUN/MATCHUP/a-first   one match: config, finished hands, every event by hand, and which of its
+                                    deals are verified, provisional or rejected (the shared conversation reader)
+    /api/pairing?p=RUN|A|B          one pairing's conversations in playing order, each deal's result and status, and
+                                    totals over verified deals only: the replay's deal sequence and scoreboard
     /api/ratings?run=RUN            the run's leaderboard, per-player stats and its audit summary. Served from a
                                     cache at once (its `cache` key says whether it is current); when a record file
                                     changed it is recomputed in the background. 202 {pending} the first time only.
     /api/quiz?run=RUN               the run's poker-fundamentals quiz (quiz.json), when it has one
 The run `*` is every run together: its leaderboard comes from the history database (history.py), one player
 per model and reasoning level, and keeps runs whose folders have since been deleted.
-Running matches are followed live: the app polls while a match is unfinished.
+Running matches are followed live: the app polls while a match is unfinished. Conversations are summarized once
+and kept in memory until one of their record files changes (`Inventory`), so a page never re-reads the archive.
 
 `export(root, out)` writes the same JSON as files next to a copy of the app, so a run can be published as a
 static site (`python -m poker_arena export runs/pilot --out site`).
 """
 from __future__ import annotations
 import json
+import os
 import re
 import shutil
 import time
@@ -126,28 +131,118 @@ def run_of(root: Path, m: Path) -> str:
     return str(rel) if str(rel) != '.' else '.'
 
 
+SIDES = ('a-first', 'b-first')
+RECORDS = ('config.json', 'hands.jsonl', 'result.json')
+
+
+def _stat(path: str):
+    try:
+        st = os.stat(path)
+        return st.st_mtime_ns, st.st_size
+    except OSError:
+        return None
+
+
+def _stamp(m: Path) -> tuple:
+    """What a conversation's summary depends on: its two plays' config, hands and result files."""
+    base = str(m)
+    return tuple(_stat(os.path.join(base, s, f)) for s in SIDES for f in RECORDS)
+
+
+def _walk(base: Path) -> tuple[list[Path], list[Path]]:
+    """(conversation folders, folders holding a plan.json) under base, without descending into a conversation."""
+    convs, plans, stack = [], [], [str(base)]
+    while stack:
+        d = stack.pop()
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        names = {e.name for e in entries}
+        if 'a-first' in names:
+            if os.path.exists(os.path.join(d, 'a-first', 'config.json')):
+                convs.append(Path(d))
+            continue
+        if 'plan.json' in names:
+            plans.append(Path(d))
+        stack += [e.path for e in entries if not e.name.startswith('.') and e.is_dir(follow_symlinks=False)]
+    return sorted(convs), sorted(plans)
+
+
+class Inventory:
+    """Every conversation under a root, summarized once and kept until one of its record files changes, so
+    listing runs and matchups never re-reads the archive: a visit stats the files and parses only what changed.
+    Whether a conversation is playing comes from its event log's age, checked on every read."""
+
+    def __init__(self):
+        import threading
+        self.mem: dict = {}
+        self.lock = threading.Lock()
+
+    def conversation(self, root: Path, m: Path) -> dict:
+        stamp = _stamp(m)
+        hit = self.mem.get(str(m))
+        if hit is None or hit[0] != stamp:
+            hit = (stamp, self._read(root, m))
+            with self.lock:
+                self.mem[str(m)] = hit
+        x = hit[1]
+        now = time.time()
+        ages = {s: _mtime(m / s / 'events.jsonl') for s in SIDES}
+        matches = [{**y, 'live': not y['finished'] and now - ages[y['side']] < LIVE_SECONDS} for y in x['matches']]
+        return {**x, 'matches': matches, 'live': any(y['live'] for y in matches),
+                'updated': max(ages.values(), default=0)}
+
+    @staticmethod
+    def _read(root: Path, m: Path) -> dict:
+        cfg = _json(m / 'a-first' / 'config.json') or {}
+        hands = {s: _lines(m / s / 'hands.jsonl') for s in SIDES}
+        matches = []
+        for s in SIDES:
+            if (m / s / 'config.json').exists():
+                y = match_summary(root, m / s, hands[s])
+                matches.append({**y, 'side': s})
+        a, b = (cfg.get('players') or ['?', '?'])[:2]
+        ha = {h['hand']: h for h in hands['a-first'] if isinstance(h.get('hand'), int)}
+        hb = {h['hand']: h for h in hands['b-first'] if isinstance(h.get('hand'), int)}
+        both = sorted(set(ha) & set(hb))
+        specs = cfg.get('specs', {})
+        tail = m.name.split('__vs__')[-1]
+        rep = re.search(r'__x(\d+)', tail)
+        rnd = tail.rsplit('__r', 1)[1] if '__r' in tail else ''
+        game = cfg.get('game', {})
+        stage = ['preflop', 'flop', 'flop', 'flop', 'turn', 'river']
+        reach = lambda h: 'showdown' if h.get('showdown') else stage[min(len(h.get('board') or []), 5)]
+        rank = {'preflop': 0, 'flop': 1, 'turn': 2, 'river': 3, 'showdown': 4}
+        deals = {k: [ha[k]['net'][0] + hb[k]['net'][1], max(reach(ha[k]), reach(hb[k]), key=rank.get)] for k in both}
+        return {'id': str(m.relative_to(root)), 'run': run_of(root, m), 'a': a, 'b': b, 'started': True,
+                'round': cfg.get('round') or (int(rnd) if rnd.isdigit() else 1),
+                'replicate': cfg.get('replicate') or (int(rep.group(1)) if rep else 1),
+                'matches': matches, 'deals_total': len(cfg.get('seeds', [])), 'pairs_done': len(both),
+                'pair_net_a': sum(x[0] for x in deals.values()),
+                'kinds': {p: 'bot' if 'bot' in s else 'model' for p, s in specs.items()},
+                'labels': {p: LABELS.get(p) or display_name(p, s) for p, s in specs.items()},
+                'bb': game.get('big_unit') or game.get('bb') or 1,
+                'finished': len(matches) == 2 and all(x['finished'] for x in matches),
+                'times': [h['t'] for s in hands.values() for h in s if h.get('t')],
+                '_specs': specs, '_deals': deals,
+                '_written': {s: sorted({h['hand'] for h in hands[s] if isinstance(h.get('hand'), int)}) for s in SIDES}}
+
+    def scan(self, root: Path, base: Path | None = None) -> tuple[list[dict], list[Path]]:
+        convs, plans = _walk(base or root)
+        return [self.conversation(root, m) for m in convs], plans
+
+
+INVENTORIES: dict = {}
+
+
+def inventory(root: Path) -> Inventory:
+    return INVENTORIES.setdefault(str(root), Inventory())
+
+
 def _matchup(root: Path, m: Path):
     """One duplicate pair: both matches, how many deals both have finished, and a's net over those deals."""
-    cfg = _json(m / 'a-first' / 'config.json') or {}
-    hands = {s: _lines(m / s / 'hands.jsonl') for s in ('a-first', 'b-first')}
-    matches = [match_summary(root, m / s, hands[s]) for s in ('a-first', 'b-first') if (m / s / 'config.json').exists()]
-    a, b = cfg.get('players', ['?', '?'])[:2]
-    ha = {h['hand']: h for h in hands['a-first']}
-    hb = {h['hand']: h for h in hands['b-first']}
-    both = sorted(set(ha) & set(hb))
-    specs = cfg.get('specs', {})
-    rep = re.search(r'__x(\d+)', m.name.split('__vs__')[-1])
-    rnd = m.name.rsplit('__r', 1)[1] if '__r' in m.name.split('__vs__')[-1] else ''
-    return {'id': str(m.relative_to(root)), 'run': run_of(root, m), 'a': a, 'b': b, 'started': True,
-            'round': int(rnd) if rnd.isdigit() else 1, 'replicate': int(rep.group(1)) if rep else 1,
-            'matches': matches, 'deals_total': len(cfg.get('seeds', [])), 'pairs_done': len(both),
-            'pair_net_a': sum(ha[k]['net'][0] + hb[k]['net'][1] for k in both),
-            'kinds': {p: 'bot' if 'bot' in s else 'model' for p, s in specs.items()},
-            'labels': {p: LABELS.get(p) or display_name(p, s) for p, s in specs.items()},
-            'bb': cfg.get('game', {}).get('big_unit') or cfg.get('game', {}).get('bb') or 1,
-            'live': any(x['live'] for x in matches), 'finished': len(matches) == 2 and all(x['finished'] for x in matches),
-            'updated': max((_mtime(m / s / 'events.jsonl') for s in ('a-first', 'b-first')), default=0),
-            'times': [h['t'] for s in hands.values() for h in s if h.get('t')]}
+    return inventory(root).conversation(root, m)
 
 
 def _plan_specs(plan_path: Path, plan: dict) -> dict:
@@ -171,17 +266,24 @@ def _who(pid, specs: list) -> tuple:
     return LABELS.get(pid) or pid, None
 
 
-def _runs_and_matchups(root: Path):
-    """{run: [matchup]} including matchups a plan.json lists that haven't started."""
-    by, seen = {}, {}
-    for cfg in sorted(root.rglob('a-first/config.json')):
-        m = _matchup(root, cfg.parent.parent)
-        by.setdefault(m['run'], []).append(m)
-        seen.setdefault(m['run'], {}).update((_json(cfg) or {}).get('specs', {}))
-    for plan_path in root.rglob('plan.json'):
-        plan = _json(plan_path) or {}
-        rel = plan_path.parent.relative_to(root)
+def _runs_and_matchups(root: Path, only: str | None = None):
+    """{run: [matchup]} including matchups a plan.json lists that haven't started. `only` reads one run's folder
+    and nothing else (unless a planned player is named only by another run)."""
+    base = None if only in (None, '.') else (root / only)
+    if base is not None and not base.is_dir():
+        return {}
+    found, plans = inventory(root).scan(root, base)
+    by = {}
+    for m in found:
+        if only is None or m['run'] == only:
+            by.setdefault(m['run'], []).append(m)
+    for plan_dir in plans:
+        plan_path = plan_dir / 'plan.json'
+        rel = plan_dir.relative_to(root)
         run = str(rel) if str(rel) != '.' else '.'
+        if only is not None and run != only:
+            continue
+        plan = _json(plan_path) or {}
         have = {(m['a'], m['b']) for m in by.get(run, [])}
         missing = [(a, b) for a, b in plan.get('matchups', []) if (a, b) not in have]
         if not missing:
@@ -190,14 +292,19 @@ def _runs_and_matchups(root: Path):
         here = [{p: {'label': lab, **({'bot': True} if m['kinds'].get(p) == 'bot' else {})} for p, lab in m['labels'].items()}
                 for m in by.get(run, [])]
         effort = plan.get('effort')
-        elsewhere = [{p: {**s, 'effort': effort or s.get('effort')} if effort and s.get('backend') in EFFORT_BACKENDS else s
-                      for p, s in specs.items()} for r, specs in seen.items() if r != run]
-        sources = here + [_plan_specs(plan_path, plan)] + elsewhere
+        sources = here + [_plan_specs(plan_path, plan)]
+        if any(not any(p in src for src in sources) for a, b in missing for p in (a, b)):
+            seen: dict = {}
+            for m in (found if only is None else inventory(root).scan(root)[0]):
+                if m['run'] != run:
+                    seen.setdefault(m['run'], {}).update(m['_specs'])
+            sources += [{p: {**s, 'effort': effort or s.get('effort')} if effort and s.get('backend') in EFFORT_BACKENDS else s
+                         for p, s in specs.items()} for specs in seen.values()]
         for a, b in missing:
             (la, ka), (lb, kb) = _who(a, sources), _who(b, sources)
             by.setdefault(run, []).append({
                 'id': str(rel / f'{a}__vs__{b}') if run != '.' else f'{a}__vs__{b}', 'run': run, 'a': a, 'b': b,
-                'started': False, 'round': 1, 'matches': [], 'deals_total': plan.get('deals', 0), 'pairs_done': 0,
+                'started': False, 'round': 1, 'replicate': 1, 'matches': [], 'deals_total': plan.get('deals', 0), 'pairs_done': 0,
                 'pair_net_a': 0, 'kinds': {p: k for p, k in ((a, ka), (b, kb)) if k}, 'labels': {a: la, b: lb},
                 'bb': 1, 'live': False, 'finished': False, 'updated': 0, 'times': []})
     return by
@@ -206,7 +313,7 @@ def _runs_and_matchups(root: Path):
 def roster(root: Path, run: str) -> list:
     """Every player of a run, from its plan when there is one, with where it stands: awaiting its first
     matchup, playing, or done."""
-    ms = _runs_and_matchups(root).get(run, [])
+    ms = _runs_and_matchups(root, run).get(run, [])
     plan = _json((root if run == '.' else root / run) / 'plan.json') or {}
     names = list(plan.get('players') or [])
     names += sorted(({m['a'] for m in ms} | {m['b'] for m in ms}) - set(names))
@@ -271,14 +378,19 @@ def lifecycle(root: Path, run: str, ms: list) -> dict:
             'round': max((m['round'] for m in ms if m['started']), default=None), 'pairings': pairings}
 
 
+MATCH_KEYS = ('id', 'hands_total', 'hands_done', 'finished', 'live')
+
+
 def _public(m):
-    return {k: v for k, v in m.items() if k != 'times'}
+    return {**{k: v for k, v in m.items() if k != 'times' and not k.startswith('_')},
+            'matches': [{k: x[k] for k in MATCH_KEYS} for x in m['matches']]}
 
 
 def index(root: Path, run: str | None = None):
+    """The run's matchups, read from its own folder only (every run's for None or all runs)."""
     from .history import ALL
     run = None if run == ALL else run
-    by = _runs_and_matchups(root)
+    by = _runs_and_matchups(root, run)
     out = [m for r, ms in by.items() if run is None or r == run for m in ms]
     # playing first, then started, then planned; alphabetical within each
     return [_public(m) for m in sorted(out, key=lambda m: (not m['live'], not m['started'], m['id']))]
@@ -370,8 +482,119 @@ def match(root: Path, mid: str):
     events = {}
     for e in _lines(d / 'events.jsonl'):
         events.setdefault(e.get('episode', 0), []).append(e)
+    conv = conversation_status(d.parent) if d.name in SIDES else None
     return {'summary': match_summary(root, d), 'config': _json(d / 'config.json'),
-            'hands': _lines(d / 'hands.jsonl'), 'events': events, 'result': _json(d / 'result.json')}
+            'hands': _lines(d / 'hands.jsonl'), 'events': events, 'result': _json(d / 'result.json'),
+            **({'status': {str(k): v for k, v in conv['status'].items()}, 'rejected': conv['rejected'], 'checked': conv['checked']} if conv else {})}
+
+
+CONVERSATIONS: dict = {}
+
+
+def conversation_status(m: Path) -> dict:
+    """Which deals of a conversation are results, from the one shared reader (`ratings.read_conversation`):
+    {'status': {deal: 'verified' | 'provisional' | 'rejected'}, 'rejected': [{'hand', 'reason'}], 'checked'}.
+    'verified': both plays committed it, they pass as a duplicate pair and replay from their seeds; 'provisional':
+    written but not a result yet; 'rejected': failed a check, so it counts nowhere. Without the reader every
+    finished deal is 'unchecked'. Kept until a record file of the conversation changes."""
+    stamp = _stamp(m)
+    hit = CONVERSATIONS.get(str(m))
+    if hit and hit[0] == stamp:
+        return hit[1]
+    written = {s: {h.get('hand') for h in _lines(m / s / 'hands.jsonl')} for s in SIDES}
+    every = {k for ks in written.values() for k in ks if isinstance(k, int)}
+    out = {'status': {}, 'rejected': [], 'checked': False}
+    try:
+        from .ratings import read_conversation
+        conv = read_conversation(m)
+    except Exception:
+        conv = None
+    if conv:
+        given = conv.get('status') if isinstance(conv.get('status'), dict) else None
+        if given and set(given) <= set(SIDES):   # per play: a deal is a result only when both plays say so
+            sides = [given.get(x) or {} for x in SIDES]
+            pick = lambda k: [d.get(k, d.get(str(k))) for d in sides]
+            given = {k: 'rejected' if 'rejected' in pick(k) else 'verified' if all(x == 'verified' for x in pick(k)) else 'provisional'
+                     for k in every}
+        rejected = [x for x in conv.get('rejected') or [] if isinstance(x, dict)]
+        whole = any(x.get('hand') is None for x in rejected)
+        bad = {x.get('hand') for x in rejected}
+        verified = set(conv.get('verified') or [])
+        for k in sorted(every):
+            g = given and (given.get(k) or given.get(str(k)))
+            out['status'][k] = g if g in ('verified', 'provisional', 'rejected') else \
+                'rejected' if whole or k in bad else 'verified' if k in verified else 'provisional'
+        out.update(rejected=[{'hand': x.get('hand'), 'reason': str(x.get('reason') or '')} for x in rejected], checked=True)
+    else:
+        both = written['a-first'] & written['b-first']
+        out['status'] = {k: 'unchecked' if k in both else 'provisional' for k in sorted(every)}
+    CONVERSATIONS[str(m)] = (stamp, out)
+    return out
+
+
+def pairing(root: Path, run: str, a: str, b: str) -> dict | None:
+    """Every conversation of one pairing in playing order (round, then replicate) with each deal's result from
+    a's side: {'a', 'b', 'conversations': [{'id', 'round', 'replicate', 'deals_total', 'live', 'finished',
+    'deals': [[deal, net_bb or None, status, reach]], 'rejected'}], 'totals': {...}}. A deal's status is the shared
+    reader's (verified, provisional, rejected, or unchecked without it), plus 'playing' for the deal a live
+    conversation is on. Totals count verified deals only (unchecked ones when nothing could be checked)."""
+    from .history import ALL
+    if run in (None, '', ALL):
+        return None
+    base = root if run == '.' else (root / run).resolve()
+    if base != root and root not in base.parents:
+        return None
+    ms = [m for m in _runs_and_matchups(root, run).get(run, []) if m['started'] and {m['a'], m['b']} == {a, b}]
+    if not ms:
+        return None
+    ms.sort(key=lambda m: (m['round'], m['replicate'], m['id']))
+    convs, tot = [], {'verified': 0, 'net_bb': 0.0, 'won': 0, 'lost': 0, 'even': 0, 'provisional': 0, 'rejected': 0,
+                      'unchecked': 0, 'playing': 0}
+    for m in ms:
+        st = conversation_status(root / m['id'])
+        sign = 1 if m['a'] == a else -1
+        bb = m['bb'] or 1
+        deals = []
+        for k, status in sorted(st['status'].items()):
+            d = m['_deals'].get(k)
+            net = round(sign * d[0] / bb, 2) if d else None
+            deals.append([k, net if status != 'rejected' else None, status, d[1] if d else None])
+            tot[status] = tot.get(status, 0) + 1
+            if status in ('verified', 'unchecked') and net is not None:
+                tot['net_bb'] += net
+                tot['won' if net > 0 else 'lost' if net < 0 else 'even'] += 1
+        nxt = max(st['status'], default=-1) + 1
+        if m['live'] and nxt < m['deals_total']:
+            deals.append([nxt, None, 'playing', None])
+            tot['playing'] += 1
+        convs.append({'id': m['id'], 'round': m['round'], 'replicate': m['replicate'], 'deals_total': m['deals_total'],
+                      'live': m['live'], 'finished': m['finished'], 'deals': deals, 'rejected': st['rejected']})
+    checked = any(conversation_status(root / m['id'])['checked'] for m in ms)
+    tot['net_bb'] = round(tot['net_bb'], 2)
+    tot['counted'] = tot['verified'] if checked else tot['unchecked']
+    return {'run': run, 'a': a, 'b': b, 'checked': checked, 'conversations': convs, 'totals': tot}
+
+
+def warm_conversations(root: Path, order: list):
+    """Check every conversation in the background, most recent run first, so a replay's first visit is instant.
+    It yields between conversations, so pages are served meanwhile."""
+    import threading
+
+    def go():
+        for run in order:
+            for m in _runs_and_matchups(root, run).get(run, []):
+                if m['started']:
+                    try:
+                        conversation_status(root / m['id'])
+                    except Exception:
+                        pass
+                    time.sleep(0.001)
+    threading.Thread(target=go, daemon=True).start()
+
+
+def pairing_key(run: str, a: str, b: str) -> str:
+    """The one parameter naming a pairing: 'RUN|A|B' with the two players in sorted order."""
+    return '|'.join([run, *sorted([a, b])])
 
 
 AUDIT_KEYS = ('decisions', 'calls', 'tool_rejected', 'unverified', 'verified', 'opaque', 'audit_missing', 'fallbacks',
@@ -478,11 +701,11 @@ def quiz(root: Path, run):
     base = root if run == '.' else (root / run).resolve()
     if base != root and root not in base.parents:
         return None
-    data = _json(base / 'quiz.json')
+    data = _verified_quiz(base / 'quiz.json')
     if not isinstance(data, dict):
         return None
     labels, kinds = {}, {}
-    for m in _runs_and_matchups(root).get(run, []):
+    for m in _runs_and_matchups(root, run).get(run, []):
         labels.update(m['labels'])
         kinds.update(m['kinds'])
     try:   # quiz players named by today's players file when the run's matches don't name them
@@ -495,6 +718,37 @@ def quiz(root: Path, run):
     except Exception:
         pass
     return {**data, 'labels': {**labels, **(data.get('labels') or {})}, 'kinds': {**kinds, **(data.get('kinds') or {})}}
+
+
+def _verified_quiz(path: Path):
+    """The quiz as the judge re-derives it (`ratings.verified_quiz_file`: answers re-verified, scores recounted,
+    eligibility and attestation the judge's); the stored file only when the judge cannot read it."""
+    if not path.exists():
+        return None
+    try:
+        from .ratings import verified_quiz_file
+    except ImportError:
+        return _json(path)
+    try:
+        return verified_quiz_file(path)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def warm_quizzes(root: Path, order: list):
+    """Verify each run's quiz in the background (the first check of a quiz takes seconds)."""
+    import threading
+
+    def go():
+        for run in order:
+            base = root if run == '.' else root / run
+            try:
+                _verified_quiz(base / 'quiz.json')
+            except Exception:
+                pass
+    threading.Thread(target=go, daemon=True).start()
 
 
 def ratings_for(root: Path, run, boot=200):
@@ -512,7 +766,7 @@ def ratings_for(root: Path, run, boot=200):
     key = run if run not in (None, '') else '.'
     r.setdefault('roster', roster(root, key))
     labels, kinds = {}, {}
-    for m in _runs_and_matchups(root).get(key, []):
+    for m in _runs_and_matchups(root, key).get(key, []):
         labels.update(m['labels'])
         kinds.update(m['kinds'])
     r['labels'] = {**labels, **(r.get('labels') or {})}
@@ -569,6 +823,11 @@ def export(root, out, players_file='players.toml') -> int:
                                             for p, s in specs.items()}
                 put(f'match-{key(x["id"])}.json', data_)
         put(f'index-{key(r["run"])}.json', ms)
+        if not r.get('all'):
+            for a, b in sorted({tuple(sorted((m['a'], m['b']))) for m in ms if m['started']}):
+                pr = pairing(root, r['run'], a, b)
+                if pr:
+                    put(f'pairing-{key(pairing_key(r["run"], a, b))}.json', pr)
         put(f'ratings-{key(r["run"])}.json', ratings_for(root, r['run'], boot=300))
         q = quiz(root, r['run'])
         if q is not None:
@@ -745,7 +1004,10 @@ def serve(root, port=8800, host='127.0.0.1', players_file='players.toml'):
     LABELS.update(load_labels(players_file))
     PLAYERS_FILE[0] = players_file
     cache = RatingsCache(root, players_file)
-    cache.warm([r['run'] for r in sorted(runs(root), key=lambda r: (bool(r.get('all')), -r['updated']))])
+    order = [r['run'] for r in sorted(runs(root), key=lambda r: (bool(r.get('all')), -r['updated']))]
+    cache.warm(order)
+    warm_conversations(root, [r for r in order if r != '*'])
+    warm_quizzes(root, [r for r in order if r != '*'])
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -775,6 +1037,10 @@ def serve(root, port=8800, host='127.0.0.1', players_file='players.toml'):
                 if url.path == '/api/match':
                     data = match(root, q.get('id', [''])[0])
                     return self.send(200, json.dumps(data)) if data else self.send(404, '{"error": "no such match"}')
+                if url.path == '/api/pairing':
+                    parts = q.get('p', [''])[0].split('|')
+                    data = pairing(root, '|'.join(parts[:-2]), *parts[-2:]) if len(parts) >= 3 else None
+                    return self.send(200, json.dumps(data)) if data else self.send(404, '{"error": "no such pairing"}')
                 if url.path == '/api/quiz':
                     data = quiz(root, run)
                     return self.send(200, json.dumps(data)) if data is not None else self.send(404, '{"error": "no quiz in this run"}')

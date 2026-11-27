@@ -135,6 +135,47 @@ class TestHistory(unittest.TestCase):
         self.assertEqual(len([p for p in merged['players'] if p['player'].startswith('claude')]), 1)
         self.assertTrue(any('equivalent implementations' in n for n in merged['notes']))
 
+    def test_a_cli_file_change_under_the_same_version_splits(self):
+        """R7-#8: the identity hashed CLI version strings, so a rebuilt binary that kept its version pooled."""
+        impl = {'poker_arena/agents.py': 'a1'}
+        art = lambda sha: {'claude': {'exe': 'claude', 'path': '/opt/claude', 'version': '1.0', 'sha256': sha}}
+        write_matchup(self.root, 'one', 'm1', 'm2', SPECS, [4, -2] * 10, impl=impl, cli='1.0')
+        write_matchup(self.root, 'two', 'm1', 'm2', SPECS, [4, -2] * 10, seed0=3000, impl=impl, cli='1.0')
+        write_matchup(self.root, 'three', 'm1', 'm2', SPECS, [4, -2] * 10, seed0=5000, impl=impl, cli='1.0')
+        for run, sha in (('one', 'aa'), ('two', 'aa'), ('three', 'bb')):
+            for side in ('a-first', 'b-first'):
+                p = self.root / run / 'm1__vs__m2' / side / 'config.json'
+                p.write_text(json.dumps({**json.loads(p.read_text()), 'cli_artifacts': art(sha)}))
+        history.sync(self.root)
+        r = history.all_time(self.root / history.DB_NAME, boot=20, players_file='/none')
+        m1 = [p for p in r['players'] if p['player'].startswith('claude')]
+        self.assertEqual(len(m1), 2)                                       # aa (runs one and two) and bb
+        few, many = sorted(p['deals'] for p in m1)
+        self.assertEqual(many, 2 * few)
+
+    def test_a_cli_file_change_mid_match_splits_at_its_hand(self):
+        impl = {'poker_arena/agents.py': 'a1'}
+        write_matchup(self.root, 'one', 'm1', 'm2', SPECS, [4, -2] * 10, impl=impl, cli='1.0')
+        old = {'exe': 'claude', 'path': '/opt/claude', 'version': '1.0', 'sha256': 'aa'}
+        new = {**old, 'sha256': 'bb'}
+        for side in ('a-first', 'b-first'):
+            p = self.root / 'one' / 'm1__vs__m2' / side / 'config.json'
+            cfg = json.loads(p.read_text())
+            cfg['cli_artifacts'] = {'claude': new}       # the runner keeps the latest artifact here
+            cfg['cli_version_changes'] = [{'kind': 'mid_run', 'after_hand': 6, 'during_hand': 6, 'from': {'claude': '1.0'},
+                                           'to': {'claude': '1.0'}, 'artifact_from': old, 'artifact_to': new}]
+            p.write_text(json.dumps(cfg))
+        history.sync(self.root)
+        con = sqlite3.connect(self.root / history.DB_NAME)
+        ids = dict(con.execute('SELECT deal, a_identity FROM deals').fetchall())
+        con.close()
+        self.assertEqual(ids[0], ids[5])
+        self.assertNotEqual(ids[5], ids[6])
+        self.assertEqual(ids[6], ids[19])
+        segs = history.implementation_segments(json.loads((self.root / 'one' / 'm1__vs__m2' / 'a-first' /
+                                                           'config.json').read_text()), 'm1')
+        self.assertEqual([at for at, _ in segs], [0, 6])
+
     def test_duplicate_pairs_are_validated(self):
         """A b-first play that is not a-first with the seats swapped never counts (R4-#8)."""
         write_matchup(self.root, 'one', 'm1', 'm2', SPECS, [4, -2] * 10)

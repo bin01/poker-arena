@@ -502,5 +502,45 @@ class TestCoverage(unittest.TestCase):
             print(f'\ncoverage, 1 slate, no conversation effect: {cov:.3f}')
 
 
+class TestDrift(unittest.TestCase):
+    """R7-#4: the bettor's null is conditional, E[Y_t | the conversations before] <= m at every t, not "the mean of
+    the run is m". A run that is +100 for 700 conversations, then -100 for 700, has mean 0 yet a's edge was real
+    while it lasted, and the bettor (3 pairings) calls a at conversation 536. The verdict is valid for its estimand; the drift
+    diagnostic beside it says the edge did not hold still."""
+
+    def probe(self, ys, n_pairings=3):
+        n = len(ys)
+        return decide(list(ys), {'round_deals': 1, 'max_rounds': n, 'block': 1, 'model_based': False}, n_pairings, n,
+                      groups=list(range(n)))
+
+    def test_the_reviewers_sequence_is_flagged(self):
+        ys = [100.0] * 700 + [-100.0] * 700
+        v = self.probe(ys)
+        self.assertEqual(v['edge'], 0.0)
+        self.assertEqual((v['verdict'], v['decided_at_conversation']), ('a', 536))
+        self.assertEqual(v['drift']['status'], 'drift detected')
+        self.assertEqual((v['drift']['early'], v['drift']['late']), (100.0, -100.0))
+        rng = np.random.default_rng(77)
+        noisy = self.probe(list(np.array(ys) + 300 * rng.standard_normal(1400)))
+        self.assertEqual(noisy['drift']['status'], 'drift detected')
+
+    def test_a_steady_edge_is_not_flagged(self):
+        rng = np.random.default_rng(78)
+        flagged = sum(self.probe(list(60 + 300 * rng.standard_normal(200)))['drift']['status'] == 'drift detected'
+                      for _ in range(200))
+        self.assertLessEqual(flagged, 8)               # DRIFT_ALPHA = 1%: about 2 of 200
+        self.assertEqual(self.probe([10.0, 20.0, 30.0])['drift']['status'], 'unknown')
+
+    def test_the_verdict_text_carries_it(self):
+        from test_ratings import plan, run, deals_between
+        rng = np.random.default_rng(79)
+        ds = deals_between('x', 'y', 0, 10, rng, sd=50, rounds=6, reps=4,
+                           effects=[300.0] * 12 + [-300.0] * 12)
+        r = run(ds, plan(['x', 'y'], 10, 6, reps=4), boot=20)
+        [m] = r['pairings']
+        self.assertEqual(m['drift']['status'], 'drift detected')
+        self.assertIn('drift detected', R.verdicts(r))
+
+
 if __name__ == '__main__':
     unittest.main()
