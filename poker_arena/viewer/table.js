@@ -247,7 +247,7 @@
         <span class="seat-badge">${s.badge || ''}<span class="dealer" title="Dealer button">D</span></span>
         <div class="who"><div class="name">${s.name}${s.effort ? `<span class="effort">${s.effort}</span>` : ''}</div>
           <div class="sub"><span class="stack-amt"></span><span class="seat-act"></span><span class="seat-net"></span></div>
-          <div class="made" title="Best hand with the board so far, from both players' cards: the players cannot see each other's"></div></div>
+          <div class="made" title="Best hand so far from this seat's own cards and the board; viewers see both hands, each player saw only its own"></div></div>
         <span class="hole"></span><span class="turn">to act</span></div>`;
     const top = seats.map((s, i) => i ? seat(s, i) : '').join('');
     return `<div class="ptable n${n} ${opts.compact ? 'compact' : ''}">
