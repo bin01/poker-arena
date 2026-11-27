@@ -4,3 +4,5 @@ __pycache__/
 *.egg-info/
 runs/
 .pytest_cache/
+tests/.tmp/*
+!tests/.tmp/.gitkeep

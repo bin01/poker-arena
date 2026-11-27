@@ -14,22 +14,42 @@
 # to wait when the plan's usage limit is hit), max_wait (total seconds to keep waiting).
 # Check them with: python -m poker_arena doctor
 
-[players.claude-opus]
+[players.claude-fable-5-2-high]
+backend = "claude"
+model = "claude-fable-5-2"
+effort = "high"
+
+[players.claude-opus-5-5-high]
 backend = "claude"
 model = "claude-opus-5-5"
 effort = "high"       # low, medium, high, xhigh, max (claude --effort)
 
-[players.claude-sonnet]
+[players.claude-sonnet-5-5-high]
 backend = "claude"
 model = "claude-sonnet-5-5"
 effort = "high"
 
-[players.codex-gpt]
+[players.claude-haiku-5-5-high]
+backend = "claude"
+model = "claude-haiku-5-5"
+effort = "high"
+
+[players.gpt-6-luna-high]
 backend = "codex"
 model = "gpt-6-luna"
 effort = "high"       # model_reasoning_effort
 
-[players.gemini-agy]
+[players.gpt-6-2-sol-high]
+backend = "codex"
+model = "gpt-6.2-sol"
+effort = "high"
+
+[players.gpt-6-2-astra-high]
+backend = "codex"
+model = "gpt-6.2-astra"
+effort = "high"
+
+[players.gemini-4-neon-high]
 backend = "agy"
 effort = "high"       # agy --effort; this model is also the "-high" variant (see `agy models`)
 # Always set a model: agy's default comes from your own settings and can be a non-Gemini model.
@@ -45,6 +65,11 @@ model = "gemini-4-neon-high"   # see `agy models`
 # model = "llama3.3"
 
 # Baseline bots: free, instant, and they anchor the scale.
+[players.gemini-4-hydrogen-high]
+backend = "agy"
+effort = "high"
+model = "gemini-4-hydrogen-high"
+
 [players.random]
 label = "Random bot"
 bot = "random"
@@ -56,3 +81,7 @@ bot = "station"   # always checks or calls
 [players.rule]
 label = "Rule bot"
 bot = "rule"      # equity vs pot odds, value bets, never bluffs
+
+[players.reference]
+label = "Reference bot"
+bot = "reference" # fixed, versioned (reference-1): tight-aggressive, position-aware, equity vs range and pot odds

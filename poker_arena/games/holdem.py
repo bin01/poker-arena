@@ -4,10 +4,11 @@ Every hand is dealt from its own seed, so a duplicate match deals the same cards
 and only the models in those seats change. The button moves one seat each hand.
 
 Actions (the `action` field of a reply): fold, check, call, raise (with `amount`: the total you
-bet this street, "raise to"; a first bet on a street is also a raise), all_in. A raise below the
-minimum is raised to the minimum, one above your stack is an all-in, and the seat is told.
+bet this street, "raise to"; a first bet on a street is also a raise), all_in. `HoldemHand.apply` has the
+correction policy: strategically different or unplayable replies are sent back, fixable sizes are adjusted.
 """
 from __future__ import annotations
+import math
 import random
 
 from ..cards import shuffled, evaluate, describe
@@ -16,6 +17,27 @@ from .base import Game, Episode, Event, Request
 
 STREETS = ['preflop', 'flop', 'turn', 'river']
 ACTIONS = ['fold', 'check', 'call', 'raise', 'all_in']
+
+
+def whole_chips(x):
+    """(chips, None) for a usable amount, else (None, why not). Infinity, NaN, booleans and text are refused."""
+    if isinstance(x, bool) or x is None:
+        return None, 'The amount is missing.' if x is None else f'{x!r} is not an amount.'
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return None, f'{x!r} is not a number.'
+    if not math.isfinite(f):
+        return None, f'{x!r} is not a finite number.'
+    return int(round(f)), None
+
+
+def json_safe(x):
+    if x is None or isinstance(x, (bool, int, str)):
+        return x
+    if isinstance(x, float):
+        return x if math.isfinite(x) else str(x)
+    return str(x)
 
 
 def cards_text(cards):
@@ -46,9 +68,12 @@ class HoldemHand(Episode):
         self.done = False
         self.payoffs = [0] * n
         self.result = {}
+        self.uncalled = None
+        self.made_by_street = {'preflop': self.made_hands()}
 
         self._emit('hand_start', {'hand': index, 'button': self.button, 'names': names, 'stack': self.start,
-                                  'sb': self.sb, 'bb': self.bb, 'hole': self.hole, 'seed': seed},
+                                  'sb': self.sb, 'bb': self.bb, 'hole': self.hole, 'seed': seed,
+                                  'omniscient': {'made_hand': self.made_by_street['preflop']}},
                    visible=[])  # the full deal is logged for the viewer only
         for i in range(n):
             self._emit('hole', {'seat': i, 'cards': self.hole[i]}, visible=[i])
@@ -61,6 +86,7 @@ class HoldemHand(Episode):
         self._post(bb_seat, self.bb, 'big blind')
         self.to_act = sb_seat if n == 2 else self._next_active(bb_seat)
         self._check_round()
+        self.events[0].data['to_act'] = None if self.done else self.to_act
 
     # ---- helpers -------------------------------------------------------------------------------
     def _emit(self, kind, data, visible=None):
@@ -88,6 +114,11 @@ class HoldemHand(Episode):
             if self._can_act(j):
                 return j
         return None
+
+    def made_hands(self) -> dict:
+        """Every seat's best hand from its cards and the board so far, folded seats included. Omniscient: it
+        reads every seat's hole cards, so it is for the viewer, never shown to a seat."""
+        return {i: describe(evaluate(self.hole[i] + self.board)) for i in range(self.n)}
 
     @property
     def pot(self):
@@ -154,31 +185,64 @@ class HoldemHand(Episode):
     def fallback(self, seat):
         return {'action': 'check' if 'check' in self.legal(seat) else 'fold'}
 
+    def raise_closed(self, seat):
+        """The seat may not raise only because the betting wasn't reopened (an all-in short of a full raise)."""
+        others = [i for i in self._in_hand() if i != seat and self.stacks[i] > 0]
+        return not self.can_raise[seat] and bool(others) and self.street_bet[seat] + self.stacks[seat] > self.current_bet
+
     def apply(self, seat, action: dict) -> str | None:
-        """Apply a seat's reply; returns an error message (nothing changed) if it can't be played.
-        Fixable sizes are corrected, and the correction is returned in the logged action's `note`."""
+        """Apply a seat's reply, or return an error (nothing changed) so the seat is asked again.
+
+        The correction policy: an action that isn't allowed, or that would have to become a strategically
+        different action (fold when you can check, raise when the betting is closed, a raise that isn't
+        above the current bet, a missing or non-finite amount), is an error. A legal intent whose size can't
+        be played is adjusted: a call with nothing to call is a check, a raise when you can only call (all in,
+        or against an all-in) is a call, a raise below the minimum is the minimum, one above your stack is
+        all in. The logged action then carries `requested`, `correction` = {kind: 'sizing', reason} and
+        `note` (the reason, which the seat is shown)."""
         assert not self.done and seat == self.to_act
         kind = str(action.get('action') or '').strip().lower().replace('-', '_').replace(' ', '_')
         kind = {'bet': 'raise', 'allin': 'all_in', 'shove': 'all_in', 'jam': 'all_in'}.get(kind, kind)
         legal = self.legal(seat)
         tc, rb = self.to_call(seat), self.raise_bounds(seat)
         note = None
-        if kind == 'check' and 'check' not in legal:
-            return f'You cannot check: there is {tc} to call. Choose fold, call' + (' or raise.' if rb else '.')
-        if kind == 'call' and 'call' not in legal:
-            kind, note = 'check', 'nothing to call: treated as a check'
-        if kind == 'fold' and 'fold' not in legal:
-            kind, note = 'check', 'nothing to call: a fold is treated as a check'
-        if kind in ('raise', 'all_in') and not rb:
-            if 'call' in legal:
-                kind, note = 'call', 'you cannot raise here: treated as a call'
-            else:
-                kind, note = 'check', 'you cannot raise here: treated as a check'
         if kind not in ACTIONS:
             return f'Unknown action {action.get("action")!r}. Use one of: {", ".join(legal)}.'
+        if kind == 'check' and 'check' not in legal:
+            return f'You cannot check: there is {tc} to call. Choose fold, call' + (' or raise.' if rb else '.')
+        if kind == 'fold' and 'fold' not in legal:
+            return 'You cannot fold: there is nothing to call. Choose check' + (' or bet.' if rb else '.')
+        if kind == 'call' and 'call' not in legal:
+            kind, note = 'check', 'nothing to call: treated as a check'
+        if kind in ('raise', 'all_in') and not rb:
+            if self.raise_closed(seat):
+                return ('You cannot raise: the last all-in was less than a full raise, so the betting is not '
+                        'reopened for you. Choose ' + ('fold or call.' if 'call' in legal else 'check.'))
+            if 'call' in legal:
+                kind, note = 'call', 'you can only call here (all in, or against an all-in): treated as a call'
+            else:
+                kind, note = 'check', 'you cannot bet here: treated as a check'
+        to = None
+        if kind == 'raise':
+            lo, hi = rb
+            asked = action.get('amount')
+            to, why = whole_chips(asked)
+            if why:
+                return f'{why} A raise needs "amount": your total for this street, a whole number from {lo} to {hi}.'
+            if isinstance(asked, float) and asked != to:
+                note = f'{asked} rounded to {to}'
+            if to > hi:
+                to, note = hi, f'{asked} is more than you have: all in for {hi}'
+            elif to <= self.current_bet:
+                return (f'A raise to {to} is not a raise: the bet this street is already {self.current_bet}. '
+                        f'"amount" is your total for this street (raise to), from {lo} to {hi}.')
+            elif to < lo:
+                to, note = lo, f'{asked} is below the minimum: raised to {lo}'
 
         say = str(action.get('say') or '').strip()
-        entry = {'seat': seat, 'street': STREETS[self.street], 'action': kind, 'say': say}
+        pot_before = self.pot
+        entry = {'seat': seat, 'street': STREETS[self.street], 'action': kind, 'say': say, 'to_call': tc,
+                 'pot_before': pot_before, 'pot_odds': round(tc / (pot_before + tc), 4) if tc else None}
         if kind == 'fold':
             self.folded[seat] = True
         elif kind == 'check':
@@ -189,18 +253,8 @@ class HoldemHand(Episode):
             if self.stacks[seat] == 0:
                 entry['all_in'] = True
         else:
-            lo, hi = rb
             if kind == 'all_in':
-                to = hi
-            else:
-                try:
-                    to = int(round(float(action.get('amount'))))
-                except (TypeError, ValueError):
-                    return f'A raise needs an amount: your total for this street, between {lo} and {hi}.'
-                if to > hi:
-                    to, note = hi, f'{action.get("amount")} is more than you have: all in for {hi}'
-                elif to < lo:
-                    to, note = lo, f'{action.get("amount")} is below the minimum: raised to {lo}'
+                to = rb[1]
             increment = to - self.current_bet
             full = increment >= self.min_raise
             opening = self.current_bet == 0
@@ -217,12 +271,16 @@ class HoldemHand(Episode):
                 self.min_raise = increment
         if note:
             entry['note'] = note
+            entry['requested'] = {'action': json_safe(action.get('action')), 'amount': json_safe(action.get('amount'))}
+            entry['correction'] = {'kind': 'sizing', 'reason': note}
         self.acted[seat] = True
         self.can_raise[seat] = False
         entry['pot'] = self.pot
         self.history.append(entry)
         self._emit('action', entry)
+        street = self.street
         self._advance(seat)
+        entry['to_act'] = None if self.done or self.street != street else self.to_act
         return None
 
     # ---- flow --------------------------------------------------------------------------------
@@ -250,18 +308,20 @@ class HoldemHand(Episode):
                 return self._showdown()
             return self._runout()
         self.street += 1
-        self._deal_board()
         self.street_bet = [0] * self.n
         self.acted = [False] * self.n
         self.can_raise = [True] * self.n
         self.min_raise = self.bb
         self.to_act = self._next_active(self.button)  # first seat left of the button (heads-up: the big blind)
+        self._deal_board(self.to_act)
 
-    def _deal_board(self):
+    def _deal_board(self, to_act=None):
         count = {1: 3, 2: 4, 3: 5}[self.street]
         new = self.deck_board[len(self.board):count]
         self.board = self.deck_board[:count]
-        self._emit('board', {'street': STREETS[self.street], 'cards': new, 'board': list(self.board)})
+        self.made_by_street[STREETS[self.street]] = self.made_hands()
+        self._emit('board', {'street': STREETS[self.street], 'cards': new, 'board': list(self.board),
+                             'omniscient': {'made_hand': self.made_by_street[STREETS[self.street]]}, 'to_act': to_act})
 
     def _runout(self):
         if len(self._in_hand()) > 1:
@@ -282,8 +342,20 @@ class HoldemHand(Episode):
     def _finish(self):
         self._award(None)
 
+    def _return_uncalled(self):
+        """The part of the largest contribution nobody matched goes back to its seat before the pot is awarded
+        (a 'return' event), so the pot is only what was contested."""
+        top = max(range(self.n), key=lambda i: self.committed[i])
+        excess = self.committed[top] - max(c for i, c in enumerate(self.committed) if i != top)
+        if excess > 0:
+            self.committed[top] -= excess
+            self.stacks[top] += excess
+            self.uncalled = {'seat': top, 'amount': excess}
+            self._emit('return', dict(self.uncalled))
+
     def _award(self, scores):
         """Main and side pots by contribution level; ties split, odd chips to the first seat left of the button."""
+        self._return_uncalled()
         contenders = self._in_hand()
         won = [0] * self.n
         levels = sorted({self.committed[i] for i in contenders if self.committed[i] > 0})
@@ -313,6 +385,7 @@ class HoldemHand(Episode):
             self.stacks[i] += won[i]
         self.payoffs = [self.stacks[i] - self.start for i in range(self.n)]
         self.result = {'won': won, 'net': self.payoffs, 'board': list(self.board), 'pot': self.pot,
+                       'uncalled_return': self.uncalled,
                        'showdown': scores is not None and len(contenders) > 1,
                        'best': {i: describe(scores[i]) for i in contenders} if scores else {}}
         self._emit('result', self.result)
@@ -349,6 +422,8 @@ class HoldemHand(Episode):
         if ev.kind == 'showdown':
             return 'Showdown: ' + '; '.join(f'{you(int(i))} {cards_text(h["cards"])} ({h["best"]})'
                                             for i, h in d['hands'].items()) + '.'
+        if ev.kind == 'return':
+            return f'{you(d["seat"])} get{"" if d["seat"] == seat else "s"} back the uncalled {d["amount"]}.'
         if ev.kind == 'result':
             winners = [i for i, w in enumerate(d['won']) if w > 0]
             parts = [f'{you(i)} win{"" if i == seat else "s"} {d["won"][i]}' for i in winners]
@@ -358,7 +433,7 @@ class HoldemHand(Episode):
 
     def summary(self):
         return {'hand': self.index, 'button': self.button, 'hole': self.hole, 'board': list(self.board),
-                'actions': self.history, **self.result}
+                'actions': self.history, **self.result, 'omniscient': {'made_hand': self.made_by_street}}
 
 
 @register
@@ -375,6 +450,9 @@ class Holdem(Game):
 
     def episode(self, index, seed, names):
         return HoldemHand(self, index, seed, names)
+
+    def verify(self, seed, button, recorded_hand, events=None):
+        return verify_hand(self, seed, button, recorded_hand, events)
 
     def response_schema(self):
         return {
@@ -411,3 +489,128 @@ YOUR RESPONSE
 Reply with only a JSON object (no code fence, no other text):
 {{"reasoning": "your private thinking about this decision, brief", "action": "fold" | "check" | "call" | "raise" | "all_in", "amount": the total you are betting this street when you raise or bet (an integer), otherwise null, "say": "table talk" or "", "notes": "your updated notes" or null}}
 To bet when nobody has bet yet, use "raise" with the amount of your bet."""
+
+
+VERIFY_IGNORE = {'note', 'requested', 'correction', 'decision_id'}   # how a reply was corrected, and its link: not what was played
+
+
+def _plain(x):
+    import json
+    return json.loads(json.dumps(x, default=str))
+
+
+# Fields the engine derives from the cards and actions (added to the logs over time). A record that lacks one is
+# checked on everything else; a record that has one must match the replay.
+DERIVED = {'pot_before', 'pot_odds', 'to_act', 'to_call', 'omniscient', 'made_hand', 'uncalled_return'}
+
+
+def _with_uncalled(result: dict, uncalled: dict | None) -> dict:
+    """A result in the form recorded before uncalled chips were returned explicitly: the returned chips counted
+    in the pot and in what their seat won."""
+    out = {k: v for k, v in result.items() if k != 'uncalled_return'}
+    if uncalled:
+        out['pot'] = result['pot'] + uncalled['amount']
+        out['won'] = [w + (uncalled['amount'] if i == uncalled['seat'] else 0) for i, w in enumerate(result['won'])]
+    return out
+
+
+def _as_recorded(result: dict, recorded: dict, uncalled: dict | None) -> dict:
+    """The replayed result in the recorded hand's form: a hand recorded before `uncalled_return` existed may
+    count the returned chips in its pot and winnings."""
+    if 'uncalled_return' in recorded or not uncalled or recorded.get('pot') == result.get('pot'):
+        return result if 'uncalled_return' in recorded else {k: v for k, v in result.items() if k != 'uncalled_return'}
+    return _with_uncalled(result, uncalled)
+
+
+def verify_hand(game: Holdem, seed, button, recorded_hand: dict, events: list | None = None) -> dict:
+    """Check a recorded hand against the engine, without trusting the record: regenerate the deal from `seed`,
+    replay the recorded actions through `apply` (each must be the legal move of the seat to act), and compare the
+    cards, board, every action's pot and price, the payouts and the summary with what was recorded. `events` (the
+    hand's rows from events.jsonl, optional) are checked the same way. Returns {ok, errors}."""
+    errors = []
+    rec = _plain(recorded_hand or {})
+    index = rec.get('hand')
+    if not isinstance(index, int) or index < 0:
+        return {'ok': False, 'errors': [f'the hand has no valid index ({index!r})']}
+    names = None
+    evs = [_plain(e) for e in events or []]
+    start = next((e for e in evs if e.get('kind') == 'hand_start'), None)
+    if start:
+        names = (start.get('data') or {}).get('names')
+    ep = HoldemHand(game, index, seed, list(names or [f'P{i}' for i in range(len(rec.get('hole') or []) or 2)]))
+    if button is not None and ep.button != button:
+        errors.append(f'button: recorded {button}, but hand {index} has the button on seat {ep.button}')
+    if rec.get('button') is not None and rec['button'] != ep.button:
+        errors.append(f'button: the record says {rec["button"]}, the engine {ep.button}')
+    if rec.get('hole') != _plain(ep.hole):
+        errors.append(f'hole cards differ from the deal of seed {seed}: recorded {rec.get("hole")}, dealt {ep.hole}')
+    for k, a in enumerate(rec.get('actions') or []):
+        if ep.done:
+            errors.append(f'action {k}: recorded after the hand was over')
+            break
+        if a.get('seat') != ep.to_act:
+            errors.append(f'action {k}: seat {a.get("seat")} acted, but seat {ep.to_act} was to act')
+            break
+        kind = {'bet': 'raise'}.get(a.get('action'), a.get('action'))
+        move = {'action': kind, 'amount': a.get('amount') if kind == 'raise' else None, 'say': a.get('say', '')}
+        err = ep.apply(ep.to_act, move)
+        if err:
+            errors.append(f'action {k} ({a.get("action")} {a.get("amount")}): illegal: {err}')
+            break
+        if ep.history[-1].get('correction'):
+            errors.append(f'action {k} ({a.get("action")} {a.get("amount")}): not playable as recorded '
+                          f'({ep.history[-1]["note"]})')
+            break
+        want = {x: v for x, v in a.items() if x not in VERIFY_IGNORE}
+        got = {x: v for x, v in _plain(ep.history[-1]).items()
+               if x not in VERIFY_IGNORE and (x in want or x not in DERIVED)}
+        if got.get('to_act', 0) is None and not ep.done and want.get('to_act') == ep.to_act:
+            got['to_act'] = ep.to_act   # older logs named the next street's first actor on a street's closing action
+        if got != want:
+            diff = sorted(x for x in set(got) | set(want) if got.get(x) != want.get(x))
+            errors.append(f'action {k}: recorded {", ".join(f"{x}={want.get(x)!r}" for x in diff)}; '
+                          f'replayed {", ".join(f"{x}={got.get(x)!r}" for x in diff)}')
+    if not errors and not ep.done:
+        errors.append('the recorded actions end before the hand is over')
+    if not errors:
+        replayed = _as_recorded(_plain(ep.summary()), rec, _plain(ep.uncalled))
+        for key in ('board', 'won', 'net', 'pot', 'uncalled_return', 'showdown', 'best', 'omniscient'):
+            if key in DERIVED and key not in rec:
+                continue
+            if rec.get(key) != replayed.get(key):
+                errors.append(f'{key}: recorded {rec.get(key)!r}, replayed {replayed.get(key)!r}')
+        if sum(rec.get('net') or [1]) != 0:
+            errors.append(f'net results do not sum to zero: {rec.get("net")}')
+        if events is not None:
+            errors += _verify_events(ep, evs)
+    return {'ok': not errors, 'errors': errors}
+
+
+def _verify_events(ep: HoldemHand, evs: list) -> list[str]:
+    out = []
+    played = [e for e in evs if e.get('kind') != 'thought']
+    engine = [_plain(e.to_json()) for e in ep.events]
+    rec = next((e.get('data') or {} for e in played if e.get('kind') == 'result'), {})
+    if 'uncalled_return' not in rec:   # recorded before uncalled chips were returned explicitly
+        engine = [{**e, 'data': _as_recorded(e['data'], rec, _plain(ep.uncalled))} if e['kind'] == 'result' else e
+                  for e in engine if e['kind'] != 'return']
+    if len(played) != len(engine):
+        return [f'events: {len(played)} recorded, the replay emits {len(engine)}']
+    for k, (got, want) in enumerate(zip(played, engine)):
+        g, w = dict(got.get('data') or {}), dict(want['data'])
+        if got.get('kind') != want['kind'] or got.get('visible') != want['visible']:
+            out.append(f'event {k}: recorded {got.get("kind")} visible to {got.get("visible")}, '
+                       f'replayed {want["kind"]} visible to {want["visible"]}')
+            continue
+        if want['kind'] == 'action':
+            g = {x: v for x, v in g.items() if x not in VERIFY_IGNORE}
+            w = {x: v for x, v in w.items() if x not in VERIFY_IGNORE}
+        w = {x: v for x, v in w.items() if x in g or x not in DERIVED}
+        nxt = engine[k + 1] if k + 1 < len(engine) else None
+        if (want['kind'] == 'action' and w.get('to_act', 0) is None and nxt and nxt['kind'] == 'board'
+                and g.get('to_act') is not None and g.get('to_act') == nxt['data'].get('to_act')):
+            w['to_act'] = g['to_act']
+        if g != w:
+            diff = sorted(x for x in set(g) | set(w) if g.get(x) != w.get(x))
+            out.append(f'event {k} ({want["kind"]}): {", ".join(diff)} differ from the replay')
+    return out

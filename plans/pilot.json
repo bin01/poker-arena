@@ -3,85 +3,85 @@
   "game_config": {},
   "players_file": "players.toml",
   "players": [
-    "claude-opus",
-    "claude-sonnet",
-    "codex-gpt",
-    "gemini-agy",
+    "claude-opus-5-5-high",
+    "claude-sonnet-5-5-high",
+    "gpt-6-luna-high",
+    "gemini-4-neon-high",
     "rule",
     "station",
     "random"
   ],
   "matchups": [
     [
-      "claude-opus",
-      "claude-sonnet"
+      "claude-opus-5-5-high",
+      "claude-sonnet-5-5-high"
     ],
     [
-      "claude-opus",
-      "codex-gpt"
+      "claude-opus-5-5-high",
+      "gpt-6-luna-high"
     ],
     [
-      "claude-opus",
-      "gemini-agy"
+      "claude-opus-5-5-high",
+      "gemini-4-neon-high"
     ],
     [
-      "claude-opus",
+      "claude-opus-5-5-high",
       "rule"
     ],
     [
-      "claude-opus",
+      "claude-opus-5-5-high",
       "station"
     ],
     [
-      "claude-opus",
+      "claude-opus-5-5-high",
       "random"
     ],
     [
-      "claude-sonnet",
-      "codex-gpt"
+      "claude-sonnet-5-5-high",
+      "gpt-6-luna-high"
     ],
     [
-      "claude-sonnet",
-      "gemini-agy"
+      "claude-sonnet-5-5-high",
+      "gemini-4-neon-high"
     ],
     [
-      "claude-sonnet",
+      "claude-sonnet-5-5-high",
       "rule"
     ],
     [
-      "claude-sonnet",
+      "claude-sonnet-5-5-high",
       "station"
     ],
     [
-      "claude-sonnet",
+      "claude-sonnet-5-5-high",
       "random"
     ],
     [
-      "codex-gpt",
-      "gemini-agy"
+      "gpt-6-luna-high",
+      "gemini-4-neon-high"
     ],
     [
-      "codex-gpt",
+      "gpt-6-luna-high",
       "rule"
     ],
     [
-      "codex-gpt",
+      "gpt-6-luna-high",
       "station"
     ],
     [
-      "codex-gpt",
+      "gpt-6-luna-high",
       "random"
     ],
     [
-      "gemini-agy",
+      "gemini-4-neon-high",
       "rule"
     ],
     [
-      "gemini-agy",
+      "gemini-4-neon-high",
       "station"
     ],
     [
-      "gemini-agy",
+      "gemini-4-neon-high",
       "random"
     ],
     [

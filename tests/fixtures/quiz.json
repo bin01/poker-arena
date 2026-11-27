@@ -1,0 +1,346 @@
+{
+ "fixture": true,
+ "suite": {
+  "name": "Poker fundamentals",
+  "version": "fixture-1"
+ },
+ "spots": [
+  {
+   "id": "river-bluff-catch",
+   "title": "Bluff-catcher on the river",
+   "kind": "pot_odds",
+   "street": "river",
+   "hole": [
+    "Ah",
+    "Jc"
+   ],
+   "board": [
+    "Kd",
+    "9s",
+    "4h",
+    "2c",
+    "7d"
+   ],
+   "pot": 80,
+   "to_call": 20,
+   "hero_bet": 0,
+   "villain_bet": 20,
+   "stack": 180,
+   "villain_stack": 160,
+   "bb": 2,
+   "button": 1,
+   "situation": "Opponent bets 10 bb into 30 bb",
+   "equity": 0.4,
+   "equity_note": "against the stated betting range",
+   "best": "call",
+   "ev": {
+    "fold": 0,
+    "call": 10.0
+   },
+   "explain": "A call of 10 bb wins a 50 bb pot, so it needs to win 20% of the time. Ace high wins about 40% against the stated range, so calling earns about 10 bb on average."
+  },
+  {
+   "id": "turn-flush-draw",
+   "title": "Flush draw facing a big turn bet",
+   "kind": "pot_odds",
+   "street": "turn",
+   "hole": [
+    "8h",
+    "7h"
+   ],
+   "board": [
+    "Ah",
+    "Kh",
+    "2c",
+    "9s"
+   ],
+   "pot": 100,
+   "to_call": 60,
+   "hero_bet": 0,
+   "villain_bet": 60,
+   "stack": 160,
+   "villain_stack": 100,
+   "bb": 2,
+   "button": 0,
+   "situation": "Opponent bets 30 bb into 20 bb; all in next street",
+   "equity": 0.205,
+   "equity_note": "9 outs from 44 unseen cards",
+   "best": "fold",
+   "ev": {
+    "fold": 0,
+    "call": -13.6
+   },
+   "explain": "Nine hearts complete the flush: about 20% with one card to come. Calling needs 37.5%, so a call loses about 13.6 bb on average."
+  },
+  {
+   "id": "preflop-nines-shove",
+   "title": "Pocket nines against an all-in",
+   "kind": "all_in",
+   "street": "preflop",
+   "hole": [
+    "9s",
+    "9d"
+   ],
+   "board": [],
+   "pot": 202,
+   "to_call": 198,
+   "hero_bet": 2,
+   "villain_bet": 200,
+   "stack": 198,
+   "villain_stack": 0,
+   "bb": 2,
+   "button": 1,
+   "situation": "Opponent moves all in for 100 bb; it shows ace-king",
+   "equity": 0.55,
+   "equity_note": "against ace-king offsuit, exact enumeration",
+   "best": "call",
+   "ev": {
+    "fold": 0,
+    "call": 11.0
+   },
+   "explain": "Nines are a small favourite over ace-king: about 55%. The call needs 49.5%, so it earns about 11 bb."
+  },
+  {
+   "id": "river-small-bet-air",
+   "title": "A small river bet with nothing",
+   "kind": "pot_odds",
+   "street": "river",
+   "hole": [
+    "Qc",
+    "3d"
+   ],
+   "board": [
+    "Js",
+    "8s",
+    "5h",
+    "2d",
+    "Kc"
+   ],
+   "pot": 50,
+   "to_call": 10,
+   "hero_bet": 0,
+   "villain_bet": 10,
+   "stack": 150,
+   "villain_stack": 140,
+   "bb": 2,
+   "button": 0,
+   "situation": "Opponent bets 5 bb into 20 bb",
+   "equity": 0.08,
+   "equity_note": "against the stated betting range",
+   "best": "fold",
+   "ev": {
+    "fold": 0,
+    "call": -2.6
+   },
+   "explain": "Even a cheap call needs 16.7%. Queen high beats only the busted draws in the range, about 8%, so calling loses about 2.6 bb."
+  },
+  {
+   "id": "flop-top-pair-minraise",
+   "title": "Top pair facing a min-raise",
+   "kind": "pot_odds",
+   "street": "flop",
+   "hole": [
+    "Ks",
+    "Qd"
+   ],
+   "board": [
+    "Kh",
+    "7c",
+    "3d"
+   ],
+   "pot": 30,
+   "to_call": 8,
+   "hero_bet": 8,
+   "villain_bet": 16,
+   "stack": 184,
+   "villain_stack": 176,
+   "bb": 2,
+   "button": 0,
+   "situation": "Hero bets 4 bb; opponent raises to 8 bb",
+   "equity": 0.72,
+   "equity_note": "against the stated raising range",
+   "best": "call",
+   "ev": {
+    "fold": 0,
+    "call": 9.7
+   },
+   "explain": "The price is tiny (21%) and top pair with a good kicker is well ahead of the raising range, so folding gives up about 9.7 bb."
+  },
+  {
+   "id": "button-shove-10bb",
+   "title": "Shove or fold, 10 big blinds deep",
+   "kind": "shove",
+   "street": "preflop",
+   "hole": [
+    "Ks",
+    "9s"
+   ],
+   "board": [],
+   "pot": 3,
+   "to_call": 1,
+   "hero_bet": 1,
+   "villain_bet": 2,
+   "stack": 19,
+   "villain_stack": 18,
+   "bb": 2,
+   "button": 0,
+   "situation": "On the button with 10 bb; all in or fold",
+   "equity": null,
+   "best": "all_in",
+   "ev": {
+    "fold": 0,
+    "all_in": 0.8
+   },
+   "explain": "At 10 bb, king-nine suited is a profitable shove: the blinds and the times the opponent folds outweigh the times it calls with a better hand."
+  }
+ ],
+ "reference": [
+  "reference"
+ ],
+ "labels": {
+  "reference": "Reference bot"
+ },
+ "kinds": {
+  "reference": "bot"
+ },
+ "players": {
+  "reference": {
+   "answers": {
+    "river-bluff-catch": {
+     "action": "call",
+     "correct": true,
+     "ev_lost_bb": 0,
+     "reasoning": "Pot odds 25%; estimated equity 40% against a polarised river range. Call."
+    },
+    "turn-flush-draw": {
+     "action": "fold",
+     "correct": true,
+     "ev_lost_bb": 0,
+     "reasoning": "Draw equity 20% against a price of 37.5%, and no implied odds behind. Fold."
+    },
+    "preflop-nines-shove": {
+     "action": "call",
+     "correct": true,
+     "ev_lost_bb": 0.0
+    },
+    "river-small-bet-air": {
+     "action": "fold",
+     "correct": true,
+     "ev_lost_bb": 0
+    },
+    "flop-top-pair-minraise": {
+     "action": "call",
+     "correct": true,
+     "ev_lost_bb": 0.0
+    },
+    "button-shove-10bb": {
+     "action": "all_in",
+     "correct": true,
+     "ev_lost_bb": 0.0
+    }
+   }
+  },
+  "rule": {
+   "answers": {
+    "river-bluff-catch": {
+     "action": "call",
+     "correct": true,
+     "ev_lost_bb": 0
+    },
+    "turn-flush-draw": {
+     "action": "fold",
+     "correct": true,
+     "ev_lost_bb": 0
+    },
+    "preflop-nines-shove": {
+     "action": "call",
+     "correct": true,
+     "ev_lost_bb": 0.0
+    },
+    "river-small-bet-air": {
+     "action": "fold",
+     "correct": true,
+     "ev_lost_bb": 0
+    },
+    "flop-top-pair-minraise": {
+     "action": "call",
+     "correct": true,
+     "ev_lost_bb": 0.0
+    },
+    "button-shove-10bb": {
+     "action": "fold",
+     "correct": false,
+     "ev_lost_bb": 0.8
+    }
+   }
+  },
+  "station": {
+   "answers": {
+    "river-bluff-catch": {
+     "action": "call",
+     "correct": true,
+     "ev_lost_bb": 0
+    },
+    "turn-flush-draw": {
+     "action": "call",
+     "correct": false,
+     "ev_lost_bb": 13.6
+    },
+    "preflop-nines-shove": {
+     "action": "call",
+     "correct": true,
+     "ev_lost_bb": 0.0
+    },
+    "river-small-bet-air": {
+     "action": "call",
+     "correct": false,
+     "ev_lost_bb": 2.6
+    },
+    "flop-top-pair-minraise": {
+     "action": "call",
+     "correct": true,
+     "ev_lost_bb": 0.0
+    },
+    "button-shove-10bb": {
+     "action": "fold",
+     "correct": false,
+     "ev_lost_bb": 0.8
+    }
+   }
+  },
+  "random": {
+   "answers": {
+    "river-bluff-catch": {
+     "action": "fold",
+     "correct": false,
+     "ev_lost_bb": 10.0
+    },
+    "turn-flush-draw": {
+     "action": "call",
+     "correct": false,
+     "ev_lost_bb": 13.6
+    },
+    "preflop-nines-shove": {
+     "action": "call",
+     "correct": true,
+     "ev_lost_bb": 0.0
+    },
+    "river-small-bet-air": {
+     "action": "fold",
+     "correct": true,
+     "ev_lost_bb": 0
+    },
+    "flop-top-pair-minraise": {
+     "action": "fold",
+     "correct": false,
+     "ev_lost_bb": 9.7
+    },
+    "button-shove-10bb": {
+     "action": "all_in",
+     "correct": true,
+     "ev_lost_bb": 0.0
+    }
+   }
+  }
+ }
+}
