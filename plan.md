@@ -118,3 +118,74 @@ Work happens in three parallel tracks with **disjoint files**. Do not edit files
 - `python -m pytest -q` green after each track.
 - Screenshots at 1440 and 390 px of standings (live run, all runs, finished small run) and a match replay.
 - Fresh blind review (new Codex thread, same rubric). Repeat until every score > 8.
+
+---
+
+# Round 2 → 3
+
+Round 2 report: `/private/tmp/claude-501/-Users-snehal-Code-poker-arena/7391e5d9-a258-4fd4-b230-fb0d350c6f8f/scratchpad/review/r2-report.md`
+(ux=6 gameplay=7 evals=5 judges=4 overall=5). Issue numbers below (R2-#n) are that report's. Same three tracks, same file ownership.
+
+## Contract additions
+
+### One design, everywhere (A defines, C uses)
+- `ratings.normalize_design(plan: dict) -> dict | None`: the plan's design with defaults filled, `replicates` folded in,
+  and a preregistered `target_edge_bb100` (default 50) plus `deals_planned` (power-based: deals per pairing for 80% power
+  at the target edge, from a stated prior spread `prior_sd_bb100 = 350`, capped by max_rounds × round_deals × replicates).
+  Runner and ratings both call it; nothing else builds a design (R2-#9, #10).
+
+### Inference vs description (A computes, B displays)
+- A rank, a leader or a winner is **inferential** only when it comes from the sequential procedure at a completed
+  planned look: a pairing verdict `a`/`b`/`even` from `decide`. Everything recomputed on every refresh is
+  **descriptive** (R2-#2).
+- `rate()` adds `groups: [{id, players, leader | null, front_runner | null, front_runner_margin, ci95, power, ...}]`.
+  `leader` (inferential) only when that player has a decided winning verdict against every other player in the group;
+  `front_runner` is the descriptive top by point estimate. Top-level `leader`/`leaders` keep meaning "inferential".
+  Players get `rank_kind: 'decided' | 'descriptive'`.
+- All-time (pooled across runs) output is descriptive only: pairings carry `verdict: 'descriptive'` and the summary
+  says so (R2-#3).
+- Players carry `in_fit` (bool) and `identity_resolved` (bool) separately from `quarantined` (R2-#13).
+
+### Uncertainty (A)
+- Resampling unit = (conversation, block): a conversation is one match folder (one replicate of one round of one
+  pairing); blocks of `block` deals within it. Bootstrap jointly over aligned deal blocks shared across pairings in a
+  run (same seed range) so common-card correlation is kept; hierarchical: resample conversations, then blocks within
+  them (R2-#7, #8). Calibrate coverage with correlated tournament simulations in tests (fast, seeded).
+
+### Identity (A history, C config)
+- C writes `protocol` into each match config.json: `{fingerprint, settings}` where settings = the effective backend
+  settings that change behaviour (backend, model, effort, isolate, replace_instructions/system prompt sha, tool policy,
+  extra_args, max_fixes/retries, thinking display) and fingerprint = sha1 of them.
+- A's history identity = `backend:model:effort` + `#` + first 8 chars of the protocol fingerprint when present; players
+  with differing protocols never pool; a served-model mismatch (calls' served_model ≠ configured model) quarantines
+  the player for that run (R2-#6).
+
+### Fairness and recovery (C)
+- Tool use: any model turn that ran a tool (codex `command_execution`/`web_search`/`mcp_tool_call`/file items, agy
+  `tool` steps, claude `tool_use` blocks) is rejected: the reply is not used, the seat is asked again with a correction
+  of kind `tool_use`, and calls.jsonl records `tool_use: [...]`. Also pass every available codex flag that narrows tools
+  (R2-#1).
+- Atomic commit per hand: write hand row + checkpoint via temp file + rename (state.json carries `hands_committed`);
+  on resume, reconcile hands.jsonl, events.jsonl, calls.jsonl and raw.jsonl to `hands_committed` (R2-#4).
+- Bots persist and restore RNG state (R2-#5).
+- Every backend attempt keeps stdout, stderr, exit status, session id before/after; if a failed attempt may have
+  advanced a stateful CLI conversation, rebuild the conversation from committed turns before retrying (R2-#11).
+- Tournament lifecycle file `<out>/tournament.json`: `{status: 'running'|'finished'|'stopped', round, pairings: {"a|b":
+  {status: 'playing'|'waiting'|'decided'|'exhausted', verdict, looks_used}}, updated}` written by the runner (R2-#16).
+
+### Viewer (B)
+- Per-group hero summaries; no contradictions (R2-#12). Show inferential vs descriptive explicitly: "Decided" badge
+  only for inferential results; otherwise "ahead on points".
+- Honest wording: "reduces the luck of the cards", no "at least", "difference unresolved" instead of "level" (R2-#14).
+- Matchup header: cumulative score + verdict; the selected round's score labelled as such (R2-#15).
+- Lifecycle from tournament.json (fallback: plan + decisions.json) (R2-#16).
+- Mobile: results first (who's ahead, standings, watch), glossary collapsed, compact rows keep net and sample size,
+  scroll cues on wide tables (R2-#17).
+- Watch: start at step 0 with "Watch from start"; sticky controls; on mobile a Play 1 / Play 2 switcher (or
+  synchronized); "Next deal" continuous playback (R2-#18).
+- Table: "to act" (next actor) distinct from "last action" (R2-#19).
+- Style table: tendencies with numerator/denominator, no quality thresholds (R2-#20, with A providing counts).
+- A target-edge line: "This run was planned to detect a 50 bb/100 edge; that needs ~N deals per pairing; it has M."
+
+### Stats (A)
+- `stats.collect` gives each rate as `{n, of}` plus per-opponent breakdown (R2-#20).
