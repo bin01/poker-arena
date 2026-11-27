@@ -385,3 +385,25 @@ Round 7 report: `/private/tmp/claude-501/-Users-snehal-Code-poker-arena/7391e5d9
   checks visible), #10 (incremental cached inventory; index scoped to the selected run; standings render before optional
   quiz content; no loading flashes in screenshots), #11 (compact mobile watch view: both seats, board and one playback
   control in the first screen; secondary controls and methodology behind disclosures).
+
+---
+
+# Review loop: stopped (owner's rule: no material bugs and a fresh 8+)
+
+Fresh blind review round 13 (Codex gpt-6.1-sol, high): ux 8, gameplay 8, evals 7, judges 8, overall 8, material 0.
+The verifier of round 12's fixes found no new material bug; its one partial (a hand-name tooltip) is fixed (09fc572).
+Overall by round: 4, 5, 6, 6, 7, 6, 6, 7 (fresh), 8, 8, 7, 8, 8.
+
+## Follow-ups (improvements reviewers raised; none blocks results)
+1. Publication preset: strict identity by default; record immutable provider model revisions where available.
+2. Absolute poker ability: independently calibrated strong opponents, or solver/expert-labelled decisions, reported apart.
+3. Tournament-level power: plan by the chance of naming the best player, simulating shared-deal dependence.
+4. Independent engine validation: differential checks of deals, legal actions and payouts against a second implementation.
+5. Prompt audit: rebuild and compare every delivered prompt (visible events, private cards, notes, retries).
+6. Adaptation: report context retention and rebuilds; paired early-versus-late performance before claiming learning.
+7. Quiz: preregistered fresh seeds and a held-out publication set; re-run quiz-4 on the models (basics leaked in quiz-2).
+8. Standings: lead with direct matchup evidence and decision status; fitted strength and session Elo secondary.
+9. Replay: short comparison of the divergent actions and their share of the deal's swing.
+10. First visit: shorter visible qualifications; technical detail and affected spot ids on demand.
+11. External timestamped archive for preregistrations.
+12. Later product goals: 3-handed table mode and a human seat against two models.
