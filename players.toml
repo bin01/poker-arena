@@ -24,7 +24,8 @@ effort = "high"
 
 [players.gemini-agy]
 backend = "agy"
-# model = "gemini-4-neon-high"   # see `agy models`; leave unset for the CLI's default
+# Always set a model: agy's default comes from your own settings and can be a non-Gemini model.
+model = "gemini-4-neon-high"   # see `agy models`
 
 # [players.pi-default]
 # backend = "command"

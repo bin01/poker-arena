@@ -36,8 +36,9 @@ Code, Codex, Antigravity), so a tournament costs nothing beyond the plans you al
 - **Bots.** `random` (random legal moves), `station` (always checks or calls) and `rule` (Monte Carlo equity
   against pot odds, value bets, never bluffs). They are free, play instantly, anchor the scale and catch a
   broken prompt or backend at once.
-- **Ratings.** Deals are grouped into sessions of 10 deals (20 hands). A player wins a session if it is up in
-  chips over it. One Bradley–Terry fit over all sessions gives an Elo-scale rating (200 points ≈ winning 76% of
+- **Ratings.** Deals are grouped into sessions of 10 deals (20 hands). A player wins a session if it is up by
+  more than 1 big blind over it (closer is a tie). A player with fewer than 3 sessions is shown as provisional, with
+  no interval. One Bradley–Terry fit over all sessions gives an Elo-scale rating (200 points ≈ winning 76% of
   sessions), centred on 1500, with 90% intervals from a bootstrap over sessions within each matchup. bb/100 (big
   blinds won per 100 hands, with a standard error) is reported next to it. Sessions rather than single deals,
   because most deals are tiny pots: counted one by one, a random bot that wins many small pots and loses whole

@@ -3,7 +3,7 @@
 The unit is a duplicate deal: hand k of a matchup's two matches (a-first and b-first), in which each
 player held each seat's cards once, so the luck of the deal cancels. Deals are grouped in order into
 sessions of `SESSION` deals (10 deals = 20 hands); a player wins a session if its net chips over it are
-positive (a tie counts half). The Elo fit is over sessions:
+more than 1 big blind (0.1bb per deal); closer than that is a tie (half a win). The Elo fit is over sessions:
 
     P(A wins a 20-hand duplicate session against B) = logistic(r_A - r_B)
 
@@ -64,7 +64,15 @@ def _hands(d: Path):
     return out
 
 
-SESSION = 10  # deals per session (each deal is two hands)
+SESSION = 10       # deals per session (each deal is two hands)
+TIE_BB = 0.1       # a session within this many big blinds per deal of even is a tie (1bb over 10 deals)
+MIN_SESSIONS = 3   # fewer sessions than this: the rating is provisional and gets no interval
+
+
+def outcome(g):
+    """1, 0.5 or 0 for player a: a session within TIE_BB per deal of even is a tie."""
+    band = TIE_BB * g['deals'] * g['bb']
+    return 1.0 if g['net_a'] > band else 0.0 if g['net_a'] < -band else 0.5
 
 
 def sessions(deals, size=SESSION):
@@ -79,8 +87,9 @@ def sessions(deals, size=SESSION):
     return [s for s in by.values() if s['deals'] * 2 >= size]
 
 
-def fit(games, names, prior=2.0, iters=50):
-    """Ratings in logits (mean zero) from outcomes [{'a', 'b', 'net_a'}]; ties count half."""
+def fit(games, names, prior=1.5, iters=50):
+    """Ratings in logits (mean zero) from sessions; ties count half. The prior (sd 1.5 logits, as in
+    Clocktower) keeps a player with one or two results from flying off."""
     N = len(names)
     idx = {n: i for i, n in enumerate(names)}
     if not games:
@@ -90,7 +99,7 @@ def fit(games, names, prior=2.0, iters=50):
     for k, d in enumerate(games):
         X[k, idx[d['a']]] += 1
         X[k, idx[d['b']]] -= 1
-        y[k] = 1.0 if d['net_a'] > 0 else 0.0 if d['net_a'] < 0 else 0.5
+        y[k] = outcome(d)
     w = np.zeros(N)
     pr = np.full(N, 1 / prior ** 2)
     for _ in range(iters):
@@ -152,11 +161,12 @@ def ratings(root, boot=300, anchor: tuple[str, float] | None = None, seed=0, ses
     players = []
     for i, n in enumerate(names):
         mine = [g for g in games if n in (g['a'], g['b'])]
-        wins = sum(1 for g in mine if (g['net_a'] > 0) == (g['a'] == n) and g['net_a'] != 0)
-        ties = sum(1 for g in mine if g['net_a'] == 0)
-        lo, hi = (np.percentile(samples[:, i], [5, 95]) if len(samples) else (None, None))
+        wins = sum(1 for g in mine if outcome(g) == (1.0 if g['a'] == n else 0.0))
+        ties = sum(1 for g in mine if outcome(g) == 0.5)
+        provisional = len(mine) < MIN_SESSIONS
+        lo, hi = (np.percentile(samples[:, i], [5, 95]) if len(samples) and not provisional else (None, None))
         m, se, hands = rates[n]
-        players.append({'player': n, 'elo': round(float(point[i])),
+        players.append({'player': n, 'elo': round(float(point[i])), 'provisional': provisional,
                         'elo90': [round(float(lo)), round(float(hi))] if lo is not None else None,
                         'bb_per_100': None if m is None else round(m, 1),
                         'bb_per_100_se': None if se is None else round(se, 1),
@@ -172,8 +182,8 @@ def ratings(root, boot=300, anchor: tuple[str, float] | None = None, seed=0, ses
         matchups.append({'matchup': name, 'a': a, 'b': b, 'deals': len(ds),
                          'net_a_chips': sum(d['net_a'] for d in ds), 'a_bb_per_100': round(m, 1),
                          'se': round(sd / math.sqrt(len(ds)), 1),
-                         'a_session_wins': sum(g['net_a'] > 0 for g in games_by[name]),
-                         'b_session_wins': sum(g['net_a'] < 0 for g in games_by[name])})
+                         'a_session_wins': sum(outcome(g) == 1.0 for g in games_by[name]),
+                         'b_session_wins': sum(outcome(g) == 0.0 for g in games_by[name])})
     return {'players': players, 'matchups': matchups, 'deals': len(deals), 'sessions': len(games),
             'session_deals': session, 'anchor': list(anchor) if anchor else None, 'boot': boot}
 
@@ -181,7 +191,7 @@ def ratings(root, boot=300, anchor: tuple[str, float] | None = None, seed=0, ses
 def table(r) -> str:
     lines = [f'{"player":24} {"elo":>6} {"90% interval":>14} {"bb/100":>9} {"±se":>6} {"hands":>6} {"sessions W-T-L":>15}']
     for p in r['players']:
-        iv = f'{p["elo90"][0]}-{p["elo90"][1]}' if p['elo90'] else ''
+        iv = f'{p["elo90"][0]}-{p["elo90"][1]}' if p['elo90'] else 'provisional'
         bb = f'{p["bb_per_100"]:+.1f}' if p['bb_per_100'] is not None else ''
         lines.append(f'{p["player"]:24} {p["elo"]:>6} {iv:>14} {bb:>9} {p["bb_per_100_se"] or 0:>6.1f} '
                      f'{p["hands"]:>6} {p["session_wins"]:>7}-{p["session_ties"]}-{p["session_losses"]}')

@@ -70,7 +70,7 @@ async function renderBoard() {
       <td>${who(p.player)}</td>
       <td class="num"><b>${p.elo}</b></td>
       <td><span class="interval">${p.elo90 ? `<span style="left:${x(p.elo90[0])};width:calc(${x(p.elo90[1])} - ${x(p.elo90[0])})"></span>` : ''}<i style="left:${x(p.elo)}"></i></span>
-          <span class="muted">${p.elo90 ? p.elo90.join('–') : ''}</span></td>
+          <span class="muted">${p.elo90 ? p.elo90.join('–') : 'provisional'}</span></td>
       <td class="num ${cls(p.bb_per_100)}">${signed(p.bb_per_100, 1)}</td>
       <td class="num muted">±${p.bb_per_100_se ?? ''}</td>
       <td class="num">${p.hands}</td>
