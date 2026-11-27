@@ -433,7 +433,7 @@ function outcomeRow(rt, g, multi, first = true) {
   if (!descriptive && g.pairings.length) facts.push(chip(`${decided} of ${plural(g.pairings.length, 'matchup')} ${rt.track === 'adaptation' ? 'with an exploratory reading' : 'decided'}`, decided && rt.track !== 'adaptation' ? '' : 'quiet'));
   const drifts = g.pairings.filter(x => Core.driftQualified(x)).length;
   if (drifts) facts.push(chip(`${drifts} drifted · needs confirmation`, 'warn', 'Matchups where the test\'s bar was cleared while the edge changed between early and late conversations: not decided, and never a leader.'));
-  if (p && !isBot(who)) facts.push(identityChip(rt, [who], !!(p.identity_qualified || g.identity_qualified)));
+  if (p) facts.push(identityChip(rt, isBot(who) ? (g.players || []).map(pid) : [who], !!(p.identity_qualified || g.identity_qualified)));
   if (ineligible) facts.push(chip(`${ineligible} ineligible`, 'bad', 'Matchups the judge may not decide (identity, audit, protocol or registration): see Matchups.'));
   if (g.leader || g.qualified_leader) {
     const free = g.pairings.some(x => x.assumption && x.assumption.method === 'free');
@@ -1271,12 +1271,13 @@ function quizCategories(q) {
 }
 const num = (...xs) => xs.find(x => x != null && isFinite(x)) ?? null;
 
-// Which players chose differently on a spot: 'split' when their valid answers differ, 'missed' when someone's
-// was not the best, else 'agree'.
+// Which players chose differently on a spot: 'split' when their valid answers differ, 'missed' when someone's answer is missing, unverified or
+// not the best, else 'agree'.
 function spotAgreement(q, s) {
-  const as = q.players.map(x => x.answers[s.id]).filter(Boolean);
+  const all = q.players.map(x => x.answers[s.id]);
+  const as = all.filter(Boolean);
   const keys = new Set(as.map(a => Core.isFallback(a) ? 'fallback' : answerKey(a)));
-  const missed = as.some(a => Core.isFallback(a) || !(a.correct ?? (answerKey(a) === answerKey(s.best))));
+  const missed = as.length < all.length || as.some(a => Core.isFallback(a) || a.outcome === 'unverified' || !(a.correct ?? (answerKey(a) === answerKey(s.best))));
   return keys.size > 1 ? 'split' : missed ? 'missed' : 'agree';
 }
 const SPOT_FILTERS = [['all', 'All spots'], ['split', 'Players disagree'], ['missed', 'Someone missed'], ['agree', 'Everyone right']];
