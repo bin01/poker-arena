@@ -27,6 +27,45 @@ LIVE_SECONDS = 180    # a match without a result that wrote an event this recent
 PACE_SECONDS = 1800   # the ETA uses the pace over the last half hour of finished hands
 
 
+BOT_NAMES = {'random': 'Random bot', 'station': 'Calling station', 'rule': 'Rule bot'}
+LABELS: dict = {}   # labels from the current players.toml, which win over the ones recorded in old runs
+
+
+def pretty_model(model: str) -> str:
+    """'claude-opus-5-5' -> 'Claude Opus 5.5', 'gpt-6-luna' -> 'GPT-6 Luna', 'sonnet' -> 'Claude Sonnet'."""
+    if model in ('opus', 'sonnet', 'haiku'):
+        return 'Claude ' + model.title()
+    out = []
+    for tok in model.replace('_', '-').split('-'):
+        if tok.isdigit() and out and out[-1][-1].isdigit():
+            out[-1] += '.' + tok
+        elif tok.isdigit() and out and out[-1] == 'GPT':
+            out[-1] += '-' + tok
+        else:
+            out.append('GPT' if tok.lower() == 'gpt' else tok if any(c.isdigit() for c in tok) else tok.title())
+    return ' '.join(out)
+
+
+def display_name(pid: str, spec: dict) -> str:
+    """The name the viewer shows: the player's `label`, else one made from its model, else its id."""
+    if spec.get('label'):
+        return spec['label']
+    if 'bot' in spec:
+        return BOT_NAMES.get(spec['bot'], f'{spec["bot"]} bot')
+    if not spec.get('model'):
+        return pid
+    return pretty_model(str(spec['model'])) + (f' ({spec["effort"]})' if spec.get('effort') else '')
+
+
+def load_labels(players_file='players.toml') -> dict:
+    """Explicit labels from a players file, if there is one here."""
+    try:
+        from .runner import load_players
+        return {pid: s['label'] for pid, s in load_players(players_file).items() if s.get('label')}
+    except Exception:
+        return {}
+
+
 def _json(p: Path):
     try:
         return json.loads(p.read_text())
@@ -84,8 +123,7 @@ def _matchup(root: Path, m: Path):
             'matches': matches, 'deals_total': len(cfg.get('seeds', [])), 'pairs_done': len(both),
             'pair_net_a': sum(ha[k]['net'][0] + hb[k]['net'][1] for k in both),
             'kinds': {p: 'bot' if 'bot' in s else 'model' for p, s in specs.items()},
-            'via': {p: ' · '.join(str(x) for x in (s.get('backend'), s.get('model')) if x) if 'backend' in s
-                    else f'{s["bot"]} bot' for p, s in specs.items()},
+            'labels': {p: LABELS.get(p) or display_name(p, s) for p, s in specs.items()},
             'bb': cfg.get('game', {}).get('big_unit') or cfg.get('game', {}).get('bb') or 1,
             'live': any(x['live'] for x in matches), 'finished': len(matches) == 2 and all(x['finished'] for x in matches),
             'updated': max((_mtime(m / s / 'events.jsonl') for s in ('a-first', 'b-first')), default=0),
@@ -108,7 +146,7 @@ def _runs_and_matchups(root: Path):
                 by.setdefault(run, []).append({
                     'id': str(rel / f'{a}__vs__{b}') if run != '.' else f'{a}__vs__{b}', 'run': run, 'a': a, 'b': b,
                     'started': False, 'matches': [], 'deals_total': plan.get('deals', 0), 'pairs_done': 0,
-                    'pair_net_a': 0, 'kinds': {}, 'via': {}, 'bb': 1, 'live': False, 'finished': False,
+                    'pair_net_a': 0, 'kinds': {}, 'labels': {**plan.get('labels', {}), **LABELS}, 'bb': 1, 'live': False, 'finished': False,
                     'updated': 0, 'times': []})
     return by
 
@@ -137,7 +175,7 @@ def runs(root: Path):
         rate = None  # hands per second
         if live and len(recent) >= 4:
             rate = (len(recent) - 1) / max(1.0, recent[-1] - recent[0])
-        out.append({'run': run, 'matchups': len(ms), 'matchups_started': sum(m['started'] for m in ms),
+        out.append({'run': run, 'title': root.name if run == '.' else run.split('/')[-1], 'matchups': len(ms), 'matchups_started': sum(m['started'] for m in ms),
                     'matchups_finished': sum(m['finished'] for m in ms),
                     'players': sorted({m['a'] for m in ms} | {m['b'] for m in ms}),
                     'hands': done, 'hands_planned': planned, 'live': live,
@@ -175,9 +213,10 @@ def key(s: str) -> str:
                    for b in s.encode())
 
 
-def export(root, out) -> int:
+def export(root, out, players_file='players.toml') -> int:
     """A static copy of the viewer for the runs under root: the app plus every API answer as a file."""
     root, out = Path(root).resolve(), Path(out)
+    LABELS.update(load_labels(players_file))
     data = out / 'data'
     data.mkdir(parents=True, exist_ok=True)
     for f in VIEWER.iterdir():
@@ -206,7 +245,7 @@ def export(root, out) -> int:
                 x['live'] = False
                 data_ = match(root, x['id'])
                 specs = data_['config'].get('specs', {})  # only what the viewer shows: no commands, paths or URLs
-                data_['config']['specs'] = {p: {k: v for k, v in s.items() if k in ('backend', 'model', 'bot', 'effort')}
+                data_['config']['specs'] = {p: {k: v for k, v in s.items() if k in ('label', 'model', 'bot', 'effort')}
                                             for p, s in specs.items()}
                 put(f'match-{key(x["id"])}.json', data_)
         put(f'index-{key(r["run"])}.json', ms)
@@ -214,8 +253,9 @@ def export(root, out) -> int:
     return files
 
 
-def serve(root, port=8800, host='127.0.0.1'):
+def serve(root, port=8800, host='127.0.0.1', players_file='players.toml'):
     root = Path(root).resolve()  # match folders are resolved before use, so the root must be too
+    LABELS.update(load_labels(players_file))
     cache = {}
 
     def ratings_json(run):

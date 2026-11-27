@@ -192,7 +192,8 @@ async def run_plan(plan: dict, *, only=None, concurrency=None, log=print):
     seeds = [plan['seed'] + k for k in range(plan['deals'])]
     limit = concurrency or plan.get('concurrency', 2)
     Path(plan['out']).mkdir(parents=True, exist_ok=True)
-    (Path(plan['out']) / 'plan.json').write_text(json.dumps(plan, indent=2))  # the viewer shows unstarted matchups
+    labels = {pid: spec.get('label', pid) for pid, spec in players.items() if pid in plan['players']}
+    (Path(plan['out']) / 'plan.json').write_text(json.dumps({**plan, 'labels': labels}, indent=2))  # for the viewer
     sems = {}
     tasks = []
     for a, b in plan['matchups']:

@@ -5,24 +5,30 @@
 #   agy     -> Google Antigravity CLI (Gemini models, Google account)
 #   gemini  -> Gemini CLI, where still installed
 #   command -> any CLI that reads a prompt on stdin, e.g. pi or ollama
+# `label` is the name the leaderboard and replays show; the [players.ID] key names the run folders.
+# Always set `model`: without it a CLI uses whatever default your own settings have, and nothing records it.
 # Optional keys for any model: extra_args (list), timeout (seconds per call), rate_limit_wait (seconds
 # to wait when the plan's usage limit is hit), max_wait (total seconds to keep waiting).
 # Check them with: python -m poker_arena doctor
 
 [players.claude-opus]
+label = "Claude Opus 5.5"
 backend = "claude"
-model = "opus"
+model = "claude-opus-5-5"
 
 [players.claude-sonnet]
+label = "Claude Sonnet 5.5"
 backend = "claude"
-model = "sonnet"
+model = "claude-sonnet-5-5"
 
 [players.codex-gpt]
+label = "GPT-6 Luna (high)"
 backend = "codex"
-# model = "gpt-6.1-sol"   # leave unset to use your Codex default
+model = "gpt-6-luna"
 effort = "high"
 
 [players.gemini-agy]
+label = "Gemini 4 Neon High"
 backend = "agy"
 # Always set a model: agy's default comes from your own settings and can be a non-Gemini model.
 model = "gemini-4-neon-high"   # see `agy models`
@@ -38,10 +44,13 @@ model = "gemini-4-neon-high"   # see `agy models`
 
 # Baseline bots: free, instant, and they anchor the scale.
 [players.random]
+label = "Random bot"
 bot = "random"
 
 [players.station]
+label = "Calling station"
 bot = "station"   # always checks or calls
 
 [players.rule]
+label = "Rule bot"
 bot = "rule"      # equity vs pot odds, value bets, never bluffs

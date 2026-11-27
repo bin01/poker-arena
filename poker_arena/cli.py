@@ -95,6 +95,15 @@ def cmd_status(args):
             mark = 'playing' if m['live'] else 'not started' if not m['started'] else 'done' if m['finished'] else 'paused'
             net = f", {m['a']} {m['pair_net_a'] / m['bb']:+.1f} bb" if m['pairs_done'] else ''
             print(f"  {m['a']} vs {m['b']}: {m['pairs_done']}/{m['deals_total']} deals, {mark}{net}")
+        if args.health:
+            from .stats import collect
+            base = root if r['run'] == '.' else root / r['run']
+            for pid, s in sorted(collect(base).items()):
+                if not s['calls']:
+                    continue
+                print(f"  {pid}: {s['decisions']} decisions, {s['latency_mean'] or 0:.1f}s a call (slowest "
+                      f"{s['latency_max'] or 0:.0f}s), {s['retries']} retries, {s['fallbacks']} fallbacks, "
+                      f"{s['corrected']} sizes corrected" + (f", answered by {', '.join(s['served_models'])}" if s['served_models'] else ''))
 
 
 def cmd_doctor(args):
@@ -183,6 +192,7 @@ def main(argv=None):
     p.add_argument('root', nargs='?', default='runs')
     p.add_argument('--run', help='only this run')
     p.add_argument('--all', action='store_true', help='list finished matchups too')
+    p.add_argument('--health', action='store_true', help='per model: reply times, retries, fallbacks, which model answered')
     p.set_defaults(fn=cmd_status)
 
     p = sub.add_parser('doctor', help='check that each model player answers and remembers')

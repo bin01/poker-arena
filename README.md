@@ -65,7 +65,9 @@ Install and sign in to the CLIs you want to use (`claude`, `codex`, `agy`), then
 python -m poker_arena doctor          # each model player: does it answer, is the JSON valid, does it remember?
 ```
 
-Players live in [`players.toml`](players.toml): a `backend` and optional `model` per model, or a `bot`.
+Players live in [`players.toml`](players.toml). Each model entry names its CLI (`backend`), the `model` to ask for
+(always set it: otherwise the CLI uses whatever default your own settings have) and a `label`, the name the viewer
+shows. A bot entry names the `bot`.
 
 | backend | tool | plan | memory |
 |---|---|---|---|
@@ -121,23 +123,27 @@ A tournament also writes its `plan.json` into `runs/<plan>/`, so the viewer can 
 `python -m poker_arena view runs` serves every run under `runs/` at http://127.0.0.1:8800, with a picker for the
 run (a tournament's `out` folder, or a `play --out`). It follows running matches live.
 
-- **Leaderboard.** Progress of the run (hands played, pace, time left), then:
+The look is a card room: green felt, ivory cards, chips and brass. Players are shown by their `label` from
+`players.toml` (or a name made from their model), never by the CLI that runs them.
+
+- **Standings.** Progress of the run (hands played, pace, time left), the top three as a hand of cards, then:
   - **Ratings**: Elo with its 90% interval on a shared axis, bb/100 with its 95% margin (coloured only when the
     margin excludes zero), sessions won–tied–lost. Only players with at least 3 sessions are ranked; the rest
     are listed with how far they are from a rating.
   - **Head to head**: bb/100 for every pair, shaded when the edge is larger than its margin; a cell opens the matchup.
   - **How they play**: VPIP, PFR, aggression after the flop, how often it goes to showdown and wins there, and
     how often it talks.
-  - **Reliability** (model players): mean and slowest reply, retries, fallbacks, corrected bet sizes, tokens per
-    decision, and which model the CLI says answered.
-- **Matches.** Every matchup (playing, played, not started). A strip of its deals, shaded by who won each deal
-  over both plays and by how much. Each deal shows **both plays side by side** (same cards, seats swapped):
+- **Matches.** Every matchup (playing, played, not started) with its score. A row of chips, one per deal,
+  coloured by who won it over both plays and brighter the bigger the swing. Each deal shows **both plays side by
+  side at the table** (same cards, seats swapped):
   hole cards, board, every action in big blinds, the table talk, each decision's private reasoning (and the
-  CLI's own thinking where it exposes it), badges for retries, fallbacks, corrected sizes and reply time, and
-  each player's notes on its opponent. <kbd>←</kbd> <kbd>→</kbd> move between deals, <kbd>r</kbd> hides the reasoning.
+  CLI's own thinking where it exposes it), and each player's notes on its opponent. A move the model didn't make
+  (no playable answer, so the game checked or folded for it) and an illegal bet size are marked. **Replay** (or <kbd>space</kbd>) deals both plays again step by step. <kbd>←</kbd> <kbd>→</kbd> move between deals,
+  <kbd>r</kbd> hides the reasoning.
 
 ```sh
 python -m poker_arena status runs                 # the same progress in the terminal
+python -m poker_arena status runs --health        # and per model: reply times, retries, fallbacks
 python -m poker_arena export runs --out site       # a static copy (no server needed) to host or share
 python -m http.server -d site 8000
 ```

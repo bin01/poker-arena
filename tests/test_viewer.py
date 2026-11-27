@@ -24,7 +24,7 @@ class TestViewerData(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory()
         cls.root = Path(cls.tmp.name).resolve()
         players = cls.root / 'players.toml'
-        players.write_text(f'[players.fake]\nbackend = "command"\ncommand = {json.dumps(FAKE)}\n'
+        players.write_text(f'[players.fake]\nlabel = "Fake Model 1"\nbackend = "command"\ncommand = {json.dumps(FAKE)}\n'
                            '[players.rule]\nbot = "rule"\nsims = 40\n[players.station]\nbot = "station"\n'
                            '[players.random]\nbot = "random"\n')
         out = cls.root / 'runs' / 'pilot'
@@ -56,7 +56,8 @@ class TestViewerData(unittest.TestCase):
         m = played['pilot/fake__vs__rule']
         self.assertEqual(m['pairs_done'], 6)
         self.assertEqual(m['kinds'], {'fake': 'model', 'rule': 'bot'})
-        self.assertEqual(m['via']['fake'], 'command')
+        self.assertEqual(m['labels'], {'fake': 'Fake Model 1', 'rule': 'Rule bot'})
+        self.assertEqual(planned[0]['labels'].get('fake'), 'Fake Model 1')  # from plan.json
         self.assertTrue(m['finished'])
         self.assertNotIn('times', m)
 
@@ -94,7 +95,7 @@ class TestViewerData(unittest.TestCase):
             self.assertTrue((data / 'index-pilot.json').exists())
             self.assertTrue((data / 'ratings-pilot.json').exists())
             m = json.loads((data / f"match-{server.key('pilot/fake__vs__rule/a-first')}.json").read_text())
-            self.assertEqual(m['config']['specs']['fake'], {'backend': 'command'})  # no commands or paths
+            self.assertEqual(m['config']['specs']['fake'], {'label': 'Fake Model 1'})  # no commands or paths
 
     def test_key_matches_the_app(self):
         self.assertEqual(server.key('pilot/a__vs__b-1/a-first'), 'pilot~2Fa__vs__b-1~2Fa-first')
@@ -123,6 +124,17 @@ class TestViewerData(unittest.TestCase):
         self.assertIn('app.js', page)
         with self.assertRaises(urllib.error.HTTPError):
             urllib.request.urlopen(base + '/api/match?id=../x')
+
+
+
+class TestNames(unittest.TestCase):
+    def test_display_names(self):
+        self.assertEqual(server.pretty_model('claude-opus-5-5'), 'Claude Opus 5.5')
+        self.assertEqual(server.pretty_model('gpt-6-luna'), 'GPT-6 Luna')
+        self.assertEqual(server.pretty_model('gemini-4-neon-high'), 'Gemini 4 Neon High')
+        self.assertEqual(server.display_name('x', {'backend': 'codex', 'model': 'gpt-6-luna', 'effort': 'high'}), 'GPT-6 Luna (high)')
+        self.assertEqual(server.display_name('x', {'label': 'Mine', 'model': 'm'}), 'Mine')
+        self.assertEqual(server.display_name('codex-gpt', {'backend': 'codex'}), 'codex-gpt')  # no model: the id
 
 
 if __name__ == '__main__':
