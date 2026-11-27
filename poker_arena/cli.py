@@ -18,8 +18,11 @@ def cmd_play(args):
     res = asyncio.run(run_duplicate(game, (args.a, players[args.a]), (args.b, players[args.b]), seeds, Path(args.out)))
     for label, r in zip(('a-first', 'b-first'), res):
         print(label, dict(zip(r['players'], r['net'])))
-    from .ratings import ratings, table
+    from .ratings import ratings, table, SESSION
     print(table(ratings(args.out, boot=100)))
+    if args.deals < SESSION:
+        print(f'\nElo needs at least {SESSION // 2} deals per matchup (sessions are {SESSION} deals); '
+              f'with {args.deals} only bb/100 is meaningful.')
 
 
 def cmd_plan(args):

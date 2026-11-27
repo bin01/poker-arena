@@ -135,12 +135,19 @@ class Backend:
 class ClaudeCLI(Backend):
     """Claude Code in print mode. The first turn sets the system prompt and opens a session; later turns
     resume it, so the model keeps its own earlier replies (and the CLI handles caching and compaction).
-    Tools are switched off: the model can only answer."""
+    Tools and MCP servers are switched off, and only project settings load (the folder is empty), so your
+    own hooks and settings don't run inside the eval. Set `isolate = false` on the player to keep them."""
     stateful = True
+
+    def __init__(self, system, *, isolate: bool = True, **kw):
+        super().__init__(system, **kw)
+        self.isolate = isolate
 
     async def _call(self, text):
         cmd = ['claude', '-p', '--output-format', 'stream-json', '--verbose', '--tools', '',
                '--strict-mcp-config', '--system-prompt', self.system]
+        if self.isolate:
+            cmd += ['--setting-sources', 'project']
         if self.model:
             cmd += ['--model', self.model]
         if self.session:
@@ -173,9 +180,9 @@ class CodexCLI(Backend):
     first message (exec has no system-prompt flag); later turns resume the same thread."""
     stateful = True
 
-    def __init__(self, system, *, effort: str | None = 'high', **kw):
+    def __init__(self, system, *, effort: str | None = 'high', summary: str | None = 'auto', **kw):
         super().__init__(system, **kw)
-        self.effort = effort
+        self.effort, self.summary = effort, summary
 
     async def _call(self, text):
         flags = ['--json', '--skip-git-repo-check']
@@ -183,6 +190,8 @@ class CodexCLI(Backend):
             flags += ['-m', self.model]
         if self.effort:
             flags += ['-c', f'model_reasoning_effort="{self.effort}"']
+        if self.summary:  # ask for reasoning summaries, so the viewer can show them
+            flags += ['-c', f'model_reasoning_summary="{self.summary}"']
         flags += self.extra_args
         if self.session:
             cmd = ['codex', 'exec', 'resume', self.session, *flags, '-']
@@ -203,6 +212,8 @@ class CodexCLI(Backend):
             elif t == 'item.completed':
                 item = ev.get('item') or {}
                 kind = item.get('type') or item.get('item_type')
+                if kind == 'error':  # config warnings arrive as items; they don't fail the turn
+                    continue
                 if kind in ('agent_message', 'assistant_message'):
                     messages.append(item.get('text', ''))
                 elif kind == 'reasoning':

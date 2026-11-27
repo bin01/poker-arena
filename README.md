@@ -74,7 +74,9 @@ Players live in [`players.toml`](players.toml): a `backend` and optional `model`
 | `command` | any CLI reading a prompt on stdin, e.g. `["pi", "-p"]`, `["ollama", "run", "{model}"]` | yours | transcript re-sent |
 | `openai_compat` | OpenRouter, Ollama, LM Studio, vLLM (an API, not a subscription) | API key | transcript re-sent |
 
-Every CLI runs in an empty temporary folder so no project files or instructions leak in. When a plan's usage
+Every CLI runs in an empty temporary folder so no project files or instructions leak in, and `claude` runs
+with `--setting-sources project`, so your personal hooks and settings don't run inside matches (set
+`isolate = false` on a player to keep them). When a plan's usage
 limit is hit, the call waits (`rate_limit_wait`, 15 minutes by default) and tries again, for up to `max_wait`
 (6 hours), so a long tournament pauses instead of failing.
 
@@ -137,8 +139,9 @@ plugged in as a `command` backend if you want to compare harnesses.
 
 ## Caveats
 
-- CLI backends add their own system prompts and limits, and expose reasoning unevenly (`claude` shows thinking when
-  the model emits it, `codex` shows reasoning summaries, `gemini` shows none), which is why every reply carries its
-  own `reasoning` field.
+- CLI backends add their own system prompts and limits (Codex's default prompt is about 21K tokens), and expose
+  reasoning unevenly (`claude -p` shows no thinking, `codex` shows reasoning summaries when asked, `gemini` none),
+  which is why every reply carries its own `reasoning` field.
+- Elo needs whole sessions (10 deals each), so a matchup needs at least 5 deals to count and 10+ to mean much.
 - Results from different backends of the same model (CLI vs API) shouldn't be mixed on one leaderboard.
 - 50 deals per matchup separates large skill gaps; close models need several hundred.
