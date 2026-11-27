@@ -1020,3 +1020,9 @@ class TestEffort(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestRound8Followups(unittest.TestCase):
+    def test_verification_stamp_covers_commit_and_evidence_files(self):
+        for f in ('state.json', 'events.jsonl', 'calls.jsonl', 'raw.jsonl'):
+            self.assertIn(f, server.RECORDS)

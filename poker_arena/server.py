@@ -132,7 +132,7 @@ def run_of(root: Path, m: Path) -> str:
 
 
 SIDES = ('a-first', 'b-first')
-RECORDS = ('config.json', 'hands.jsonl', 'result.json')
+RECORDS = ('config.json', 'hands.jsonl', 'result.json', 'state.json', 'events.jsonl', 'calls.jsonl', 'raw.jsonl')
 
 
 def _stat(path: str):

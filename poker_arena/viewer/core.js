@@ -301,7 +301,7 @@
         : mv === 'exhausted' ? 'No winner' : mv === 'early' ? 'Too early' : 'Undecided' };
     const sec = secondary ? ` The model-based test (secondary, never decides) says: ${secondary.short.toLowerCase()}.` : '';
     const out = as.method === 'free' && as.status === 'free'
-      ? ` The test makes no assumption about the shape of the results: its error rate holds at every check as long as conversations are independent.${sec}`
+      ? ` The test makes no assumption about the shape of the results: its error rate holds at every check if conversations are independent and the edge stays the same over the run (no drift)${p.drift && /drift detected/.test(typeof p.drift === 'string' ? p.drift : p.drift.status || '') ? '; drift was detected here, so treat this verdict with caution' : ''}.${sec}`
       : as.method === 'free' && as.status === 'unsupported'
       ? ` The test makes no assumption about the shape of the results, but a check it needs failed here (${as.failed.join(', ') || 'see the checks'}), so its error rate is not established.${sec}`
       : as.method === 'free' && as.status === 'incomplete'
@@ -544,7 +544,9 @@
         const c = cats[catKey(k, a)] = cats[catKey(k, a)] || { correct: 0, total: 0, valid: 0, fallbacks: 0, ev_lost_bb: 0 };
         c.total++;
         c.ev_lost_bb += lostOf(a);
-        if (isFallback(a)) c.fallbacks++; else { c.valid++; if (a.correct) c.correct++; }
+        if (isFallback(a)) c.fallbacks++;
+        else if (a.outcome === 'unverified' || a.verified === false) c.unverified = (c.unverified || 0) + 1;
+        else { c.valid++; if (a.correct) c.correct++; }
       }
       for (const [c, k] of Object.entries(cats)) { k.answered = k.total; k.total = Math.max(k.total, spotsIn(c)); k.ev_lost_bb = Math.round(k.ev_lost_bb * 1000) / 1000; }
       const given = r.by_category || r.categories;
