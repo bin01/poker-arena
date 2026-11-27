@@ -357,3 +357,31 @@ Round 6 report: `/private/tmp/claude-501/-Users-snehal-Code-poker-arena/7391e5d9
   table) and `all_time(track=...)` never pools them. The viewer groups the two runs under one tournament in the
   picker, shows the official standings first, a track tab bar, an explanation, and an adaptation section.
 - Tests: `tests/test_tracks.py`.
+
+---
+
+# Round 7 → 8
+
+Round 7 report: `/private/tmp/claude-501/-Users-snehal-Code-poker-arena/7391e5d9-a258-4fd4-b230-fb0d350c6f8f/scratchpad/review/r7-report.md`
+(ux=6 gameplay=7 evals=7 judges=6 overall=6). Issues R7-#n. Same tracks and file ownership.
+
+- A (ratings/history/stats/cli/docs): R7-#3 (quiz eligibility re-verifies raw evidence via backends.verify_call, binds the
+  parsed reply to the scored answer, validates spot key and CLI provenance; the verified representation is what the server
+  serves), #4 (state the conditional null E[Y_t|past] <= m / common mean precisely; define the estimand under drift; add a
+  drift diagnostic (early vs late conversations) that is reported beside each verdict and can mark it "drift detected";
+  reproduce the +100/−100 sequence as a test showing the diagnostic flags it), #5 (quiz scores descriptive; no Wilson
+  interval unless the sampling design supports it), #8 (CLI artifact hash in implementation identity and transitions),
+  #12 wording, #13 (one attestation policy: attested / unattested / mismatch, applied identically to games and quiz),
+  #7 (the shared reader returns verified / provisional / rejected per hand for the server to use).
+- C (runner/games/agents/backends/quiz): R7-#2 (linked audit replays each accepted parsed reply against the pre-action
+  engine state and compares action, amount, correction and speech with the executed record; probe test: raise to 4
+  linked to an executed raise to 200 must fail), #3/#5/#13 quiz side (store verifiable raw evidence per answer; generate
+  questions without answer quotas or with explicit documented strata and weights; follow the shared attestation policy),
+  converge `committed_records` onto `ratings.read_conversation`.
+- B (viewer/server): R7-#1 (every quiz headline field from the scored category; other categories with their own
+  denominators), #6 (pairing-wide deal sequence across rounds and replicates for auto-next, arrows and swings; no wall of
+  replicate chips — a compact pairing navigator), #7 (replay totals and progress from verified hands; provisional and
+  rejected clearly marked, independent of ratings availability), #9 (method shown separately from evidence status; failed
+  checks visible), #10 (incremental cached inventory; index scoped to the selected run; standings render before optional
+  quiz content; no loading flashes in screenshots), #11 (compact mobile watch view: both seats, board and one playback
+  control in the first screen; secondary controls and methodology behind disclosures).
