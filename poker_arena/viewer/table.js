@@ -115,7 +115,8 @@
         const s = seats[x.seat];
         const potBefore = x.pot_before ?? collected + seats.reduce((t, y) => t + y.bet, 0);
         const toCall = x.to_call ?? owed(x.seat);
-        const facing = toCall > 0 ? { toCall, pot: potBefore, odds: x.pot_odds ?? toCall / (potBefore + toCall) } : null;
+        const facing = toCall > 0 ? { toCall, pot: potBefore, odds: x.pot_odds ?? toCall / (potBefore + toCall),
+          closes: callCloses({ street, toCall, stack: s.stack, opponentAllIn: seats.some((y, j) => j !== x.seat && !y.folded && y.allIn) }) } : null;
         if (x.action === 'fold') s.folded = true;
         else if (x.action === 'call') put(x.seat, x.amount || 0);
         else if (x.action === 'bet' || x.action === 'raise' || x.action === 'all_in') put(x.seat, Math.max(0, (x.amount || 0) - s.bet));
@@ -168,9 +169,17 @@
       const owe = me ? Math.max(0, Math.min(me.stack, Math.max(...st.seats.map(x => x.bet)) - me.bet)) : 0;
       st.toCall = me ? owe : null;
       st.potOdds = owe ? owe / (st.pot + owe) : null;
+      st.callCloses = owe ? callCloses({ street: st.street, toCall: owe, stack: me.stack, opponentAllIn: st.seats.some((y, j) => j !== st.toAct && !y.folded && y.allIn) }) : null;
     });
     return { steps: out, log, n, button: d.button };
   }
+
+  // Whether calling ends the betting for the hand (river, or someone all in): only then are the pot odds a full
+  // break-even; otherwise they are the immediate price, before any later betting.
+  function callCloses({ street, toCall, stack, opponentAllIn }) {
+    return street === 'river' || !!opponentAllIn || (toCall > 0 && stack != null && toCall >= stack);
+  }
+  const priceText = (odds, closes) => closes ? `break-even ${Math.round(odds * 100)}%` : `immediate pot odds ${Math.round(odds * 100)}%, before future betting`;
 
   // One timeline over the two plays of a deal: frames of {at: [step per play], focus, seg}.
   // 'sequence': the first play from start to end, then the next (focus is the play that moves).
@@ -287,9 +296,9 @@
     if (turn) {
       const who = snap.toAct != null && names[snap.toAct];
       turn.innerHTML = !who ? '' : `<b>${who}</b> to act<span class="price">${snap.toCall
-        ? `call ${fmt(snap.toCall)} · break-even ${Math.round(snap.potOdds * 100)}%` : 'can check'}</span>`;
+        ? `call ${fmt(snap.toCall)} · ${priceText(snap.potOdds, snap.callCloses)}` : 'can check'}</span>`;
     }
   }
 
-  return { steps, timeline, frameOf, html, show, card, cards, SUIT, madeHand, drawOf };
+  return { steps, timeline, frameOf, html, show, card, cards, SUIT, madeHand, drawOf, callCloses, priceText };
 });

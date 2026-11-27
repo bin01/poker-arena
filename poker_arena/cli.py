@@ -54,7 +54,7 @@ def _cost(plan: dict, d: dict) -> str:
             f'{per_round:,} hands a round, at most {rounds} rounds = {per_round * rounds:,} hands '
             f'({n * reps * rounds:,} fresh conversations of two matches)')
     if used:
-        line += (f'; if the better player of each pairing is {d["target_edge_bb100"]:.0f} bb/100 ahead, about '
+        line += (f'; if one player of each pairing is truly {d["target_edge_bb100"]:.0f} bb/100 ahead, about '
                  f'{round(2 * n * R * min(used, reps * rounds)):,} hands before the pairings stop')
     return line
 
@@ -63,11 +63,11 @@ def _track_text(track: str, plan: dict, d: dict, args) -> list[str]:
     from .ratings import design_line
     out = []
     if track == 'adaptation':
-        out.append(f'ADAPTATION track -> {plan["out"]} (models remember the session; model-based, not official): '
-                   + _cost(plan, d) + '.')
+        out.append(f'ADAPTATION track -> {plan["out"]} (models remember the session; model-based, exploratory, not '
+                   f'official): ' + _cost(plan, d) + '.')
         out.append(design_line(d))
-        out += [f'  {x["scenario"]:12} ICC {x["assumed_icc"]:<5} AR(1) {x["assumed_ar1"]:<4} model-based verdict for the '
-                f'better player {_pct_(x["power"])}, after about {x["conversations_used"]:,.0f} conversations'
+        out += [f'  {x["scenario"]:12} ICC {x["assumed_icc"]:<5} AR(1) {x["assumed_ar1"]:<4} model-based test leans toward '
+                f'the stronger player {_pct_(x["power"])}, after about {x["conversations_used"]:,.0f} conversations'
                 for x in d.get('power_scenarios') or []]
         if d.get('power_by_edge'):
             out.append('  assumed dependence, by edge: ' + ', '.join(f'{e} bb/100 {_pct_(p)}' for e, p in d['power_by_edge'].items()))
@@ -102,7 +102,8 @@ def cmd_plan(args):
     from .runner import make_tournament
     shared = {k: v for k, v in (('alpha', args.alpha), ('block', args.block), ('target_edge_bb100', args.target_edge),
                                 ('prior_sd_bb100', args.prior_sd), ('assumed_icc', args.assumed_icc),
-                                ('assumed_ar1', args.assumed_ar1)) if v is not None}
+                                ('assumed_ar1', args.assumed_ar1),
+                                ('strict_identity', True if args.strict_identity else None)) if v is not None}
     per = {'official': {'max_rounds': args.max_rounds, 'budget_deals': args.budget_deals},
            'adaptation': {'max_rounds': args.adaptation_max_rounds, 'budget_deals': args.adaptation_budget_deals}}
     tracks = [t.strip() for t in args.tracks.split(',') if t.strip()]
@@ -390,6 +391,10 @@ def main(argv=None):
                    help='conversations per pairing per round on the adaptation track (default 4)')
     p.add_argument('--adaptation-max-rounds', type=int, help='rounds at most on the adaptation track (default: the '
                                                              'fewest that give its model-based gate 80%% power)')
+    p.add_argument('--strict-identity', action='store_true',
+                   help='strict publication policy, stored in the design: a pairing with an unattested player (a backend '
+                        'that does not report which model answered, e.g. codex) gets no counted official result; by '
+                        'default it counts, marked identity_qualified')
     p.add_argument('--adaptation-budget-deals', type=int, help='cap on deals per pairing on the adaptation track')
     p.set_defaults(fn=cmd_plan)
 

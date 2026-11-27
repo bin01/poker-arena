@@ -1250,3 +1250,44 @@ details.fold[open] .fold-mark::before { content: "−"; }
   .ctls [data-ctl="start"], .ctls [data-ctl="end"] { display: none; }
   .sb-name .effort { display: none; }
 }
+
+/* ---- round 8: what a range is, drifted verdicts, the quiz question as asked ------------------------- */
+.lede-2 { flex: 1 1 100%; order: 1; margin: 0; max-width: 780px; font-size: 13.5px; line-height: 1.55; color: var(--ink-3); }
+.lede-2 b { color: var(--ink-2); }
+.lede-2 .decided-badge { vertical-align: 1px; }
+.intro .who-plays { order: 2; }
+.ci-desc i, .ci-official i { font-style: normal; font-size: 10.5px; color: var(--ink-3); letter-spacing: .02em; }
+.ci-official { color: var(--ink-2); }
+.ci-official i { color: #9fd3b5; }
+.ci-second { display: block; color: var(--ink-3); font-size: 10.5px; }
+.verdict.drift { color: #f5c36b; border: 1px dashed rgba(245, 195, 107, .6); background: rgba(245, 195, 107, .06); }
+.outcome-row.drift { border-color: rgba(245, 195, 107, .45); border-style: dashed; }
+.outcome-row.drift .o-kicker { color: #f5c36b; }
+.run-own { margin-top: 8px; font-size: 12.5px; }
+.run-own summary { cursor: pointer; color: var(--gold); font-weight: 600; }
+.run-own p { margin: 6px 0 0; color: var(--ink-3); }
+.spot-filters { display: grid; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.sf-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.sf-row > span { font-size: 10.5px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: rgba(var(--gold-rgb), .75); min-width: 74px; }
+.sf-row .toggle small { color: var(--ink-3); margin-left: 3px; }
+.sg-head { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; padding: 12px 16px 6px; border-top: 1px solid var(--line); }
+.spot-group:first-child .sg-head { border-top: 0; }
+.sg-head small { color: var(--ink-3); }
+.sg-more { margin: 4px 16px 12px; }
+.sg-none { padding: 14px 16px; margin: 0; }
+.sp-tag { margin-left: 8px; vertical-align: 1px; }
+.spot-main { display: grid; gap: 14px; min-width: 0; }
+.spot-question { padding: 14px 18px; }
+.sq-text { margin: 8px 0 0; white-space: pre-wrap; word-break: break-word; font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink-2);
+  background: rgba(0, 0, 0, .22); border: 1px solid var(--line-soft); border-radius: 8px; padding: 10px 12px; max-height: 420px; overflow: auto; }
+.sq-src { margin: 6px 0 0; }
+.sq-more { margin-top: 8px; font-size: 13px; }
+.sq-more summary { cursor: pointer; color: var(--gold); font-weight: 600; }
+.sq-facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 14px; margin: 8px 0 0; font-size: 13px; }
+.sq-facts dt { color: var(--ink-3); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; padding-top: 2px; }
+.sq-facts dd { margin: 0; }
+@media (max-width: 560px) { .sq-facts { grid-template-columns: minmax(0, 1fr); } .sq-facts dd { margin-bottom: 4px; } }
+.spot-question .sa-head { padding: 0; }
+.verdict.model, .verdict.drift { white-space: normal; max-width: 100%; line-height: 1.35; }
+.vcell { min-width: 0; }
+.ci-line { display: block; white-space: normal; line-height: 1.35; }

@@ -23,8 +23,11 @@ recomputes is retrospective), and its evidence still stands today (`evidence_now
 all here, replay from their seeds and hash as they did, and their records pass today's checks). Every
 verdict carries the checks of what its guarantee needs (`assumptions`: deals within the game's bound, no deal
 repeated across conversations). A decided rank and a leader are built only from official verdicts whose
-evidence stands and whose checks passed: a leader has such a win over every other player of its group.
-Everything else (strengths, their intervals and fit diagnostics, the order by points, the front runner, session
+evidence stands, whose checks passed and whose edge did not drift (`publication`: 'decided_with_drift' counts
+for nothing until a confirmation run; under a design's strict_identity neither does an unattested player's
+result, which otherwise carries identity_qualified): a leader has such a win over every other player of its
+group. Each pairing's primary interval is the anytime-valid one (`ci_official`); every other interval is
+'fixed-time descriptive' (`ci_kind`). Everything else (strengths, their intervals and fit diagnostics, the order by points, the front runner, session
 Elo, the model-based result, every all-time number, every number of a run that is not preregistered) is
 descriptive, recomputed on every refresh, and labelled so.
 
@@ -43,7 +46,8 @@ gives one with chance at most alpha_pairing (Bonferroni over the pairings: alpha
 is conditional: E[Y_t | the conversations before t] <= m at every t (a common mean is one case of it). When the
 edge drifts, 'a' means that a's expected edge was positive for at least part of the run, not that the run's
 average favours it; `drift` (early against late conversations) is reported beside every verdict. `model_based` is the round 6 gate (a conversation-level
-t and a sign-flip test with bars calibrated for a family of shapes): secondary, descriptive, never official.
+t and a sign-flip test with bars calibrated for a family of shapes): secondary, descriptive, never official;
+on the adaptation track it judges, in exploratory words (`language`: a player leans ahead, it never wins).
 
 Planning. A design's power is that of the official test, simulated (`procedure`): the chance that the better
 player is decided by the last look, under optimistic, assumed (assumed_icc, assumed_ar1) and pessimistic
@@ -116,6 +120,30 @@ ASSUMPTIONS = ('With no edge, a pairing is called for either player with chance 
                'same guarantee. Each verdict reports those checks. The model-based result shown beside it (a t and '
                'sign-flip test calibrated for a family of shapes) is secondary and never official.')
 GUARANTEE = ASSUMPTIONS
+CI_SEQUENTIAL = 'anytime-valid sequential'
+CI_FIXED = 'fixed-time descriptive'
+INTERVALS = {
+    CI_SEQUENTIAL: 'the official interval of a pairing (`ci_official`): the betting confidence sequence, which covers '
+                   'the mean edge at every look at once, so it stays valid whenever play stopped and whatever the '
+                   'shape of the results (given independent conversations); its level is 1 - alpha_pairing',
+    CI_FIXED: 'an ordinary interval (a t interval on conversation means for a pairing, the bootstrap for strengths, '
+              'margins and session Elo): it would cover 95% of the time for a sample of fixed size, but play stopped '
+              'when the results said so and the front runner is picked from the same data, so it is not adjusted '
+              'for either and its 95% is not a guarantee; descriptive only',
+}
+STRENGTH_COVERAGE = {'stopped_runs_checked': True, 'guaranteed': False, 'strength': 0.95, 'pairing_t': 0.95,
+                     'front_runner_margin': 0.93,
+                     'meaning': 'in seeded 4-player round robins whose pairings stop when the official test decides '
+                                '(400 tournaments per setting, conversation effects, up to half the pairings '
+                                'stopping early; tests/test_publication.py), strength intervals covered 94-95%, '
+                                'pairing t intervals 95% and the front runner\'s margin 92-93% (it is picked from the '
+                                'same data); one family of scenarios, not a guarantee, so they stay descriptive'}
+DRIFT_RULE = ('A decided verdict whose drift diagnostic (early against late conversations of the judged ones) detects '
+              'a change of edge is "decided_with_drift": it stays shown, but it counts toward no decided rank or '
+              'leader, because it says only that a player was ahead for part of the run; it needs a confirmation run '
+              'on a stable model snapshot. Drift after play stopped is never seen, so pin dated model snapshots.')
+STRICT_IDENTITY = ('strict identity policy: a pairing with an unattested player (its backend does not report which '
+                   'model answered) gets no counted result, whatever the design allows to play')
 TRACKS = ('official', 'adaptation')
 ADAPTATION_DEALS = 50       # deals per conversation on the adaptation track: models remember the session
 ADAPTATION_REPLICATES = 4   # conversations per pairing per round on the adaptation track
@@ -780,7 +808,7 @@ def calibration_id(design: dict | None) -> str | None:
 
 DESIGN_INPUTS = ('alpha', 'round_deals', 'block', 'replicates', 'max_rounds', 'target_edge_bb100', 'prior_sd_bb100',
                  'assumed_icc', 'assumed_ar1', 'budget_deals', 'n_pairings', 'allow_unattested', 'allow_opaque',
-                 'outside_calibration', 'track')
+                 'outside_calibration', 'track', 'strict_identity')
 
 
 def _inputs(d: dict) -> dict:
@@ -789,7 +817,7 @@ def _inputs(d: dict) -> dict:
     defaults = {'block': BLOCK, 'replicates': 1, 'target_edge_bb100': TARGET_EDGE, 'prior_sd_bb100': PRIOR_SD,
                 'assumed_icc': ASSUMED_ICC, 'assumed_ar1': ASSUMED_AR1, 'budget_deals': None,
                 'allow_unattested': list(ALLOW_UNATTESTED), 'allow_opaque': [], 'outside_calibration': 'exclude',
-                'track': 'official'}
+                'track': 'official', 'strict_identity': False}
     out = {}
     for k in DESIGN_INPUTS:
         v = d.get(k, defaults.get(k))
@@ -1038,6 +1066,7 @@ def _complete(d, reps, n_pairings, target, prior, players=None, bound=None) -> d
            'allow_unattested': sorted(d.get('allow_unattested', ALLOW_UNATTESTED)),
            'allow_opaque': sorted(d.get('allow_opaque', ())),
            'outside_calibration': d.get('outside_calibration', 'exclude'),
+           'strict_identity': bool(d.get('strict_identity', False)),
            'assumed_icc': icc, 'assumed_ar1': ar1, 'sd_conversation_bb100': round(plan_sd, 1),
            'conversations_needed': need * reps if need else None, 'deals_needed': need * reps * R if need else None,
            'deals_planned': cap, 'max_deals': cap, 'power_at_max': moderate, 'power_scenarios': power,
@@ -1108,6 +1137,7 @@ def _complete_adaptation(d, reps, n_pairings, target, prior, bound=None) -> dict
             'allow_unattested': sorted(d.get('allow_unattested', ALLOW_UNATTESTED)),
             'allow_opaque': sorted(d.get('allow_opaque', ())),
             'outside_calibration': d.get('outside_calibration', 'exclude'),
+            'strict_identity': bool(d.get('strict_identity', False)),
             'assumed_icc': icc, 'assumed_ar1': ar1, 'sd_conversation_bb100': round(sd_conversation(prior, R, icc, ar1), 1),
             'conversations_needed': need * reps if need else None, 'deals_needed': need * reps * R if need else None,
             'deals_planned': deals, 'max_deals': deals, 'power_at_max': moderate, 'power_scenarios': power,
@@ -1806,9 +1836,12 @@ def decide(xs, design=None, n_pairings=1, looks_used=None, groups=None) -> dict:
     'exhausted' (the last planned look, undecided), 'open' (undecided, looks remain, or no look yet), 'early'
     (a completed look with fewer conversations than any verdict could come from). `capital` is each bettor's
     best capital so far against the bar `official_test.threshold`; `cs` the anytime-valid interval for the edge
-    (level `cs_level`). `drift` compares early and late conversations (a diagnostic beside the verdict: under
-    drift a verdict holds for the conditional null, see `drift`). The other numbers describe all the deals given (`ci95` is an ordinary t interval, not a
-    test); with one conversation `basis` is 'blocks' and it is conditional on it. `model_based` is the round 6
+    (level `cs_level`), also given as `ci_official` ({interval, level, kind: CI_SEQUENTIAL}), the primary
+    interval. `drift` compares early and late conversations (a diagnostic beside the verdict: under drift a
+    verdict holds for the conditional null, see `drift`; `publication` withholds it from ranks and leaders).
+    The other numbers describe all the deals given (`ci95` is an ordinary t interval, `ci_kind` CI_FIXED: not
+    adjusted for the stopping rule, not a test); with one conversation `basis` is 'blocks' and it is
+    conditional on it. `model_based` is the round 6
     gate on the same data, secondary and never official (None for designs it was never calibrated for)."""
     d = {**DEFAULT_DESIGN, 'max_rounds': 1, **(design or {})}
     xs = [float(x) for x in xs]
@@ -1837,7 +1870,8 @@ def decide(xs, design=None, n_pairings=1, looks_used=None, groups=None) -> dict:
                              'threshold': round(2 / alpha_p, 3)},
            'assumption_free': True, 'bound_bb100': bound,
            'out_of_bound': sum(abs(x) > bound * (1 + 1e-9) for x in xs), 'capital': None, 'cs': None,
-           'cs_level': round(1 - alpha_p, 6), 'conversation_share': None, 'sd_per_deal': None, 'reason': None,
+           'cs_level': round(1 - alpha_p, 6), 'ci_official': None, 'ci_kind': CI_FIXED,
+           'conversation_share': None, 'sd_per_deal': None, 'reason': None,
            'model_based': None, 'power': {'deals_for_80pct': {str(e): None for e in POWER_EDGES}},
            'drift': drift(np.clip(sums / np.maximum(sizes, 1), -bound, bound))}
     if C >= 2:
@@ -1868,6 +1902,7 @@ def decide(xs, design=None, n_pairings=1, looks_used=None, groups=None) -> dict:
         out['capital'] = {'a': test['capital']['a'], 'b': test['capital']['b'],
                           'even': min(test['capital']['lo'], test['capital']['hi'])}
         out['cs'] = confidence_sequence(means, alpha_p, bound)
+        out['ci_official'] = _ci_official(out)
     out.update(verdict=verdict, reason=reason, decided_at_look=at, decided_at_conversation=at_c)
     if m is None:
         out.update(verdict='early', reason=out['reason'] or 'too few deals to estimate any spread')
@@ -1892,6 +1927,13 @@ def decide(xs, design=None, n_pairings=1, looks_used=None, groups=None) -> dict:
         out['model_based'] = _model_based(xs, labels, sizes, sums, m, se, df, C, share, d, alpha_p, looks_used,
                                           rounds, reps)
     return out
+
+
+def _ci_official(v: dict) -> dict | None:
+    if not v.get('cs'):
+        return None
+    return {'interval': v['cs'], 'level': v.get('cs_level'), 'kind': CI_SEQUENTIAL,
+            'meaning': 'covers the mean edge at every look at once, whenever play stopped'}
 
 
 def _model_cheap(rounds: int, reps: int, R: int) -> bool:
@@ -2071,7 +2113,10 @@ def adjudicate(pairing_data: dict, design: dict, n_pairings: int, look: int, eli
     round 6), counts_toward_leader, standing, linked_audit (per player, the audit derived from the decision-linked
     call and raw records, when `pairing_data` found them),
     test_verdict (decide's verdict), identity_status and audit_status per player, judge_fingerprint (= judge),
-    calibration_id, registered_judge and official (made by the registered judge under a valid registration).
+    calibration_id, registered_judge and official (made by the registered judge under a valid registration),
+    and what the result may claim (`publication`: decision_status, qualifier, identity_qualified, language,
+    ci_official). A decided verdict under detected drift, or with an unattested player under the design's
+    `strict_identity`, keeps its verdict (play stops on it) but does not count toward a leader.
     verdict is 'ineligible', a terminal verdict, whenever any rule fails: no valid registration, code changed
     during the run, a player's identity unresolved, mismatched or unattested where the design doesn't allow it,
     its turns not fully audited (by the runner's facts, and by the linked records where they exist), its
@@ -2147,7 +2192,7 @@ def adjudicate(pairing_data: dict, design: dict, n_pairings: int, look: int, eli
     track = {'track': 'adaptation', 'model_based': True, 'model_based_counts': counts,
              'registered_record': registered, 'label': ADAPTATION_LABEL} if adaptation else \
         {'track': 'official', 'registered_record': registered}
-    return {**v, 'verdict': test if eligible else 'ineligible', 'test_verdict': test, 'eligible': eligible,
+    out = {**v, 'verdict': test if eligible else 'ineligible', 'test_verdict': test, 'eligible': eligible,
             'ineligible_reasons': reasons, 'assumptions': a, 'calibrated': calibrated,
             'counts_toward_leader': counts and not adaptation, 'standing': standing, **track,
             'identity_status': {p: (players.get(p) or {}).get('identity') for p in named},
@@ -2160,6 +2205,82 @@ def adjudicate(pairing_data: dict, design: dict, n_pairings: int, look: int, eli
             'evidence_hash': data.get('evidence_hash'), 'judged_evidence_hash': data.get('evidence_hash'),
             'evidence_version': data.get('evidence_version', EVIDENCE_VERSION), 'evidence_deals': len(xs),
             'linked_audit': linked or None}
+    out.update(publication(out, design, data.get('a'), data.get('b'), not adaptation))
+    return out
+
+
+ADAPTATION_TEXT = {'a': '{a} leans ahead on the model-based test', 'b': '{b} leans ahead on the model-based test',
+                   'even': 'the model-based test leans toward even (within ±{e} bb/100)'}
+
+
+def _side_text(v: dict, side: str, a, b) -> tuple[str, float, float]:
+    dr = v.get('drift') or {}
+    s = -1.0 if side == 'b' else 1.0
+    return (b if side == 'b' else a) or side, s * float(dr.get('early') or 0.0), s * float(dr.get('late') or 0.0)
+
+
+def _drift_qualifier(v: dict, a, b) -> str:
+    word = lambda e: 'ahead' if e > 0 else 'behind' if e < 0 else 'level'
+    tail = ('the edge changed during play, so this verdict counts toward no rank or leader: it needs a '
+            'confirmation run on a stable model snapshot')
+    if v.get('verdict') == 'even':
+        _, e, l = _side_text(v, 'a', a, b)
+        return f'called even, but {a or "a"} was {e:+.0f} bb/100 early and {l:+.0f} late; {tail}'
+    who, e, l = _side_text(v, v.get('verdict'), a, b)
+    how = f'{word(e)} early, {word(l)} late' if word(e) != word(l) else f'{word(e)} early and late, by different amounts'
+    return f'decided with drift: {who} {how} ({e:+.0f} then {l:+.0f} bb/100); {tail}'
+
+
+def publication(v: dict, design: dict | None, a=None, b=None, official_run: bool = True) -> dict:
+    """What a verdict may claim when it is published, from the verdict itself: {'decision_status', 'standing',
+    'counts_toward_leader', 'qualifier' (plain words, or None), 'identity_qualified', 'identity_qualifier',
+    'unattested' (players whose backend did not report the model), 'language' ('confirmatory' | 'exploratory' |
+    'descriptive'), 'ci_official', 'ci_kind'}. It only ever withholds: a decided verdict under detected drift is
+    'decided_with_drift' (DRIFT_RULE), one with an unattested player under `strict_identity` is
+    'decided_identity_unattested', and a counted result with an unattested player is `identity_qualified`. The
+    adaptation track's verdicts are exploratory: they lean, they never win."""
+    d = design or {}
+    verdict = v.get('verdict')
+    decided = verdict in DECIDED
+    unattested = sorted(p for p, x in (v.get('attestation') or {}).items() if (x or {}).get('status') == 'unattested')
+    counts = bool(v.get('counts_toward_leader'))
+    out = {'unattested': unattested, 'ci_kind': CI_FIXED, 'identity_qualified': False, 'identity_qualifier': None,
+           'qualifier': None, 'decision_status': verdict}
+    if track_of(d) == 'adaptation' or v.get('track') == 'adaptation':
+        e = v.get('equiv_bb100', EQUIV_BB100)
+        out.update(language='exploratory', ci_official=None, counts_toward_leader=False,
+                   decision_status='model-based lean' if decided else verdict,
+                   qualifier=(ADAPTATION_TEXT[verdict].format(a=a or 'a', b=b or 'b', e=e)
+                              + ' (exploratory: adaptation track, not official)') if decided else None)
+        return out
+    if not official_run or verdict == 'descriptive':
+        out.update(language='descriptive', ci_official=None)
+        return out
+    ci = _ci_official(v)
+    if ci and (v.get('drift') or {}).get('status') == 'drift detected':
+        ci = {**ci, 'drift': True, 'meaning': 'drift detected: the interval is for one mean edge over the run, which '
+                                              'the change of edge between early and late play contradicts'}
+    out.update(language='confirmatory', ci_official=ci)
+    if not decided:
+        return out
+    standing = v.get('standing')
+    if (v.get('drift') or {}).get('status') == 'drift detected':
+        status, counts, standing = 'decided_with_drift', False, 'decided_with_drift'
+        out['qualifier'] = _drift_qualifier(v, a, b)
+    elif unattested and d.get('strict_identity'):
+        status, counts = 'decided_identity_unattested', False
+        standing = 'decided (not counted: unattested identity under the strict policy)'
+        out['qualifier'] = (f'not counted: {", ".join(unattested)} unattested (the backend did not report which model '
+                            f'answered), and the design\'s strict identity policy counts only attested players')
+    else:
+        status = 'decided' if counts else 'decided_not_counted'
+    if counts and unattested:
+        out.update(identity_qualified=True,
+                   identity_qualifier=f'{", ".join(unattested)} unattested: the backend did not report which model '
+                                      f'answered, so this result rests on it serving the requested model (allowed by '
+                                      f'the design\'s policy)')
+    out.update(decision_status=status, standing=standing, counts_toward_leader=counts)
+    return out
 
 
 def _adaptation_verdict(v: dict, look: int) -> dict:
@@ -2593,23 +2714,31 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
             second = next(q for q in order if q != lead)
             _, lci, _, _ = interval([lead, second], unit((lead, 1), (second, -1)))
             beats = [(q, vmap[frozenset((lead, q))]) for q in order if q != lead]
+            qualified = [x for _, x in beats if x.get('identity_qualified')]
             leader = {'player': lead, 'component': ci, 'over': second, 'basis': 'sequential verdicts',
                       'margin_bb100': round(float(point[idx[lead]] - point[idx[second]]), 1), 'ci95': lci,
+                      'ci_kind': CI_FIXED, 'identity_qualified': bool(qualified),
+                      'unattested': sorted({p for x in qualified for p in x.get('unattested') or []}),
                       'beats': [{'player': q, 'edge': x['edge'] if x['a'] == lead else -x['edge'],
-                                 'looks_used': x['looks_used']} for q, x in beats]}
+                                 'looks_used': x['looks_used'], 'ci_official': x.get('ci_official'),
+                                 'identity_qualified': bool(x.get('identity_qualified'))} for q, x in beats]}
         leaders.append(leader)
         groups.append({
             'id': ci, 'players': comp, 'leader': lead, 'leader_detail': leader, 'front_runner': front,
             'leader_outside_calibration': outside,
             'misfit_pairings': sum((x.get('additivity') or {}).get('status') == 'warning' for x in mine),
-            'over': order[1] if front else None, 'front_runner_margin': margin, 'ci95': ci95, 'power': power,
+            'over': order[1] if front else None, 'front_runner_margin': margin, 'ci95': ci95, 'ci_kind': CI_FIXED,
+            'power': power, 'language': 'descriptive' if pooled or not registered else
+            'exploratory' if adaptation else 'confirmatory',
+            'identity_qualified': bool(leader and leader['identity_qualified']),
+            'drift_pairings': sum(x.get('decision_status') == 'decided_with_drift' for x in mine),
             'pairings': len(mine), 'decided': sum(x['verdict'] in DECIDED for x in mine),
             'has_bot': any(info(p)['kind'] == 'bot' for p in comp),
             'has_reference': any(str(info(p)['identity']).startswith('bot:reference') for p in comp),
             'kind': 'descriptive' if pooled else 'decided' if lead else 'model-based' if mb_lead else 'descriptive',
             'model_based_leader': mb_lead, 'track': track,
             'headline': _headline_adaptation(mb_lead, front, margin, ci95, mine) if adaptation
-            else _headline(lead, front, margin, ci95, mine, pooled, outside)})
+            else _headline(lead, front, margin, ci95, mine, pooled, outside, leader)})
         for pos, p in enumerate(order, 1):
             i = idx[p]
             se, sci, df, basis = interval([p], unit((p, 1)))
@@ -2628,7 +2757,7 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
                 'identity_match': _status_of(p, pairings, 'identity_match'),
                 'audit_status': _status_of(p, pairings, 'audit_status'),
                 'strength': round(float(point[i]), 1), 'strength_se': se, 'strength_ci95': sci, 'df': df,
-                'ci_basis': basis, 'position': pos, 'rank': rank, 'rank_kind': 'decided' if rank else 'descriptive',
+                'ci_basis': basis, 'ci_kind': CI_FIXED, 'position': pos, 'rank': rank, 'rank_kind': 'decided' if rank else 'descriptive',
                 'rank_range': rng_, 'rank_tied_with': tied, 'in_fit': True,
                 'identity_resolved': bool(info(p).get('identity_resolved', identity_resolved(info(p)['identity']))),
                 'net_bb': round(tot[p]['net_bb'], 1), 'hands': 2 * tot[p]['deals'], 'deals': tot[p]['deals'],
@@ -2647,7 +2776,11 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
             'reference': ref, 'reference_version': REFERENCE['version'],
             'edge': x['edge'] if x['a'] == row['player'] else -x['edge'],
             'cs': None if not x.get('cs') else x['cs'] if x['a'] == row['player'] else [-x['cs'][1], -x['cs'][0]],
+            'ci_official': None if not x.get('ci_official') else {
+                **x['ci_official'], 'interval': x['ci_official']['interval'] if x['a'] == row['player']
+                else [-x['ci_official']['interval'][1], -x['ci_official']['interval'][0]]},
             'ci95': x['ci95'] if not x['ci95'] or x['a'] == row['player'] else [-x['ci95'][1], -x['ci95'][0]],
+            'ci_kind': CI_FIXED,
             'deals': x['deals'], 'verdict': x['verdict']}
     unrated = sorted(excluded | ({p for d in raw for p in (d['a'], d['b'])} - set(names)))
     for p in unrated:
@@ -2657,7 +2790,7 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
             'identity_match': _status_of(p, pairings, 'identity_match'),
             'audit_status': _status_of(p, pairings, 'audit_status'),
             'strength': None, 'strength_se': None, 'strength_ci95': None, 'df': None, 'ci_basis': None,
-            'position': None, 'rank': None, 'rank_kind': 'descriptive', 'rank_range': None, 'rank_tied_with': [],
+            'ci_kind': CI_FIXED, 'position': None, 'rank': None, 'rank_kind': 'descriptive', 'rank_range': None, 'rank_tied_with': [],
             'in_fit': False, 'identity_resolved': bool(info(p).get('identity_resolved', identity_resolved(info(p)['identity']))),
             'net_bb': round(tot[p]['net_bb'], 1), 'hands': 2 * tot[p]['deals'], 'deals': tot[p]['deals'],
             'session_elo': None, 'session_elo_ci95': None, 'session_elo_basis': None, 'inferential': False,
@@ -2689,6 +2822,8 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
                                  reg, list(rejected), adaptation)
     return {'objective': OBJECTIVE, 'design': design, 'registration': reg, 'pooled': pooled, 'deals': len(raw),
             'track': track, 'official': not pooled and not adaptation, 'model_based': adaptation,
+            'language': 'descriptive' if pooled or not registered else 'exploratory' if adaptation else 'confirmatory',
+            'intervals': INTERVALS, 'strength_coverage': STRENGTH_COVERAGE,
             'label': ADAPTATION_LABEL if adaptation else None,
             'hands': 2 * len(raw), 'rejected': list(rejected), 'judge_fingerprint': judge_fingerprint(),
             'fit': {'method': 'least squares on distinct duplicate deals: each distinct deal counts once, so a '
@@ -2716,34 +2851,44 @@ def rate(deals, boot=BOOT, seed=0, session=SESSION, *, meta=None, design=None, p
             'players': players, 'pairings': pairings, 'matchups': pairings, 'roster': roster, 'notes': notes}
 
 
-def _headline(lead, front, margin, ci95, pairings, pooled, outside=None) -> str:
+def _fixed(ci95) -> str:
+    return f', fixed-time descriptive 95% range {_iv(ci95)}' if ci95 else ''
+
+
+def _headline(lead, front, margin, ci95, pairings, pooled, outside=None, leader=None) -> str:
     """One line per group, from that group's own data only."""
     if lead:
-        return (f'{lead} is the decided leader: it won its pairing against every other player in this group, each '
+        text = (f'{lead} is the decided leader: it won its pairing against every other player in this group, each '
                 f'an official verdict of the assumption-free test whose evidence stands today and whose checks passed.')
+        if leader and leader.get('identity_qualified'):
+            text += (f' Identity qualified: {", ".join(leader["unattested"])} unattested (the backend did not report '
+                     f'which model answered).')
+        return text
     if not front:
         return 'Only one player in this group.'
     open_ = sum(not x.get('counts_toward_leader') for x in pairings)
     what = 'pooled across runs, so nothing here is decided' if pooled else (
         f'no decided leader ({open_} of {len(pairings)} pairings without decided results that count)')
+    drifted = sum(x.get('decision_status') == 'decided_with_drift' for x in pairings)
+    if drifted:
+        what += (f'; {drifted} pairing{"s" if drifted != 1 else ""} decided with drift (the edge changed during '
+                 f'play), which count for nothing until a confirmation run on a stable model snapshot')
     if outside:
         what += (f'; {outside} won every pairing, but at least one of those verdicts failed its checks (deals '
                  f'repeated across conversations), so its error rate is not established')
-    iv = f', 95% {_iv(ci95)}' if ci95 else ''
-    return f'{front} is ahead on points by {margin:+.0f} bb/100 over the next player{iv}; {what}.'
+    return f'{front} is ahead on points by {margin:+.0f} bb/100 over the next player{_fixed(ci95)}; {what}.'
 
 
 def _headline_adaptation(lead, front, margin, ci95, pairings) -> str:
     if not front:
         return 'Only one player in this group.'
-    iv = f', 95% {_iv(ci95)}' if ci95 else ''
     if lead:
-        return (f'{lead} won its pairing against every other player in this group by the model-based gate '
-                f'(adaptation track: not official, so it is no decided leader); {front} is ahead on points by '
-                f'{margin:+.0f} bb/100{iv}.')
+        return (f'{lead} is ahead of every other player in this group on the model-based test (exploratory: '
+                f'adaptation track, not official, so no decided leader); {front} is ahead on points by '
+                f'{margin:+.0f} bb/100{_fixed(ci95)}.')
     called = sum(x['verdict'] in DECIDED for x in pairings)
-    return (f'{front} is ahead on points by {margin:+.0f} bb/100 over the next player{iv}; the model-based gate '
-            f'called {called} of {len(pairings)} pairings (adaptation track: not official).')
+    return (f'{front} is ahead on points by {margin:+.0f} bb/100 over the next player{_fixed(ci95)}; the model-based '
+            f'test leans one way in {called} of {len(pairings)} pairings (exploratory: adaptation track, not official).')
 
 
 def _notes(pooled, design, pairings, comps, groups, obs, repeats, excluded, unrated, players, block, reg=None,
@@ -2794,6 +2939,22 @@ def _notes(pooled, design, pairings, comps, groups, obs, repeats, excluded, unra
         if bad:
             notes.append('Ineligible for a decided result: ' + '; '.join(
                 f'{x["a"]} vs {x["b"]} ({"; ".join(x.get("ineligible_reasons") or [])})' for x in bad) + '.')
+        drifted = [x for x in pairings if x.get('decision_status') == 'decided_with_drift']
+        if drifted:
+            notes.append('Decided with drift, so not counted: ' + '; '.join(
+                f'{x["a"]} vs {x["b"]} ({x["qualifier"]})' for x in drifted) + f'. {DRIFT_RULE}')
+        strict = [x for x in pairings if x.get('decision_status') == 'decided_identity_unattested']
+        if strict:
+            notes.append('Not counted under the strict identity policy: ' + '; '.join(
+                f'{x["a"]} vs {x["b"]} ({", ".join(x["unattested"])} unattested)' for x in strict) + '.')
+        qualified = [x for x in pairings if x.get('identity_qualified')]
+        if qualified:
+            notes.append('Counted with an identity qualification (an unattested player the design allows; '
+                         '`plan --strict-identity` counts none): ' + '; '.join(
+                             f'{x["a"]} vs {x["b"]} ({", ".join(x["unattested"])} unattested)' for x in qualified) + '.')
+        notes.append(f'Each pairing\'s primary interval is the anytime-valid one (`ci_official`, level 1 - alpha / '
+                     f'{design.get("n_pairings", 1)}). Every 95% range (pairings, strengths, margins, session Elo) is '
+                     f'{CI_FIXED}: {INTERVALS[CI_FIXED]}.')
         retro = [x for x in pairings if x.get('retrospective') and x.get('test_verdict') in DECIDED + ('ineligible',)]
         if retro:
             notes.append('No decision by the registered judge was recorded at the last look of ' + ', '.join(
@@ -3094,6 +3255,7 @@ def _pairings(raw, obs, design, n_pairings, pooled, recorded, eligibility=None, 
                     v.update(verdict='retrospective',
                              reason='no decision by the registered judge was recorded at this look; this is today\'s '
                                     'recomputation, which decides nothing')
+        v.update(publication(v, design, x['a'], x['b'], registered and not pooled))
         v['inferential'] = bool(v.get('official')) and v['verdict'] in DECIDED
         last_rec = rec[-1] if rec else {}
         out.append({'a': x['a'], 'b': x['b'], 'matchups': x['matchups'], 'matchup': x['matchups'][-1],
@@ -3443,7 +3605,8 @@ def table(r, labels=None) -> str:
     labels = labels or {}
     name = lambda p: labels.get(p, p)
     lines = [f'Standings (descriptive): strength = {r["objective"]} against the average opponent in its group, '
-             f'with a 95% interval from a bootstrap that keeps shared cards and conversations together.']
+             f'with a fixed-time descriptive 95% interval from a bootstrap that keeps shared cards and conversations '
+             f'together (not adjusted for when play stopped).']
     for g in r.get('groups', []):
         if len(r['groups']) > 1:
             lines.append(f'\nGroup {g["id"] + 1}')
@@ -3519,6 +3682,8 @@ def design_line(d) -> str:
         need = f'about {d["deals_needed"]:,}' if d.get('deals_needed') else \
             f'more than {MAX_ROUNDS * d["round_deals"] * d["replicates"]:,}'
         head += f' Underpowered: capped by {why}; 80% would need {need} deals per pairing.'
+    if d.get('strict_identity'):
+        head += f' {STRICT_IDENTITY[0].upper()}{STRICT_IDENTITY[1:]}.'
     return head
 
 
@@ -3530,10 +3695,10 @@ def _design_line_adaptation(d) -> str:
             f'verdict possible from {d["min_conversations"]} conversations on.')
     if sc:
         m = sc['moderate']
-        head += (f' Chance of a model-based verdict for the better player at {d["target_edge_bb100"]:.0f} bb/100 '
+        head += (f' Chance that the model-based test leans toward the stronger player at {d["target_edge_bb100"]:.0f} bb/100 '
                  f'(simulated, normal conversation means): {_pct(m["power"])} with the assumed dependence, '
                  f'{_pct(sc["optimistic"]["power"])} with none, {_pct(sc["pessimistic"]["power"])} if it is worse. Its '
-                 f'error rate holds only within its calibrated family of shapes.')
+                 f'error rate holds only within its calibrated family of shapes, so its results are exploratory.')
     if d.get('underpowered'):
         why = f'a budget of {d["budget_deals"]:,} deals' if d.get('max_rounds_basis') == 'budget' else \
             'the most rounds the gate is calibrated for' if d.get('max_rounds_basis') == 'power' else 'its max_rounds'
@@ -3588,25 +3753,31 @@ def verdicts(r, labels=None) -> str:
             continue
         head += f'{m["edge"]:+.0f} bb/100 for {a} over {m["deals"]} deals in {m["conversations"]} conversation' \
             + ('s' if m['conversations'] != 1 else '')
-        if m.get('ci95'):
-            head += f' (95% {_iv(m["ci95"])}, descriptive)'
+        fixed = f'fixed-time descriptive 95% range {_iv(m["ci95"])}' if m.get('ci95') else ''
+        off = m.get('ci_official') if not adaptation and m['verdict'] != 'descriptive' else None
+        if off:
+            head += f' (official anytime-valid {off["level"]:.1%} interval {_iv(off["interval"])}' \
+                + (f'; {fixed})' if fixed else ')')
+        elif fixed:
+            head += f' ({fixed})'
         if adaptation and m.get('t') is not None and m['verdict'] != 'descriptive':
             head += f'; model-based t = {m["t"]}' + (f' against its bar {m["boundary"]:.2f}' if m.get('boundary') else '')
-        elif m.get('cs') and m['verdict'] != 'descriptive':
-            head += f'; anytime-valid {1 - m["alpha_pairing"]:.1%} interval {_iv(m["cs"])}'
         if m['verdict'] != 'descriptive' and m.get('looks_used') is not None:
             head += ', no planned look yet' if m['looks_used'] < 1 else f', look {m["looks_used"]} of {m["looks_planned"]}'
             cap = '' if adaptation else _capital(m)
             head += f', {cap}' if cap else ''
             if m.get('decided_at_look') and m['decided_at_look'] != m['looks_used']:
                 head += f', decided at look {m["decided_at_look"]}'
-        state = VERDICT_TEXT[m['verdict']].format(a=a, b=b, e=r.get('equiv_bb100', EQUIV_BB100))
-        if m['verdict'] in DECIDED and m.get('standing') and m['standing'].startswith('decided ('):
-            state += m['standing'][len('decided'):]
-        elif adaptation and m['verdict'] in DECIDED and m.get('calibrated') is not True:
-            state += ' (diagnostics ' + ('failed' if m.get('calibrated') is False else 'incomplete') + ')'
+        e = r.get('equiv_bb100', EQUIV_BB100)
+        state = VERDICT_TEXT[m['verdict']].format(a=a, b=b, e=e)
         if adaptation and m['verdict'] in DECIDED:
-            state = state.replace(' (decided)', ' (model-based, not official)')
+            state = ADAPTATION_TEXT[m['verdict']].format(a=a, b=b, e=e) + ' (exploratory: model-based, not official)'
+            if m.get('calibrated') is not True:
+                state += ' (diagnostics ' + ('failed' if m.get('calibrated') is False else 'incomplete') + ')'
+        elif m.get('decision_status') == 'decided_with_drift':
+            state = _named(m['qualifier'], name, [m['a'], m['b']])
+        elif m['verdict'] in DECIDED and m.get('standing') and m['standing'].startswith('decided ('):
+            state += m['standing'][len('decided'):]
         if adaptation and m.get('recorded'):
             state += f'; recorded by judge {m.get("judge")}'
         elif m.get('official'):
@@ -3625,10 +3796,12 @@ def verdicts(r, labels=None) -> str:
             lines.append(f'      {DIAGNOSTICS[st]}')
         if (m.get('drift') or {}).get('status') == 'drift detected':
             lines.append(f'      drift detected: {m["drift"]["meaning"]}.')
+        if m.get('identity_qualified'):
+            lines.append(f'      identity qualified: {_named(m["identity_qualifier"], name, [m["a"], m["b"]])}.')
         mb = m.get('model_based')
         if isinstance(mb, dict) and mb.get('verdict') and m['verdict'] != 'descriptive':
-            lines.append(f'      model-based (secondary, never official; assumes a family of shapes): '
-                         f'{VERDICT_TEXT.get(mb["verdict"], mb["verdict"]).format(a=a, b=b, e=r.get("equiv_bb100", EQUIV_BB100))}'
+            lines.append(f'      model-based (secondary, exploratory, never official; assumes a family of shapes): '
+                         f'{(ADAPTATION_TEXT.get(mb["verdict"]) or VERDICT_TEXT.get(mb["verdict"], mb["verdict"])).format(a=a, b=b, e=e)}'
                          + (f', t = {mb["t"]} vs bar {mb["boundary"]:.2f}' if mb.get('boundary') else ''))
         now = m.get('evidence_now')
         if now and now['status'] != 'verified':
@@ -3650,12 +3823,15 @@ def verdicts(r, labels=None) -> str:
     lead = [x for x in r.get('leaders') or [] if x]
     if adaptation:
         mb = [g['model_based_leader'] for g in r.get('groups') or [] if g.get('model_based_leader')]
-        lines.append('Won every pairing by the model-based gate (not official, not a decided leader): '
-                     + (', '.join(name(p) for p in mb) if mb else 'none') + '.')
+        lines.append('Ahead of every other player on the model-based test (exploratory: not official, not a decided '
+                     'leader): ' + (', '.join(name(p) for p in mb) if mb else 'none') + '.')
     elif not r.get('pooled') and (d or {}).get('registered', True):
         lines.append('Decided leader: ' + ('; '.join(f'{name(x["player"])} (won its pairing against every other '
                                                     f'player of its group: official verdicts, evidence verified today, '
-                                                    f'checks passed)' for x in lead) if lead else 'none.'))
+                                                    f'checks passed'
+                                                    + (f'; identity qualified: {", ".join(name(p) for p in x["unattested"])} '
+                                                       f'unattested' if x.get('identity_qualified') else '') + ')'
+                                                    for x in lead) if lead else 'none.'))
         for g in r.get('groups') or []:
             if g.get('leader_outside_calibration'):
                 lines.append(f'  {name(g["leader_outside_calibration"])} won every pairing of its group, but not all '

@@ -41,17 +41,17 @@ Code, Codex, Antigravity), so a tournament costs nothing beyond the plans you al
   The **official** track starts a fresh conversation for every deal, so its conversations are independent and
   its verdicts come from a test that assumes nothing about the shape of the results; only it decides ranks and
   leaders. The **adaptation** track keeps each conversation for 50 deals, so a model remembers the session and
-  can adapt to its opponent; its verdicts (and its stopping) come from a model-based test with stated
-  assumptions, labelled *adaptation · model-based · not official* everywhere, and never feed the official
-  standings. The all-time history keeps the tracks apart.
+  can adapt to its opponent; its readings (and its stopping) come from a model-based test with stated
+  assumptions, so they are exploratory ("leans ahead", never "wins"), labelled *adaptation · model-based · not
+  official* everywhere, and never feed the official standings. The all-time history keeps the tracks apart.
 - **Ratings.** Chips decide, as the models are told. Only one thing is a test: each pairing's preregistered
   sequential procedure. On the official track it is a betting confidence sequence on conversation means, which
   the stacks bound (±10,000 bb/100 at 100 big blinds): with no edge, the chance of any false verdict in a
   tournament stays under 5% at every look, for any distribution of results, given independent conversations.
-  A **decided** rank or leader is built from those verdicts alone. Everything else is **descriptive**: a
-  player's strength (its edge in bb/100 against the average opponent of its group, from a least-squares fit
-  over duplicate deals) and its 95% interval, the order by points, session Elo, and every adaptation-track
-  number. [docs/methodology.md](docs/methodology.md) has the method, the assumptions, power, cost and the limits.
+  A **decided** rank or leader is built from those verdicts alone, and not from one reached while the edge
+  drifted. Everything else is **descriptive**: a player's strength (its edge in bb/100 against the average
+  opponent of its group, from a least-squares fit over duplicate deals) and its fixed-time 95% interval, the
+  order by points, session Elo, and every adaptation-track number. [docs/methodology.md](docs/methodology.md) has the method, the assumptions, power, cost and the limits.
 
 ## Quick start
 
@@ -150,11 +150,19 @@ mean is one case of that). *even* (within ±15 bb/100) has the same guarantee. I
 changes the model mid-run, say), a verdict for a means a's expected edge was positive for at least part of the
 run, not that the run's average favours a: +100 bb/100 for 700 conversations and then −100 for 700 averages
 zero, yet a is rightly called at conversation 536 (with 3 pairings). So every verdict carries a **drift** diagnostic (the first
-half of its conversations against the second, Welch t, flagged at p < 1%), and a flagged one says *drift
-detected*. Each verdict reports those checks, its bettors' capital against the bar and
-an anytime-valid interval for the edge. Round 6's t and sign-flip gate, which a rare-loss distribution inside the
+half of its conversations against the second, Welch t, flagged at p < 1%), and a decided verdict it flags is
+**decided with drift** (`decision_status: decided_with_drift`): shown in plain words ("x ahead early, behind
+late"), but counted toward no rank or leader until a confirmation run on a stable model snapshot decides it. Drift
+after a pairing stops is never seen, so pin dated model snapshots. Each verdict reports those checks, its bettors'
+capital against the bar and its **official interval** (`ci_official`): the anytime-valid interval for the edge,
+at level 1 − alpha per pairing, valid whenever play stopped. Every other range (a pairing's t interval, strengths,
+the front runner's margin, session Elo) is marked `ci_kind: 'fixed-time descriptive'`: it ignores that play
+stopped on the results and that the front runner is picked by them. In seeded round robins that stop as the
+runner does, strength intervals still covered about 95% and the front runner's margin about 93%, one family of
+scenarios and not a guarantee (`ratings.STRENGTH_COVERAGE`). Round 6's t and sign-flip gate, which a rare-loss distribution inside the
 chip bounds fooled 45% of the time, is still shown beside it as a **model-based** result: secondary, never
-official, never counted.
+official, never counted. The adaptation track is judged by that gate, so its results are **exploratory**
+(`language: 'exploratory'`): a player *leans ahead on the model-based test*, it never wins.
 
 **What it costs.** Needing nothing has a price set by the bound: a pairing needs about log(2 / alpha per
 pairing) × 10,000 / edge independent conversations, however long each is (about 1,450 to detect 50 bb/100 among
@@ -226,7 +234,8 @@ that are stricter now).
 (the CLI reported the model that answered and `ratings.same_model` says it is the one requested; reporting some
 model is not enough; Codex can't report it, so the default design allows it and shows it as *unattested*; one
 policy, `ratings.attestation`, judges games and the quiz alike: attested, unattested where allowed, mismatch
-never), every
+never; a counted result that involves an unattested player carries `identity_qualified: true` into every
+headline, and `plan --strict-identity` (stored in the registered design) counts none of them), every
 model action has exactly one decision record with its calls, every used reply was audited for tool use (the plain
 `command` backend can't be, so it is never decided unless a design allows it; where decisions are linked to
 their calls and raw output by a decision id, the judge derives each one's audit from those links), each player's
@@ -241,6 +250,8 @@ coverage of the anytime-valid interval, the advertised power against `decide` it
 strength intervals. A pairing ends with one of these verdicts:
 
 - **a is better / b is better** (decided): that player's bettor reached the bar.
+- **decided with drift** (not counted): the bar was reached, but the edge changed between early and late
+  conversations; it needs a confirmation run on a stable model snapshot.
 - **even** (decided): the edge is shown to be within ±15 bb/100; out of reach of the default design at 100 big
   blinds.
 - **undecided after every planned look**: the data can't tell the two apart at this size. That is *not*
@@ -342,8 +353,8 @@ result takes a new run with its own design. The viewer shows it as **All runs** 
 run (a tournament's `out` folder, or a `play --out`). It follows running matches live. A tournament with two tracks
 is one entry in the picker: its page shows the official standings first, with a tab (and a compact section below
 the matchups) for **Adaptation (models remember the session)**, which has its own standings, matchups and replays,
-is marked *model-based · not official*, never shows a Decided badge, a rank or a leader, and says in one paragraph
-how the two tracks differ. The all-runs view pools official-track runs only.
+is marked *exploratory · not official*, never shows a Decided badge, a rank or a leader, words its results as
+leanings ("Reference bot leans ahead · model-based", never "wins"), and says in one paragraph how the two tracks differ. The all-runs view pools official-track runs only.
 
 The look is a card room: green felt, ivory cards, chips and brass. Players are always shown as a model and its
 reasoning level (e.g. "GPT-6 Luna · High", from `label` in `players.toml` or made from `model` and `effort`), never
@@ -364,6 +375,12 @@ leader whose wins include one outside the calibrated range is shown as *Leader, 
 decided leader. A matchup the judge may not decide (identity, audit, protocol or registration) shows **Ineligible**
 with its reasons. A verdict recorded by the run's registered judge is marked *official*; a recomputation by today's
 code is *retrospective*, and a verdict the runner recorded that is not a result today is shown as *at the time: ...*.
+A verdict the test reached while the edge **drifted** between early and late conversations (the ratings'
+`decision_status: decided_with_drift`, or a decided verdict with drift detected) is shown in a dashed pill in its own
+words ("Gemini 4 Neon: ahead early, behind late") with a *needs confirmation* chip: never a Decided badge, never a rank,
+never a leader; a group whose only clean sweep rests on one says so in its outcome row. A verdict withheld because a
+player's model was never confirmed (`decided_identity_unattested`) reads "... ahead · model unconfirmed", and any
+headline or verdict involving an unattested model (`identity_qualified`) carries a *model unconfirmed* chip.
 Everything recomputed as hands finish is **ahead on points**. The all-runs view pools runs that each stopped on their
 own rule, so it is descriptive only. A run without a registration written before play is **unregistered** (a void
 registration says so with its reason): nothing in it is decided, and any sample-size figure is labelled
@@ -371,25 +388,35 @@ registration says so with its reason): nothing in it is decided, and any sample-
 
 - **Standings.** The first screen answers four questions in plain words: who is playing (every model, then the bots,
   by name), who is ahead, whether that is decided, and a **Watch a hand** button (the live table when one is playing).
+  Two short sentences above the results say how to read them: *bb/100* is big blinds won per 100 hands (above 0 wins
+  chips), and the Decided badge marks only what a test planned before play settled. Operator guidance (such as how to
+  add the reference bot to a plan) sits in a folded **Run your own**, never before the results.
+  - **Ranges.** An official matchup's primary range is the test's **anytime-valid** interval (`ci_official`, else the
+    betting confidence sequence `cs`, with its level, e.g. "anytime-valid 98.3%"): it holds whenever play stops.
+    Every other range (strengths, the reference, a matchup's ordinary t interval, shown second) is labelled
+    **fixed-time, descriptive** (the ratings' `ci_kind`): play stops on the results and the front runner is picked by
+    them, so the page never calls it a 95% range.
   - **Players who met.** When the run (or the all-runs history) holds groups of players who never played each other,
     a compact selector picks one, named by its participants and protocol ("Gemini 4 Neon · Claude Sonnet 5.5 · GPT-6
     Luna · High reasoning · 50-hand conversations", "Baseline bots", "Earlier variants"). The current model cohort
     comes first and is shown by default; `?c=` in the address keeps the choice.
   - **Outcome row**, one per group of players who have met: the decided leader (an ace), or who is ahead on points
     (a face-down card), one sentence on whether it is decided and why ("Not decided yet: 1 of 3 matchups has a
-    result, and play continues"), its strength with the 95% range and the range's basis, and chips for the run's
+    result, and play continues"), its strength with its fixed-time, descriptive range and the range's basis, and chips for the run's
     registration, how many matchups are decided, the leader's assumption status and any wrong-model calls. When the
     matchups don't fit one number per player (an additivity *warning*), the row leads with the **direct results**
     ("Rule bot beat Random bot · 801 bb/100 · Decided") and shows the fitted strength only as a secondary, qualified
     number.
-  - **Against the reference bot**: each player's bb/100 against the fixed, versioned reference policy with its range
-    and verdict, models first. What the reference is and is not (a heuristic, not a solver) and its own record against
-    the baselines are one click away under *What the reference bot is*. A model-only group says plainly that it has no
-    fixed yardstick.
+  - **Against the reference bot**: each player's bb/100 against the fixed, versioned reference policy (a fixed
+    heuristic yardstick, not a measure of how good a player is at poker in general) with its range and verdict, models
+    first. What the reference is and is not (a heuristic, not a solver) and its own record against the baselines are one
+    click away under *What the reference bot is*. A model-only group says plainly that it has no fixed yardstick.
   - **How this is judged**, folded: the test and its assumptions, the target edge ("Planned to detect a 50 bb/100
     edge: ~N deals per matchup; the matchups have M", or *retrospective*), power under the optimistic, moderate and
     pessimistic dependence assumptions, the words used on the page, and the ratings' notes. Caveats live here once.
-  - **Standings**, per group: strength in bb/100 against the average opponent with its 95% range on a shared axis.
+  - **Standings**, per group: strength in bb/100 against the average opponent with its descriptive range on a shared
+    axis. With a cohort picked, the deal count is the cohort's own ("150 duplicate deals in this group"), with the
+    whole run's or archive's total beside it, labelled as such.
     A range that rests on blocks of deals inside single conversations is marked *within conversations* at the number
     (hatched on the axis): it leaves out how much fresh matches differ. The **decided order** comes first: decided
     ranks in order, then the players whose order is not decided, grouped by the places they share ("Places 3–4: the
@@ -399,7 +426,8 @@ registration says so with its reason): nothing in it is decided, and any sample-
     and checked); the style table says which hands it counts. Flags: *identity unresolved*, *model unconfirmed* (the model's tool
     never reported which model answered), *wrong model* or *partly confirmed*. A reference policy is tagged
     *reference*: it is the yardstick, not a contestant.
-  - **Matchups**, the direct evidence: each pair's edge with its 95% range and basis, its verdict with what it rests
+  - **Matchups**, the direct evidence: each pair's edge with its anytime-valid range (official runs) and its
+    fixed-time, descriptive range and basis, its verdict with what it rests
     on, the checks used and conversations it has, and an *off the fit* line only where the fit's additivity check
     warns ("The strengths predict +502; this matchup's own result is +273"). Where too few matchups link the players
     to test the fit, it says *fit: insufficient evidence to assess* instead.
@@ -425,8 +453,16 @@ registration says so with its reason): nothing in it is decided, and any sample-
   (*provenance checked*, *ineligible* with reasons, or *provenance not recorded*). **Harder categories, scored
   separately** gives every other category its own count out of its own spots, with fallbacks and bb lost; none of them
   enters the headline. No error ranges are shown unless the quiz defines its sampling population.
-  The reference policy is called out as the yardstick. Each spot opens on the same table component (the deciding seat's cards up, the opponent's down), with
-  the pot, price, break-even share, equity, best answer and every player's choice, its EV lost and its reasoning.
+  The reference policy is called out as the yardstick. The **Spots** list is grouped by category (a long category
+  shows 12, then *Show all*), with filters for category and for answers (*Players disagree*, *Someone missed*,
+  *Everyone right*); a generated spot whose title is its id gets one from its hand and situation ("J9o on the river:
+  Villain bets 3 bb into 6 bb"). Each spot opens on the same table component (the deciding seat's cards up, the
+  opponent's down), with **the question exactly as the model received it** (the spot's stored `prompt`, else the
+  prompt in the answers' call log, else the server's rebuild from `quiz.question`, marked with the quiz code's
+  version), and what it states in short (Villain's range, the hand so far, Villain's line, river plan or responses to
+  each bet, the allowed choices), beside the worked answer: the pot, price, equity, best answer and every player's
+  choice, its EV lost and its reasoning. The price is a **break-even** share only when the call ends the betting
+  (river, or someone all in); otherwise it is *immediate pot odds, before future betting*.
   This is separate from the standings: fundamentals, not winnings against these opponents. A quiz file marked
   `"fixture": true` is labelled as made-up layout data (`tests/fixtures/quiz.json` is one).
 - **Watch.** The first screen, on a desktop and on a phone, is the table: a one-strip scoreboard (both players by
@@ -449,7 +485,8 @@ registration says so with its reason): nothing in it is decided, and any sample-
     verifier's reasons for any rejection.
   - A finished deal opens at its first step with **Watch from start**; a deal still being played follows the latest
     step. Each deal shows **both plays at the table** (same cards, seats swapped). The felt says whose turn it is from
-    the engine's recorded `to_act`, the price to call and the break-even share (pot odds); each seat shows its made hand
+    the engine's recorded `to_act`, the price to call and its pot odds: a break-even share only when the call ends the
+    betting (river, or someone all in), else *immediate pot odds, before future betting*; each seat shows its made hand
     ("a pair of queens", plus an open draw on the flop or turn), labelled as computed from both players' cards. On a
     wide screen the tables sit side by side and move either **street by street** (both reach the flop, turn, river and
     result together; the one with fewer actions waits) or **Play 1, then Play 2**; on a narrower one, two tabs above

@@ -43,7 +43,19 @@
   }
 
   const DECIDED = ['a', 'b', 'even'];
-  const isDecided = p => !!p && DECIDED.includes(p.verdict);
+  // A verdict the test reached while the edge drifted between early and late conversations: it says only that a
+  // player was ahead for part of the run, so it is never decided and never makes a leader. From the ratings'
+  // `decided_with_drift` status when they give it, else from a decided verdict with drift detected beside it.
+  const driftOf = p => { const d = p && p.drift; return !d ? null : typeof d === 'string' ? { status: d } : d; };
+  const DRIFT_STATUS = 'decided_with_drift';
+  function driftQualified(p) {
+    if (!p || p.track === 'adaptation') return false;
+    if ([p.verdict, p.decision_status, p.verdict_status, p.status, p.standing].includes(DRIFT_STATUS)) return true;
+    return DECIDED.includes(p.verdict) && /drift detected/.test((driftOf(p) || {}).status || '');
+  }
+  const countsForLeader = p => !driftQualified(p) && !idWithheld(p) && p.counts_toward_leader !== false;
+  const idWithheld = p => !!p && p.decision_status === 'decided_identity_unattested';
+  const isDecided = p => !!p && DECIDED.includes(p.verdict) && !driftQualified(p) && !idWithheld(p);
   const playerId = x => x == null ? null : typeof x === 'object' ? x.player : x;
 
   // `pooled`: an all-runs view, which is descriptive only: no pairing verdict there is a decision.
@@ -121,7 +133,7 @@
   // own groups, they are rebuilt from the components and the pairings' verdicts.
   function decidedLeader(members, pairings) {
     if (members.length < 2) return null;
-    return members.find(p => members.every(q => q === p || pairings.some(x => x.track !== 'adaptation' &&
+    return members.find(p => members.every(q => q === p || pairings.some(x => x.track !== 'adaptation' && countsForLeader(x) &&
       ((x.a === p && x.b === q && x.verdict === 'a') || (x.a === q && x.b === p && x.verdict === 'b'))))) || null;
   }
 
@@ -147,20 +159,57 @@
       // a leader whose wins include one outside the calibrated range is not a decided leader
       let qualified = pooled ? null : playerId(g.leader_outside_calibration);
       let decided = leader && members.includes(leader) ? leader : null;
+      // a player that beat everyone only with the help of a drifted verdict: shown as such, never as a leader
+      const beat = (x, q, w) => x.track !== 'adaptation' && (DECIDED.includes(x.verdict) || driftQualified(x)) && verdictSides(x)
+        && verdictSides(x).winner === w && verdictSides(x).loser === q;
+      const loose = !pooled && !decided && members.length > 1 && members.find(w => members.every(q => q === w || pairings.some(x => beat(x, q, w))));
+      const driftLeader = decided && wins.some(x => !countsForLeader(x)) ? decided
+        : loose && pairings.some(x => verdictSides(x)?.winner === loose && driftQualified(x)) ? loose : null;
+      if (driftLeader) decided = null;
       if (decided && leaderAssumption === 'unsupported') { qualified = decided; decided = null; }
       if (qualified) leaderAssumption = 'unsupported';
       return { ...g, index: i, members, ranked: ranked.map(p => p.player), pairings,
-        leader: decided, qualified_leader: qualified && members.includes(qualified) ? qualified : null, front_runner: front, front_runner_margin: margin,
+        leader: decided, drift_leader: driftLeader, qualified_leader: qualified && members.includes(qualified) ? qualified : null, front_runner: front, front_runner_margin: margin,
         leader_assumption: leaderAssumption, misfits: g.misfit_pairings ?? pairings.filter(x => x.fit && x.fit.warn).length };
     });
   }
 
   // Which side a verdict favours, as {winner, loser} or null.
   function verdictSides(p) {
-    if (p.verdict === 'a') return { winner: p.a, loser: p.b };
-    if (p.verdict === 'b') return { winner: p.b, loser: p.a };
+    let v = p.verdict;
+    if (v === DRIFT_STATUS) {
+      const s = [p.side, p.decided_side, p.verdict_side, p.winner].find(x => x != null);
+      v = s === p.a ? 'a' : s === p.b ? 'b' : s || ((p.edge ?? 0) >= 0 ? 'a' : 'b');
+    }
+    if (v === 'a') return { winner: p.a, loser: p.b };
+    if (v === 'b') return { winner: p.b, loser: p.a };
     return null;
   }
+
+  // A drift-qualified verdict in words: {phrase: 'ahead early, behind late', early, late} from the winner's side.
+  function driftWords(p) {
+    const d = driftOf(p) || {}, s = verdictSides(p);
+    const flip = s && s.winner === p.b ? -1 : 1;
+    const early = d.early != null ? flip * d.early : null, late = d.late != null ? flip * d.late : null;
+    const at = x => x > 0 ? 'ahead' : x < 0 ? 'behind' : 'level';
+    const phrase = early != null && late != null ? `${at(early)} early, ${at(late)} late` : 'the edge changed over the run';
+    return { phrase, early, late };
+  }
+
+  // The official pairing's anytime-valid interval (the ratings' `ci_official`, else the betting confidence
+  // sequence `cs`) as {lo, hi, level}, in a's orientation; null when the pairing has none or is not official.
+  function officialInterval(p) {
+    if (!p || p.track === 'adaptation' || ['descriptive', 'unregistered'].includes(p.verdict)) return null;
+    const o = p.ci_official ?? p.cs;
+    if (!o) return null;
+    const iv = Array.isArray(o) ? o : o.interval || o.ci || o.range || (o.lo != null ? [o.lo, o.hi] : null);
+    if (!iv || iv[0] == null || iv[1] == null) return null;
+    const level = (Array.isArray(o) ? null : o.level ?? o.cs_level) ?? p.cs_level ?? null;
+    return { lo: iv[0], hi: iv[1], level };
+  }
+  // What an ordinary (t or bootstrap) interval is: fixed-time and descriptive, whatever the ratings call it.
+  const DESCRIPTIVE_TIP = 'An ordinary interval, computed as if the number of deals had been fixed in advance. Play stops on the results, and the player in front is picked out by them, so this range does not carry a 95% guarantee here: it describes the spread.';
+  const ciKind = x => (x && x.ci_kind) || 'fixed-time, descriptive';
 
   // ---- what a verdict rests on: the test (method) and whether its checks hold here (evidence) ------------
   const ASSUME = { free: 'no distribution assumption; conversations independent', supported: 'diagnostics passed; distribution assumptions unverified',
@@ -301,7 +350,7 @@
         : mv === 'exhausted' ? 'No winner' : mv === 'early' ? 'Too early' : 'Undecided' };
     const sec = secondary ? ` The model-based test (secondary, never decides) says: ${secondary.short.toLowerCase()}.` : '';
     const out = as.method === 'free' && as.status === 'free'
-      ? ` The test makes no assumption about the shape of the results: its error rate holds at every check if conversations are independent and the edge stays the same over the run (no drift)${p.drift && /drift detected/.test(typeof p.drift === 'string' ? p.drift : p.drift.status || '') ? '; drift was detected here, so treat this verdict with caution' : ''}.${sec}`
+      ? ` The test makes no assumption about the shape of the results: its error rate holds at every check if conversations are independent and the edge stays the same over the run (no drift).${sec}`
       : as.method === 'free' && as.status === 'unsupported'
       ? ` The test makes no assumption about the shape of the results, but a check it needs failed here (${as.failed.join(', ') || 'see the checks'}), so its error rate is not established.${sec}`
       : as.method === 'free' && as.status === 'incomplete'
@@ -312,11 +361,23 @@
       : ' Its error rate holds only under the test\'s assumptions, which are not checked here.';
     const qualifier = as.status === 'unsupported' ? (as.method === 'free' ? 'check failed' : ASSUME.unsupported) : '';
     if (p.track === 'adaptation' && DECIDED.includes(p.verdict)) {
-      const what = p.verdict === 'even' ? `within ±${band} bb/100 of each other` : `${name(sides.winner)} beats ${name(sides.loser)}`;
+      const what = p.verdict === 'even' ? `within ±${band} bb/100 of each other` : `${name(sides.winner)} ahead of ${name(sides.loser)}`;
       const diag = as.status === 'unsupported' ? ' Its diagnostics failed: the results look outside the family of shapes it was calibrated for.'
         : as.status === 'supported' ? ' Its diagnostics passed, but its error rate still rests on those assumptions.' : '';
-      return { tone: 'model', decided: false, model: true, qualifier, short: p.verdict === 'even' ? 'Even · model-based' : `${name(sides.winner)} wins · model-based`,
-        long: `Model-based verdict${looks}, not official: ${what}. On the adaptation track a model-based test (a t and sign-flip test calibrated for a family of result shapes) judges and stops play; it never decides the official standings, ranks or leaders.${diag}` };
+      return { tone: 'model', decided: false, model: true, qualifier, short: p.verdict === 'even' ? 'Leans even · model-based' : `${name(sides.winner)} leans ahead · model-based`,
+        long: `Exploratory${looks}, not official: the model-based test reads this as ${what}. On the adaptation track that test (a t and sign-flip test calibrated for a family of result shapes) stops play, but its error rate is not established for these results, so this is a lead to look into, not a finding; it never decides the official standings, ranks or leaders.${diag}` };
+    }
+    if (driftQualified(p)) {
+      const sides = verdictSides(p), dw = driftWords(p);
+      const num = x => x == null ? '' : `${x > 0 ? '+' : x < 0 ? MINUS : ''}${Math.abs(Math.round(x))}`;
+      const nums = dw.early != null && dw.late != null ? ` (${num(dw.early)} early, ${num(dw.late)} late, bb/100 for ${name(sides.winner)})` : '';
+      return { tone: 'drift', decided: false, drift: true, secondary, short: `${name(sides ? sides.winner : ahead)}: ${dw.phrase}`,
+        long: `Not decided: the sequential test's bar was cleared${looks}, but the edge drifted between early and late conversations${nums}. That says only that ${name(sides ? sides.winner : ahead)} was ahead for part of the run, not that it is better: it needs confirmation under a stable model snapshot, and it makes no leader.` };
+    }
+    if (idWithheld(p) && DECIDED.includes(p.verdict)) {
+      const sides = verdictSides(p);
+      return { tone: 'open', decided: false, identity: true, secondary, short: sides ? `${name(sides.winner)} ahead · model unconfirmed` : 'Even · model unconfirmed',
+        long: `Not counted: the test's bar was cleared${looks}, but a player's tool never reported which model answered, and this run's policy counts only confirmed models.${typeof p.qualifier === 'string' ? ` (${p.qualifier})` : ''}` };
     }
     switch (p.verdict) {
       case 'a': case 'b':
@@ -522,6 +583,38 @@
   }
   // The headline is one category's (the one the quiz scores: `scored_category`, else "basics" when there are
   // others), every figure of it from that category's own answers; every other category keeps its own count.
+  // The question exactly as a model received it: the spot's stored prompt, else the first prompt recorded in an
+  // answer's call log, else the server's reconstruction from today's quiz code. {text, source, ...} or null.
+  function spotPrompt(q, s) {
+    if (s.prompt) return { text: s.prompt, source: 'stored' };
+    const seen = [];
+    for (const x of q.players || []) {
+      const a = (x.answers || {})[s.id];
+      const c = a && (a.calls || [])[0];
+      if (c && c.prompt) seen.push(c.prompt);
+    }
+    if (seen.length) return { text: seen[0], source: 'recorded', answers: seen.length, differs: new Set(seen).size > 1 };
+    if (s.question) return { text: s.question, source: 'reconstructed', version: s.question_version || null };
+    return null;
+  }
+  // A hand in the usual short form: ['Qd', '9c'] -> 'Q9o', ['As', 'Ks'] -> 'AKs', ['Td', 'Tc'] -> 'TT'.
+  const RANKS = '23456789TJQKA';
+  function handCode(hole) {
+    if (!hole || hole.length !== 2 || hole.some(c => !c || c.length < 2)) return '';
+    const [x, y] = [...hole].sort((a, b) => RANKS.indexOf(b[0]) - RANKS.indexOf(a[0]));
+    return x[0] === y[0] ? x[0] + y[0] : x[0] + y[0] + (x[1] === y[1] ? 's' : 'o');
+  }
+  // A spot's title: its own, or for a generated spot (whose title is its id) one made from the hand and the situation.
+  function spotTitle(s) {
+    if (s.title && s.title !== s.id) return s.title;
+    const hand = handCode(s.hole) || 'A hand', at = `${hand} on the ${s.street || 'river'}`;
+    const sit = s.situation || '';
+    if (s.kind === 'sizing') return `${at}: check, or how much to bet`;
+    if (s.kind === 'multistreet') return `${at}: ${sit || 'facing a bet'}, river plan known`;
+    if (s.kind === 'inference') return `${at}: ${sit || 'facing a bet'}, range from its line`;
+    return sit ? `${at}: ${sit}` : at;
+  }
+
   function quizOf(raw) {
     if (!raw || typeof raw !== 'object') return null;
     const spots = (raw.spots || raw.items || raw.questions || []).map((x, i) => ({ ...x, id: String(x.id ?? x.spot ?? i),
@@ -639,6 +732,6 @@
   }
 
   return { dealSequence, sequenceSwings, sequenceTotals, standingBlocks, cohorts, cohortName, protocolOf, populationOf, testOf, isFallback, provenanceOf, quizOf, firstDifference, bigSwings, IDENTITY, esc, MINUS, signed, plural, trim, approx, nameParts, family, isContract, normalize, verdict, verdictSides, powerLine, correction, actText,
-    isDecided, decidedLeader, playerId, rateOf, targetEdge, isUnregistered, scenarios, conversationsShort,
+    isDecided, decidedLeader, driftQualified, countsForLeader, driftWords, officialInterval, ciKind, DESCRIPTIVE_TIP, spotPrompt, spotTitle, handCode, playerId, rateOf, targetEdge, isUnregistered, scenarios, conversationsShort,
     assumptionsOf, ineligible, sourceOf, basisOf, fitOf, identityOf, ASSUME };
 });

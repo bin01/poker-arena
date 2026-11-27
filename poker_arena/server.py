@@ -717,7 +717,39 @@ def quiz(root: Path, run):
                 kinds[pid] = 'bot' if 'bot' in known[pid] else 'model'
     except Exception:
         pass
-    return {**data, 'labels': {**labels, **(data.get('labels') or {})}, 'kinds': {**kinds, **(data.get('kinds') or {})}}
+    return {**data, 'spots': _with_questions(data), 'labels': {**labels, **(data.get('labels') or {})},
+            'kinds': {**kinds, **(data.get('kinds') or {})}}
+
+
+def _with_questions(data: dict) -> list:
+    """The quiz's spots, each without a stored or recorded prompt given `question`: the text the quiz code sends
+    for it (`quiz.question`), rebuilt from its definition when that still matches the stored spot, and
+    `question_version`, the quiz code's version, which can differ from the version the quiz ran."""
+    spots = data.get('spots') or []
+    players = data.get('players') or {}
+    asked = set()
+    for r in (players.values() if isinstance(players, dict) else players):
+        for a in (r or {}).get('answers') or []:
+            if isinstance(a, dict) and any(isinstance(c, dict) and c.get('prompt') for c in a.get('calls') or []):
+                asked.add(str(a.get('spot')))
+    try:
+        from . import quiz as Q
+    except ImportError:
+        return spots
+    out = []
+    for s in spots:
+        if not isinstance(s, dict) or s.get('prompt') or str(s.get('id')) in asked:
+            out.append(s)
+            continue
+        try:
+            d = Q.spot_def(s['id'])
+            ep, hero, _, _ = Q.build(d)
+            same = (list(d['hole']) == list(s.get('hole') or []) and list(d['board']) == list(s.get('board') or [])
+                    and d['range'] == s.get('villain_range') and ep.pot == s.get('pot') and ep.to_call(hero) == s.get('to_call'))
+            out.append({**s, 'question': Q.question(s, ep, hero), 'question_version': Q.VERSION} if same else s)
+        except Exception:
+            out.append(s)
+    return out
 
 
 def _verified_quiz(path: Path):

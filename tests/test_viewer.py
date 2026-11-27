@@ -990,7 +990,7 @@ class TestViewerLogic(unittest.TestCase):
         r = self.run_js(f'const s = PokerTable.steps({json.dumps(hand)}); return [s.steps.map(x => x.toAct), s.log[1].facing,'
                         ' s.steps[0].seats[0].made, s.steps[3].seats[0].made];')
         self.assertEqual(r[0], [0, 1, 1, 1, 0, 1, None, None])
-        self.assertEqual(r[1], {'toCall': 1, 'pot': 3, 'odds': 0.25})
+        self.assertEqual(r[1], {'toCall': 1, 'pot': 3, 'odds': 0.25, 'closes': False})   # a preflop limp: more betting follows
         self.assertEqual(r[2:], ['ace high (recorded)', 'a pair of aces (recorded)'])
 
     def test_made_hands(self):
@@ -1020,6 +1020,102 @@ class TestEffort(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+@unittest.skipUnless(shutil.which('node'), 'node is not installed')
+class TestRound8Review(unittest.TestCase):
+    """Blind review round 8: drifted verdicts, the official interval, the quiz question as asked, pot-odds words."""
+    run_js = TestViewerLogic.run_js
+
+    DRIFT = {'a': 'x', 'b': 'y', 'edge': 5, 'verdict': 'a', 'official_test': {'name': 'betting confidence sequence', 'assumption_free': True},
+             'drift': {'status': 'drift detected', 'early': 100, 'late': -90}}
+
+    def test_drift_is_never_decided_nor_a_leader(self):
+        players = [{'player': 'x', 'strength': 3}, {'player': 'y', 'strength': -3}]
+        cases = [self.DRIFT, {**self.DRIFT, 'drift': {'status': 'stable'}, 'decision_status': 'decided_with_drift', 'counts_toward_leader': False}]
+        r = self.run_js(f'return {json.dumps(cases)}.map(p => {{ const rt = Core.normalize({{players: {json.dumps(players)}, pairings: [p], design: {{registered: true}}}});'
+                        ' const q = rt.pairings[0], v = Core.verdict(q); return [v.decided, v.tone, v.short, v.long, Core.isDecided(q), rt.groups[0].leader, rt.groups[0].drift_leader]; });')
+        self.assertEqual(r[0][:3], [False, 'drift', 'x: ahead early, behind late'])
+        self.assertIn('needs confirmation', r[0][3])
+        self.assertNotIn('Decided', r[0][3])
+        self.assertEqual(r[0][4:], [False, None, 'x'])
+        self.assertEqual((r[1][0], r[1][1], r[1][4], r[1][5], r[1][6]), (False, 'drift', False, None, 'x'))
+        r = self.run_js(f'const p = {json.dumps(self.DRIFT)}; return [Core.verdict({{...p, drift: {{status: "stable"}}}}).decided,'
+                        ' Core.verdict({...p, verdict: "b", drift: {status: "drift detected", early: 100, late: -90}}).short,'
+                        ' Core.verdict({...p, decision_status: "decided_identity_unattested", drift: null}).decided];')
+        self.assertEqual(r, [True, 'y: behind early, ahead late', False])
+
+    def test_official_interval_is_primary_and_others_descriptive(self):
+        r = self.run_js('const o = Core.officialInterval; return [o({verdict: "a", cs: [10, 90], cs_level: 0.983}),'
+                        ' o({verdict: "open", ci_official: {interval: [-5, 40], level: 0.99, kind: "anytime-valid sequential"}, cs: [1, 2]}),'
+                        ' o({verdict: "descriptive", cs: [1, 2]}), o({verdict: "a", track: "adaptation", cs: [1, 2]}), o({verdict: "a"}),'
+                        ' Core.ciKind({}), Core.ciKind({ci_kind: "fixed-time descriptive"}), Core.DESCRIPTIVE_TIP];')
+        self.assertEqual(r[0], {'lo': 10, 'hi': 90, 'level': 0.983})
+        self.assertEqual(r[1], {'lo': -5, 'hi': 40, 'level': 0.99})
+        self.assertEqual(r[2:5], [None, None, None])
+        self.assertEqual(r[5:7], ['fixed-time, descriptive', 'fixed-time descriptive'])
+        self.assertNotIn('95% range', r[7])
+        app = (VIEWER / 'app.js').read_text()
+        self.assertNotIn('95% range', app)
+        self.assertNotIn('The range is 95%', app)
+        self.assertNotIn('how good they are at poker', app)
+
+    def test_adaptation_is_exploratory(self):
+        r = self.run_js('const p = {a: "x", b: "y", edge: 40, track: "adaptation"};'
+                        ' return [Core.verdict({...p, verdict: "a"}), Core.verdict({...p, verdict: "even"}).short];')
+        self.assertEqual(r[0]['short'], 'x leans ahead · model-based')
+        self.assertFalse(r[0]['decided'])
+        self.assertIn('Exploratory', r[0]['long'])
+        self.assertNotIn('wins', r[0]['short'] + r[1])
+        self.assertNotIn('beats', r[0]['long'])
+
+    def test_quiz_question_as_asked(self):
+        q = {'players': [{'player': 'm', 'answers': [{'spot': 's1', 'calls': [{'prompt': 'Question s1. exact text'}, {'prompt': 'retry'}]}]},
+                         {'player': 'n', 'answers': [{'spot': 's1', 'calls': [{'prompt': 'Question s1. exact text'}]}]}],
+             'spots': [{'id': 's1', 'title': 's1', 'hole': ['9h', 'Jd'], 'street': 'river', 'situation': 'Villain bets 3 bb into 6 bb', 'kind': 'call'},
+                       {'id': 's2', 'question': 'rebuilt', 'question_version': 'quiz-3', 'hole': ['As', 'Ks'], 'kind': 'sizing', 'street': 'river', 'title': 's2'},
+                       {'id': 's3', 'prompt': 'stored', 'title': 'Queens against kings', 'hole': ['Qd', 'Qc']}, {'id': 's4', 'title': 's4'}]}
+        r = self.run_js(f'const q = Core.quizOf({json.dumps(q)}); return [q.spots.map(s => Core.spotPrompt(q, s)), q.spots.map(Core.spotTitle),'
+                        ' [["Td", "Tc"], ["2s", "As"], ["Kh", "Qd"]].map(Core.handCode)];')
+        self.assertEqual(r[0][0], {'text': 'Question s1. exact text', 'source': 'recorded', 'answers': 2, 'differs': False})
+        self.assertEqual(r[0][1], {'text': 'rebuilt', 'source': 'reconstructed', 'version': 'quiz-3'})
+        self.assertEqual(r[0][2], {'text': 'stored', 'source': 'stored'})
+        self.assertIsNone(r[0][3])
+        self.assertEqual(r[1][:3], ['J9o on the river: Villain bets 3 bb into 6 bb', 'AKs on the river: check, or how much to bet', 'Queens against kings'])
+        self.assertEqual(r[2], ['TT', 'A2s', 'KQo'])
+
+    def test_pot_odds_are_a_break_even_only_when_the_call_closes_the_betting(self):
+        hand = [dict(e, data=dict(e['data'])) for e in HAND]
+        hand[-2]['data'] = {'seat': 1, 'action': 'call', 'amount': 8, 'pot': 28}
+        hand.insert(-1, {'kind': 'board', 'data': {'street': 'turn', 'cards': ['2c'], 'board': ['Ah', '9c', '3d', '2c']}})
+        r = self.run_js(f'const s = PokerTable.steps({json.dumps(hand)}); const c = PokerTable.callCloses;'
+                        ' return [s.log.filter(e => e.facing).map(e => e.facing.closes), s.steps.filter(x => x.toCall).map(x => x.callCloses),'
+                        ' c({street: "river", toCall: 5, stack: 100}), c({street: "flop", toCall: 50, stack: 50}), c({street: "turn", toCall: 5, stack: 100, opponentAllIn: true}),'
+                        ' c({street: "turn", toCall: 5, stack: 100}), PokerTable.priceText(0.25, false), PokerTable.priceText(0.25, true)];')
+        self.assertEqual(r[0], [False, False, False])
+        self.assertTrue(all(x is False for x in r[1]))
+        self.assertEqual(r[2:6], [True, True, True, False])
+        self.assertEqual(r[6], 'immediate pot odds 25%, before future betting')
+        self.assertEqual(r[7], 'break-even 25%')
+        app = (VIEWER / 'app.js').read_text()
+        self.assertNotIn('it pays if it wins ${Math.round(st.potOdds * 100)}% of the time` : ', app)
+
+
+class TestQuizQuestion(unittest.TestCase):
+    def test_server_rebuilds_the_question_only_without_a_recorded_prompt(self):
+        from poker_arena import quiz as Q
+        d = Q.spot_def('pf-call-qq-100')
+        ep, hero, _, _ = Q.build(d)
+        spot = {'id': d['id'], 'kind': 'call', 'stack_bb': d['stack_bb'], 'hole': d['hole'], 'board': d['board'], 'villain_range': d['range'],
+                'villain_combos': len(Q.villain_combos(d)), 'options': ['fold', 'call'], 'pot': ep.pot, 'to_call': ep.to_call(hero)}
+        out = server._with_questions({'spots': [spot, {**spot, 'id': 'pf-shove-a7o-10'}], 'players': {}})
+        self.assertEqual(out[0]['question'], Q.question(spot, ep, hero))
+        self.assertIn('KK+', out[0]['question'])
+        self.assertIn('your only choices are "fold" or "call"', out[0]['question'])
+        self.assertEqual(out[0]['question_version'], Q.VERSION)
+        self.assertNotIn('question', out[1])                      # its definition no longer matches the stored spot
+        asked = server._with_questions({'spots': [spot], 'players': {'m': {'answers': [{'spot': spot['id'], 'calls': [{'prompt': 'as sent'}]}]}}})
+        self.assertNotIn('question', asked[0])
 
 
 class TestRound8Followups(unittest.TestCase):

@@ -62,7 +62,9 @@ ratings, the command line and the viewer report what it recorded. Its verdicts *
 A **decided rank** and a **decided leader** are built from those verdicts alone, so they inherit their
 guarantee: a false leader needs at least one false verdict. A verdict whose checks failed (its
 `assumptions` are `unsupported`, below) does not count unless the design preregistered that it should
-(`outside_calibration: 'count'`). A leader is a player with a counting decided win over every other player of
+(`outside_calibration: 'count'`), and neither does one reached while the edge drifted (`decided_with_drift`,
+below) or, under the design's `strict_identity`, one with an unattested player (`decided_identity_unattested`).
+A leader is a player with a counting decided win over every other player of
 its group; a rank is decided when a player has a counting decided win or loss against every other player of its
 group (and the verdicts form no cycle). A group whose only would-be leader relies on a verdict whose checks
 failed has `leader: null` and names it in `leader_outside_calibration`.
@@ -135,6 +137,20 @@ and printed with it ("drift detected: ..."); it does not change the verdict, who
 conditional null either way, but it changes what the verdict means. It is a diagnostic: it can miss drift that
 reverses within each half, and a steady pairing is flagged about 1% of the time.
 
+**Drift withholds the result (round 8).** "Ahead for part of the run" is too weak a claim for a standings
+table, so a decided verdict whose drift diagnostic says *drift detected* gets `decision_status` and `standing`
+**`decided_with_drift`** (`ratings.publication`, applied by `adjudicate`, so the runner records it, and again by
+`rate` to every recorded verdict, so older records are judged by the rule too). It keeps its verdict (play
+stops on it, as before), it is shown with a plain-language `qualifier` ("decided with drift: x ahead early,
+behind late (+100 then −100 bb/100); the edge changed during play, so this verdict counts toward no rank or
+leader: it needs a confirmation run on a stable model snapshot"), and `counts_toward_leader` is false, so it
+builds no decided rank or leader. The group headline and the notes say how many pairings are withheld this way.
+The confirmation is a new registered run on dated model snapshots: a result that stands is one decided twice.
+On the reviewer's sequence (`tests/test_publication.py`, `TestDriftIsNotACountedWinner`) the verdict is still a
+at conversation 536, and the run names no winner. The diagnostic sees only the conversations judged: when a
+pairing stops before the edge moves, the drift is never observed, which is why bare aliases are quarantined,
+dated snapshots should be pinned, and confirmation runs are the remedy rather than a longer first run.
+
 **Every verdict reports its checks** (`assumptions: {status, summary, checks}`, recorded with the decision):
 `bounded` (no deal beyond the bound), `independent_deals` (no deal repeated across the pairing's conversations)
 and `conversations` (enough for any verdict). `supported` is *checks passed: the guarantee holds for any
@@ -143,6 +159,23 @@ deal) means the conversations are not shown to be independent, and such a verdic
 decided rank or leader unless the design says `outside_calibration: 'count'`; `unknown` is *checks
 incomplete*. A decided verdict carries `calibrated` (kept from round 6: true when the checks passed) and a
 `standing`.
+
+**Which interval is official.** Each pairing of a registered official run carries `ci_official`:
+`{interval, level, kind: 'anytime-valid sequential', meaning}`, the betting confidence sequence (`cs`) at level
+1 − alpha_pairing, which covers the mean edge at every look at once, so it stays valid whenever play stopped. It
+is the primary interval. Every ordinary interval is marked `ci_kind: 'fixed-time descriptive'` (a pairing's t
+interval `ci95`, each player's `strength_ci95` and session Elo, a group's front-runner margin, a leader's margin,
+the edge against the reference): it would cover 95% for a sample fixed in advance, but play stops when the
+results say so and the front runner is picked from the same data, and neither is accounted for. `rate` returns
+`intervals` (what each kind means) and `strength_coverage` (below); pooled and unregistered runs and the
+adaptation track have `ci_official: null`. **Coverage after stopping**, checked by simulation rather than
+claimed: in seeded round robins of 4 players (strengths ±1.5k and ±0.5k, k = 300 to 700 bb/100, a 3,000 bb/100
+bound so that no deal is clipped, conversation effects, 10-deal conversations, 4 a round, up to 8 rounds) whose
+pairings stop when the official test decides, as the runner stops them (up to half stopping early), 400
+tournaments per setting: strength intervals covered 0.946 to 0.949, pairing t intervals 0.95, and the front
+runner's margin 0.925 to 0.930 (it is selected by the data). That is one family of scenarios, not a guarantee,
+so these intervals stay descriptive (`tests/test_publication.py`, `TestStoppedRunCoverage`; POKER_ARENA_HEAVY=1
+runs the 400).
 
 ## The adjudicator: registration, eligibility and official decisions
 
@@ -165,7 +198,7 @@ player its kind, backend, requested model, protocols, the models its replies nam
 |---|---|
 | registration | no valid registration (as above), or a code change during the run |
 | identity resolved | no model recorded, or a bare alias (`sonnet`) |
-| identity attested | by the one attestation policy, `ratings.attestation`, which judges the quiz the same way: `attested` (the backend reported the requested model), `unattested` (it reported none) or `mismatch` (another model, by `ratings.same_model`, rechecked by the judge from the models the facts name, whatever summary they carry). Ineligible on a mismatch, on no reply at all, or when unattested and the design's `allow_unattested` (default `codex`, which cannot report it) does not name the backend. An allowed unattested player is shown as unattested everywhere (`attestation` per player in each verdict): reporting some model is never a match. |
+| identity attested | by the one attestation policy, `ratings.attestation`, which judges the quiz the same way: `attested` (the backend reported the requested model), `unattested` (it reported none) or `mismatch` (another model, by `ratings.same_model`, rechecked by the judge from the models the facts name, whatever summary they carry). Ineligible on a mismatch, on no reply at all, or when unattested and the design's `allow_unattested` (default `codex`, which cannot report it) does not name the backend. An allowed unattested player is shown as unattested everywhere (`attestation` per player in each verdict): reporting some model is never a match. A counted result with an unattested player carries `identity_qualified: true`, `identity_qualifier` and `unattested` (on the pairing, and on the leader and group it makes); under the design's `strict_identity` (`plan --strict-identity`) such a pairing stays eligible and keeps its verdict, but is `decided_identity_unattested` and counts toward no rank or leader. |
 | audit complete | a used reply whose turn could not be checked for tool use: `opaque` (the `command` backend) unless `allow_opaque` names the backend (default none), or unverified or unrecorded; and, where the records link each decision to its calls (`decision_id`), the audit the judge derives from those links is not complete (below) |
 | decision coverage | (from the runner's facts) a model action without exactly one decision record and its calls, decision records without an action, or no recorded actions at all |
 | protocol consistent | the player's settings differ between the pairing's matches, or a match records no protocol |
@@ -275,6 +308,7 @@ and the viewer shows (nothing else builds one):
 | `allow_unattested` | `['codex']` | backends whose players may be eligible without attesting the model that answered |
 | `allow_opaque` | `[]` | backends whose players may be eligible although their turns cannot be audited for tool use |
 | `outside_calibration` | `'exclude'` | whether a decided verdict whose checks failed counts towards a decided rank or leader (`'count'`) |
+| `strict_identity` | `false` | strict publication policy (`plan --strict-identity`): a pairing with an unattested player gets no counted result (`decided_identity_unattested`); by default it counts, marked `identity_qualified` |
 | `registered` | | only `false`, for a plan that declines registration or an older stopping rule; whether a run is registered comes from `registration_status`, never from the design |
 | `calibration` | | what sets the official test (bound, bet cap, prior, bar, margin); hashed into the calibration id |
 
@@ -380,6 +414,13 @@ family); *supported* there means *diagnostics passed; distribution assumptions u
 The runner stops on these verdicts and records them like official ones; `rate` reads them as recorded but never
 builds a rank or a leader from them: a group reports `model_based_leader` (a counting model-based win over every
 other player) beside `leader: null`, and `inferential` is false for every adaptation player.
+
+**Exploratory language.** The gate's error rate is not established outside its family, so adaptation results
+never say *wins* or *better*: a decided gate verdict is a `qualifier` such as "x leans ahead on the model-based
+test (exploratory: adaptation track, not official)", `decision_status` is `model-based lean`, and every
+adaptation pairing, group and run carries `language: 'exploratory'` (official ones `'confirmatory'`, pooled and
+unregistered ones `'descriptive'`) for the viewer to word by. The gate is kept as it is: a robust
+conversation-level replacement is future work, and until then its readings are leads, not findings.
 
 The default 3-model adaptation design: 10 rounds of 4 conversations of 50 deals (2,000 deals per pairing at
 most), a verdict possible from 12 conversations; at 50 bb/100 the gate decides for the better player with
@@ -701,8 +742,12 @@ call, result or not: a mismatch anywhere counts.)
   checked; it is eligible only because the attestation policy allows it by default, in games and the quiz
   alike, and it is shown as unattested.
 - **Drift.** The guarantee is for the conditional null; an edge that changes during a run makes a verdict mean
-  "ahead for part of the run". The drift diagnostic flags large changes between early and late play, not every
-  change.
+  "ahead for part of the run", so a flagged one does not count (`decided_with_drift`) until a confirmation run
+  decides it. The drift diagnostic flags large changes between early and late play of the judged conversations,
+  not every change, and nothing after the stop.
+- **Fixed-time intervals after stopping.** Only `ci_official` is valid whenever play stopped; the 95% ranges
+  were checked by simulation in one family of stopped round robins (about 95% for strengths, 93% for the front
+  runner's margin), not in general.
 - **Winnings are relative.** Strength and verdicts say how a model does against the players it met. The fixed
   reference bot gives every run a common, versioned opponent, and the quiz scores fundamentals against computed
   answers; neither is a measure of play against strong humans, and the reference is a heuristic, not a solver.
