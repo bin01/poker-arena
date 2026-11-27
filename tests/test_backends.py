@@ -224,11 +224,27 @@ class TestIdentity(OnPath):
                                                   'requested_effort')},
                          {'requested_model': 'claude-x-1', 'observed_model': 'claude-x-1-20260101',
                           'identity': 'attested', 'served_model': 'claude-x-1-20260101', 'requested_effort': 'high'})
+        self.assertEqual((r.meta['identity_reported'], r.meta['identity_match']), (True, 'match'))
+
+    def test_identity_match_is_separate_from_reporting(self):
+        from poker_arena.backends import identity_fields
+        self.assertEqual(identity_fields('claude-sonnet-5-5', 'claude-sonnet-5-5-20260101'),
+                         {'identity_reported': True, 'identity_match': 'match'})
+        self.assertEqual(identity_fields('claude-sonnet-5-5', 'claude-haiku-5-5'),
+                         {'identity_reported': True, 'identity_match': 'mismatch'})
+        self.assertEqual(identity_fields(None, 'claude-haiku-5-5'),
+                         {'identity_reported': True, 'identity_match': 'mismatch'})
+        self.assertEqual(identity_fields('claude-sonnet-5-5', None),
+                         {'identity_reported': False, 'identity_match': 'unattested'})
+        be = make_backend('claude', 'SYS', model='claude-sonnet-5-5')
+        meta = be.identity('claude-haiku-5-5')
+        self.assertEqual((meta['identity_reported'], meta['identity_match']), (True, 'mismatch'))
 
     def test_a_claude_reply_that_names_no_model_is_unattested(self):
         self.install('claude', FAKE_CLAUDE)
         r = asyncio.run(make_backend('claude', 'SYS', model='claude-x-1', retries=0).send('hi'))
         self.assertEqual((r.meta['observed_model'], r.meta['identity']), (None, 'unattested'))
+        self.assertEqual((r.meta['identity_reported'], r.meta['identity_match']), (False, 'unattested'))
         self.assertNotIn('served_model', r.meta)
 
     def test_codex_and_command_cannot_attest(self):

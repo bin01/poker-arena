@@ -43,7 +43,8 @@ def deals_between(a, b, edge, n, rng, sd=300.0, rounds=1, seed0=1000, run='', pl
                 seed = seed0 + ((r - 1) * reps + j - 1) * n + k
                 name = f'{run}{a}__vs__{b}' + (f'__x{j}' if j > 1 else '') + (f'__r{r}' if r > 1 else '')
                 out.append({'a': a, 'b': b, 'matchup': name, 'deal': k, 'bb': 2, 'net_a': x * 4 / 100, 'seed': seed,
-                            'fp': f'{seed}:{k % 2}', 'planned': planned or n, 'round': r, 'replicate': j})
+                            'fp': f'{seed}:{k % 2}', 'planned': planned or n, 'round': r, 'replicate': j,
+                            'evidence': f'{name}:{k}:{x:.6f}'})
     return out
 
 
@@ -89,7 +90,8 @@ def run(deals, p, boot=50, who=None, registered=True, **kw):
                 break
             sign = lambda x: (1 if x['a'] == a else -1) * x['net_a'] / x['bb'] / 2 * 100
             v = R.adjudicate({'a': a, 'b': b, 'xs': [sign(x) for x in at], 'groups': [x['matchup'] for x in at],
-                              'fps': [x['fp'] for x in at], 'rejected': []}, d, len(p['matchups']), r, elig[key])
+                              'fps': [x['fp'] for x in at], 'rejected': [], 'evidence_hash': R.evidence_hash(at)},
+                             d, len(p['matchups']), r, elig[key])
             recorded.setdefault(f'{a}__vs__{b}', []).append(v)
             if v['verdict'] in R.TERMINAL:
                 stop = r
@@ -411,7 +413,7 @@ class TestDesign(unittest.TestCase):
     def test_dependence_raises_the_deals_needed(self):
         base = {'deals': 50, 'replicates': 4, 'matchups': THREE}
         light = R.normalize_design({**base, 'design': {'assumed_icc': 0.0, 'assumed_ar1': 0.0}})
-        heavy = R.normalize_design({**base, 'design': {'assumed_icc': 0.03, 'assumed_ar1': 0.3}})
+        heavy = R.normalize_design({**base, 'design': {'assumed_icc': 0.015, 'assumed_ar1': 0.3}})
         self.assertLess(light['deals_needed'], heavy['deals_needed'])
         self.assertAlmostEqual(R.sd_conversation(350, 50, 0, 0), 350 / np.sqrt(50))
         self.assertGreater(R.design_effect(0.3, 50), 1.7)

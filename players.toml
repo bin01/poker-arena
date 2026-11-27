@@ -81,3 +81,7 @@ bot = "station"   # always checks or calls
 [players.rule]
 label = "Rule bot"
 bot = "rule"      # equity vs pot odds, value bets, never bluffs
+
+[players.reference]
+label = "Reference bot"
+bot = "reference" # fixed, versioned (reference-1): tight-aggressive, position-aware, equity vs range and pot odds

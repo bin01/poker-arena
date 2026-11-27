@@ -22,7 +22,7 @@ import re
 from dataclasses import dataclass, field
 
 from .backends import BackendError, make_backend
-from .cards import equity
+from .cards import equity, evaluate
 from .games.holdem import json_safe
 
 
@@ -273,7 +273,133 @@ class RuleBot(SeededBot):
         return Decision({'action': 'fold'}, why + ': fold')
 
 
-BOTS = {'random': RandomBot, 'station': CallingStation, 'rule': RuleBot}
+class ReferenceBot(SeededBot):
+    """A fixed, versioned, competent heads-up player: tight-aggressive, position-aware, deciding by equity against
+    the range the opponent's actions suggest and the price of the pot. It never adapts to its opponent, so the
+    same deal against the same actions always gets the same decision from the same random state.
+
+    Ranges: the opponent's preflop range is the top fraction of hands (ranges.top) its preflop betting implies;
+    after the flop every bet or raise it makes keeps the part of that range with the strongest made hands on the
+    board (with a share of the rest, for its bluffs). Equity against that range is Monte Carlo with the bot's own
+    random generator.
+
+    Preflop: on the button it opens the top 70% to 2.5 big blinds and folds the rest; in the big blind it raises
+    the top 30% over a limp. Facing a raise it re-raises its value range (top 12% against an open, 4% against a
+    3-bet, 2.5% beyond), re-raises as a bluff with probability BLUFF just outside it against an open, calls when
+    its equity, discounted for playing out of position, beats the price, and otherwise folds.
+    After the flop: unbet, it bets 2/3 pot with equity >= 0.70 (1/2 pot with >= 0.60 in position), bluffs half pot
+    with probability BLUFF with equity < 0.40 (flop and turn only), else checks. Facing a bet it raises to 3x
+    with equity >= 0.85, calls with equity >= the pot odds plus a margin (0.05 before the river), else folds.
+    A bet or raise of 40% or more of what is left goes all in."""
+    kind = 'bot'
+    VERSION = 'reference-1'
+    BLUFF = 0.2
+
+    def __init__(self, seed=0, sims=400, **_):
+        self.rng, self.sims = random.Random(seed), sims
+
+    def describe(self):
+        return {**self.spec, 'version': self.VERSION, 'sims': self.sims, 'bluff': self.BLUFF}
+
+    def _opp_range(self, d, opp):
+        from .games import ranges
+        pre = [h for h in d['history'] if h['street'] == 'preflop']
+        raises = [h for h in pre if h['action'] in ('bet', 'raise')]
+        theirs = [h for h in raises if h['seat'] == opp]
+        acts = [h['action'] for h in pre if h['seat'] == opp]
+        if not theirs:
+            f = 1.0 if not acts or acts == ['check'] else 0.85 if len(raises) == 0 else 0.6 if len(raises) == 1 else 0.3
+        elif len(theirs) == 1:
+            f = 0.7 if raises[0]['seat'] == opp else 0.3
+        else:
+            f = 0.12 if len(theirs) == 2 else 0.05
+        if raises and raises[-1]['seat'] == opp and raises[-1].get('all_in'):
+            f = min(f, 0.25)
+        combos = [c for c in ranges.top(f) if not set(c) & set(d['hole'] + d['board'])]
+        weights = [1.0] * len(combos)
+        board = d['board']
+        if board:
+            keep = 1.0
+            for h in d['history']:
+                if h['seat'] == opp and h['street'] != 'preflop' and h['action'] in ('bet', 'raise'):
+                    keep *= 0.6 if h['action'] == 'bet' else 0.4
+            if keep < 1.0:
+                order = sorted(range(len(combos)), key=lambda i: evaluate(list(combos[i]) + board), reverse=True)
+                cut = max(1, int(len(order) * max(keep, 0.1)))
+                strong = set(order[:cut])
+                weights = [0.85 / cut if i in strong else 0.15 / max(1, len(combos) - cut) for i in range(len(combos))]
+        return combos, weights
+
+    def _equity(self, d, opp):
+        from .games import ranges
+        combos, weights = self._opp_range(d, opp)
+        return ranges.equity(d['hole'], d['board'], combos, self.rng, sims=self.sims, weights=weights, exact=False)
+
+    @staticmethod
+    def _size(d, to):
+        rb = d['raise_bounds']
+        to = max(rb[0], min(rb[1], int(to)))
+        left = rb[1] - d['street_bet'][d['seat']]
+        if to - d['street_bet'][d['seat']] >= 0.4 * left:
+            to = rb[1]
+        return {'action': 'raise', 'amount': to}
+
+    async def act(self, text, request, validate):
+        from .games import ranges
+        d = request.data
+        seat, n = d['seat'], d['n']
+        if n != 2:
+            eq = equity(d['hole'], d['board'], self.rng, opponents=n - 1, sims=self.sims)
+            return Decision({'action': 'call' if d['to_call'] and eq > 0.5 else 'check' if not d['to_call'] else 'fold'},
+                            f'equity {eq:.2f} against random hands')
+        opp = 1 - seat
+        tc, pot, rb, bb = d['to_call'], d['pot'], d['raise_bounds'], d['bb']
+        current = max(d['street_bet'])
+        odds = tc / (pot + tc) if tc else 0.0
+        in_position = seat == d['button']
+        all_in_call = tc >= d['stack'] or d['stacks'][opp] == 0
+        if d['street'] == 'preflop':
+            pct = ranges.percentile()[ranges.hand_class(d['hole'])]
+            raises = sum(h['action'] in ('bet', 'raise') for h in d['history'] if h['street'] == 'preflop')
+            why = f'top {pct:.0%} hand, {raises} raise(s) so far'
+            if raises == 0 and tc > 0:   # first in on the button
+                if pct <= 0.70 and rb:
+                    return Decision(self._size(d, 2.5 * bb), why + ': open')
+                return Decision({'action': 'fold'}, why + ': fold')
+            if raises == 0:              # big blind over a limp
+                if pct <= 0.30 and rb:
+                    return Decision(self._size(d, 4 * bb), why + ': raise the limp')
+                return Decision({'action': 'check'}, why + ': check')
+            value = 0.12 if raises == 1 else 0.04 if raises == 2 else 0.025
+            if rb and pct <= value:
+                return Decision(self._size(d, 3 * current), why + ': re-raise for value')
+            if rb and raises == 1 and pct <= 0.35 and self.rng.random() < self.BLUFF:
+                return Decision(self._size(d, 3 * current), why + ': re-raise as a bluff')
+            eq = self._equity(d, opp)
+            realize = 1.0 if all_in_call else 0.9 if in_position else 0.8
+            why += f', equity {eq:.2f} vs their range, price {odds:.2f}'
+            if eq * realize >= odds:
+                return Decision({'action': 'call'}, why + ': call')
+            return Decision({'action': 'fold'}, why + ': fold')
+        eq = self._equity(d, opp)
+        why = f'equity {eq:.2f} vs their range, price {odds:.2f}'
+        if tc == 0:
+            if rb and eq >= 0.70:
+                return Decision(self._size(d, max(bb, 2 * pot / 3)), why + ': value bet')
+            if rb and eq >= 0.60 and in_position:
+                return Decision(self._size(d, max(bb, pot / 2)), why + ': thin value bet')
+            if rb and eq < 0.40 and d['street'] != 'river' and self.rng.random() < self.BLUFF:
+                return Decision(self._size(d, max(bb, pot / 2)), why + ': bluff')
+            return Decision({'action': 'check'}, why + ': check')
+        if rb and eq >= 0.85:
+            return Decision(self._size(d, 3 * current), why + ': raise for value')
+        margin = 0.0 if d['street'] == 'river' or all_in_call else 0.05
+        if eq >= odds + margin:
+            return Decision({'action': 'call'}, why + ': call')
+        return Decision({'action': 'fold'}, why + ': fold')
+
+
+BOTS = {'random': RandomBot, 'station': CallingStation, 'rule': RuleBot, 'reference': ReferenceBot}
 
 
 def make_agent(player_id: str, spec: dict, seed: int = 0) -> Agent:

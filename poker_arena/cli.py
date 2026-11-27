@@ -24,10 +24,19 @@ def cmd_play(args):
 
 
 def _power_table(d) -> str:
-    from .ratings import _pct
+    from .ratings import LEADER_SCENARIO, _pct
     rows = [f'  {x["scenario"]:12} ICC {x["assumed_icc"]:<5} AR(1) {x["assumed_ar1"]:<4} spread of a conversation '
-            f'{x["sd_conversation_bb100"]:>5.1f} bb/100   power {_pct(x["power"])}' for x in d.get('power_scenarios') or []]
-    return '\n'.join(['Power at the target edge, by how dependent the deals turn out to be:'] + rows)
+            f'{x["sd_conversation_bb100"]:>5.1f} bb/100   counting verdict {_pct(x["power"])} '
+            f'(decided {_pct(x.get("power_decided"))})' for x in d.get('power_scenarios') or []]
+    out = ['Chance that the better player gets a decided verdict that counts, at the target edge (the complete '
+           'adjudicator, simulated: both arms, the minimum, every look, the diagnostics), by how dependent the deals '
+           'turn out to be:'] + rows
+    if d.get('power_by_edge'):
+        out.append('  assumed dependence, by edge: ' + ', '.join(f'{e} bb/100 {_pct(p)}' for e, p in d['power_by_edge'].items()))
+    for x in d.get('leader_chances') or []:
+        out.append(f'  decided leader is the true best player {_pct(x["p_leader"])} if '
+                   f'{LEADER_SCENARIO[x["scenario"]].format(e=x["edge_bb100"])} (pairings taken as independent)')
+    return '\n'.join(out)
 
 
 def cmd_plan(args):
@@ -50,24 +59,28 @@ def cmd_plan(args):
         print(f'wrote {args.write}: {n} pairings, {per_round:,} hands per round, at most {d["max_rounds"]} rounds '
               f'({per_round * d["max_rounds"]:,} hands); a pairing stops once decided or ineligible. If the test\'s '
               f'assumptions hold, at most {d["alpha"]:.0%} chance of any false verdict over all pairings '
-              f'(docs/methodology.md says which assumptions, and each verdict says whether its data fit them).')
+              f'(docs/methodology.md says which assumptions; each verdict reports its diagnostics, and passing them '
+              f'does not verify the assumptions).')
         print(f'The design is registered in {plan["out"]}/plan.json when the tournament starts, before its first '
               f'hand; only then are its verdicts official. Change the plan after that and nothing in the run is a test.')
         print(design_line(d))
         print(_power_table(d))
         if d['underpowered']:
             if d.get('deals_needed'):
-                print(f'To reach 80% power with the assumed dependence, allow about {d["deals_needed"]:,} deals per '
+                print(f'To reach 80% with the assumed dependence, allow about {d["deals_needed"]:,} deals per '
                       f'pairing: drop --max-rounds/--budget-deals, or --max-rounds '
                       f'{-(-d["deals_needed"] // (args.deals * d["replicates"]))} with --replicates {d["replicates"]}.')
             else:
-                print('80% power at this target is out of reach of any plan of this shape; raise --target-edge.')
+                print('80% at this target is out of reach of any plan of this shape: the diagnostics a verdict needs '
+                      'to count fail too often, or the edge is too small; raise --target-edge or shorten --deals.')
         try:
             specs = load_players(args.players)
         except (OSError, ValueError):
             specs = {}
-        if not any('bot' in specs.get(p, {}) for p in args.players_list):
-            print('No reference bot in the plan: the models\' strengths will only compare them with each other.')
+        if not any(specs.get(p, {}).get('bot') == 'reference' for p in args.players_list):
+            print('No reference player in the plan: add the fixed reference bot (bot = "reference" in players.toml) so '
+                  'every model also plays one common, versioned opponent; without it strengths only compare the '
+                  'models with each other. `python -m poker_arena quiz` measures poker fundamentals separately.')
     else:
         print(text)
 
@@ -114,7 +127,8 @@ def cmd_ratings(args):
     if (r.get('design') or {}).get('registered'):
         test = (f'the official decisions of the preregistered sequential test on {r["objective"]}, recorded when '
                 f'play stopped by the registered judge {reg.get("judge_fingerprint")} (this judge: '
-                f'{r.get("judge_fingerprint")}; anything it recomputes differently is retrospective)')
+                f'{r.get("judge_fingerprint")}; anything it recomputes differently is retrospective), each counting '
+                f'only while its evidence still verifies today')
     else:
         why = '; '.join(reg.get('reasons') or []) or 'no preregistered design'
         test = f'none (not preregistered: {why}; everything is descriptive)'
@@ -144,10 +158,10 @@ def cmd_history(args):
         print('No finished duplicate deals yet.')
         return
     print(history.table(r))
-    print(f'\n{r["deals"]:,} duplicate deals from {len(r["runs"])} runs ({r["observations"]:,} distinct), '
-          f'one player per model, reasoning level, protocol and implementation (code that plays and CLI version; '
-          f'equivalences.json beside the database can merge implementations). Descriptive only: pooled runs are '
-          f'no one\'s preregistered test.')
+    print(f'\n{r["deals"]:,} duplicate deals from {len(r["runs"])} runs ({r["observations"]:,} distinct, every hand '
+          f'replayed from its seed), one player per model, reasoning level, protocol and implementation (code that '
+          f'plays and CLI version, split at the hand a change took effect; equivalences.json beside the database can '
+          f'merge implementations). Descriptive only: pooled runs are no one\'s preregistered test.')
     if len(r['code_versions']) > 1:
         print(f'Code versions: {", ".join(r["code_versions"])}')
 
@@ -318,6 +332,16 @@ def main(argv=None):
     p.add_argument('ids', nargs='*')
     p.add_argument('--players', default='players.toml')
     p.set_defaults(fn=cmd_doctor)
+
+    p = sub.add_parser('quiz', help='poker fundamentals: clear-cut decision spots with computed answers, asked of '
+                                    'each player through its backend; writes runs/<out>/quiz.json')
+    p.add_argument('ids', nargs='+')
+    p.add_argument('--out', default='quiz')
+    p.add_argument('--players', default='players.toml')
+    p.add_argument('--effort', help='reasoning level for every model (default: each player\'s own, else high)')
+    p.add_argument('--limit', type=int, help='only the first N spots')
+    p.add_argument('--concurrency', type=int, default=4, help='spots asked at once per player (default 4)')
+    p.set_defaults(fn=lambda a: __import__('poker_arena.quiz', fromlist=['main']).main(a))
 
     args = ap.parse_args(argv)
     from .runner import ResumeMismatch

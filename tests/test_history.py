@@ -8,8 +8,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from unittest import mock
+
 from poker_arena import history
+from poker_arena import ratings as R
 from poker_arena.ratings import fingerprint, ratings
+from test_adjudicate import stand_in
 
 GAME = {'name': 'holdem', 'unit': 'chips', 'big_unit': 2, 'sb': 1, 'bb': 2, 'stack': 200, 'hands_per_match': 20}
 
@@ -57,6 +61,9 @@ class TestHistory(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name).resolve()
+        self.patch = mock.patch.object(R, 'verify_hand', stand_in)    # these hands were written by hand, not dealt
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
 
     def tearDown(self):
         self.tmp.cleanup()

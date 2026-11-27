@@ -162,7 +162,7 @@
   }
 
   // ---- what a verdict rests on: its assumptions, its eligibility, where it was recorded ---------------
-  const ASSUME = { supported: 'within calibrated range', unsupported: 'outside calibrated range', unknown: 'assumptions unchecked' };
+  const ASSUME = { supported: 'diagnostics passed; distribution assumptions unverified', unsupported: 'outside calibrated range', unknown: 'assumptions unchecked' };
   const words = k => String(k).replace(/_/g, ' ');
   // The adjudicator's `assumptions` when given; else the conversation share against the share the test was
   // calibrated for. {status: 'supported'|'unsupported'|'unknown', label, detail}
@@ -223,25 +223,31 @@
     if (fitted == null || p.edge == null) return null;
     const residual = p.residual ?? p.edge - fitted;
     const a = p.additivity;
-    let warn;
-    if (a != null) warn = typeof a === 'boolean' ? a : typeof a === 'string' ? !['ok', 'consistent', 'none'].includes(a)
-      : !!(a.warning ?? a.warn ?? (a.status && !['ok', 'consistent'].includes(a.status)));
-    else warn = !!p.ci95 && Math.abs(residual) > (p.ci95[1] - p.ci95[0]) / 2;
-    return { fitted, residual, warn, estimated };
+    let warn, untestable = false;
+    if (a != null) {
+      const status = typeof a === 'string' ? a : typeof a === 'object' ? a.status : null;
+      untestable = status === 'untestable';
+      warn = typeof a === 'boolean' ? a : status ? status === 'warning' : !!(a.warning ?? a.warn);
+    } else warn = !!p.ci95 && Math.abs(residual) > (p.ci95[1] - p.ci95[0]) / 2;
+    return untestable ? { fitted, residual, warn, estimated, untestable } : { fitted, residual, warn, estimated };
   }
 
-  // A player's model identity: 'attested' (the backend reported the model it ran), 'unattested', 'mismatch'
-  // or 'partly attested', from the ratings' own field or the run audit's call counts; null when unknown.
+  // A player's model identity: 'match' (the backend reported the model it ran, and it is the one asked for),
+  // 'mismatch' (it reported another), 'unattested' (it reported none) or 'partial' (some calls matched, the rest
+  // reported none), from the ratings' own `identity_match` or the run audit's call counts; null when unknown.
+  // A bare 'attested' only says some model was reported, so it never stands for a match.
+  const IDENTITY = { match: 'model confirmed', mismatch: 'wrong model', unattested: 'model unconfirmed', partial: 'partly confirmed' };
   function identityOf(p, audit) {
-    const own = p && (p.attestation || p.identity_status
-      || (p.identity_attested === true ? 'attested' : p.identity_attested === false ? 'unattested' : null));
-    if (own) return own;
+    const own = p && (p.identity_match || (p.attestation === 'unattested' || p.identity_status === 'unattested' ? 'unattested' : null)
+      || (p.attestation === 'mismatch' || p.identity_status === 'mismatch' ? 'mismatch' : null));
+    if (own && IDENTITY[own]) return own;
     const a = audit && audit.identity;
     if (!a) return null;
-    if (typeof a === 'string') return a === 'none' ? null : a;
+    if (typeof a === 'string') return IDENTITY[a] ? a : null;
     if (a.mismatch) return 'mismatch';
-    if (a.attested && a.unattested) return 'partly attested';
-    return a.attested ? 'attested' : a.unattested ? 'unattested' : null;
+    if (a.match && a.unattested) return 'partial';
+    if (a.match) return 'match';
+    return a.unattested ? 'unattested' : null;
   }
 
   // A verdict in words: {tone, short, long, decided, qualifier}. `name` turns a player id into display text.
@@ -261,7 +267,7 @@
     const as = p.assumption || { status: 'unknown' };
     const out = as.status === 'unsupported'
       ? ' The test\'s assumptions do not hold here (outside its calibrated range), so its error rate is not established.'
-      : as.status === 'supported' ? ' Its error rate holds under the test\'s assumptions, which the data support.'
+      : as.status === 'supported' ? ' Its error rate holds under the test\'s assumptions: the diagnostics passed, but the distribution assumptions remain unverified.'
       : ' Its error rate holds only under the test\'s assumptions, which are not checked here.';
     const qualifier = as.status === 'unsupported' ? ASSUME.unsupported : '';
     switch (p.verdict) {
@@ -367,7 +373,55 @@
     return { target: 50, need: Math.max(...need), planned: false, ...(isUnregistered(design) ? { retrospective: true } : {}), have: range };
   }
 
-  return { esc, MINUS, signed, plural, trim, approx, nameParts, family, isContract, normalize, verdict, verdictSides, powerLine, correction, actText,
+  // ---- poker fundamentals: quiz.json in one shape -----------------------------------------------------
+  // {suite, version, spots: [{id, title, kind, street, hole, board, pot, to_call, stack, bb, ..., best, ev}],
+  //  players: [{player, score, correct, answered, total, ev_lost_bb, reference, answers: {spot: {...}}}]}
+  const num = (...xs) => xs.find(x => x != null && isFinite(x)) ?? null;
+  function quizOf(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const spots = (raw.spots || raw.items || raw.questions || []).map((x, i) => ({ ...x, id: String(x.id ?? x.spot ?? i),
+      best: x.best ?? x.correct ?? x.answer ?? null, bb: x.bb ?? raw.bb ?? 1 }));
+    const refs = new Set([].concat(raw.reference || raw.references || []).map(String));
+    const list = Array.isArray(raw.players) ? raw.players : Object.entries(raw.players || raw.results || {}).map(([player, r]) => ({ player, ...r }));
+    const players = list.map(r => {
+      const answers = Array.isArray(r.answers) ? Object.fromEntries(r.answers.map(a => [String(a.spot ?? a.id), a])) : r.answers || {};
+      const vals = Object.values(answers);
+      const correct = num(r.correct, vals.length ? vals.filter(a => a.correct).length : null);
+      const answered = num(r.answered, vals.length || null);
+      const total = num(r.total, spots.length || answered);
+      const lost = num(r.ev_lost_bb, r.ev_loss_bb, r.regret_bb, vals.length ? vals.reduce((t, a) => t + (num(a.ev_lost_bb, a.ev_loss_bb, a.regret_bb) || 0), 0) : null);
+      return { ...r, answers, correct, answered, total, ev_lost_bb: lost,
+        score: num(r.score, correct != null && total ? correct / total : null),
+        reference: !!(r.reference || refs.has(String(r.player)) || r.kind === 'reference') };
+    }).sort((x, y) => (y.score ?? -1) - (x.score ?? -1) || (x.ev_lost_bb ?? 1e9) - (y.ev_lost_bb ?? 1e9));
+    return { ...raw, suite: raw.suite_name || (typeof raw.suite === 'string' ? raw.suite : raw.suite && raw.suite.name) || 'Poker fundamentals',
+      version: raw.version ?? (raw.suite && raw.suite.version) ?? null, spots, players };
+  }
+
+  // ---- replay helpers ----------------------------------------------------------------------------------
+  // Where two plays of a duplicate deal first part ways: {street, index, steps: [step in play 1, step in play 2]}
+  // (the same seat, holding the same cards, chose differently), or null when every choice is the same.
+  function firstDifference(logA, logB) {
+    for (const st of ['preflop', 'flop', 'turn', 'river']) {
+      const a = (logA || []).filter(e => e.kind === 'action' && e.street === st);
+      const b = (logB || []).filter(e => e.kind === 'action' && e.street === st);
+      for (let i = 0; i < Math.max(a.length, b.length); i++) {
+        const x = a[i], y = b[i];
+        if (!x || !y || x.seat !== y.seat || x.action !== y.action || (x.amount ?? null) !== (y.amount ?? null)) {
+          return { street: st, index: i, steps: [x ? x.step : null, y ? y.step : null] };
+        }
+      }
+    }
+    return null;
+  }
+  // The deals with the biggest swings over both plays: [{deal, net}] largest first, at most n, and only those at
+  // least `min` chips.
+  function bigSwings(nets, n = 5, min = 0) {
+    return Object.entries(nets || {}).map(([k, v]) => ({ deal: Number(k), net: v })).filter(x => Math.abs(x.net) >= min && x.net)
+      .sort((x, y) => Math.abs(y.net) - Math.abs(x.net) || x.deal - y.deal).slice(0, n);
+  }
+
+  return { quizOf, firstDifference, bigSwings, IDENTITY, esc, MINUS, signed, plural, trim, approx, nameParts, family, isContract, normalize, verdict, verdictSides, powerLine, correction, actText,
     isDecided, decidedLeader, playerId, rateOf, targetEdge, isUnregistered, scenarios, conversationsShort,
     assumptionsOf, ineligible, sourceOf, basisOf, fitOf, identityOf, ASSUME };
 });

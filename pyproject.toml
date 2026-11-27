@@ -20,3 +20,9 @@ include = ["poker_arena*"]
 
 [tool.setuptools.package-data]
 poker_arena = ["viewer/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# sys-level capture needs no temporary file, so the suite also starts where the system temp folder is read-only
+# (tests/conftest.py then picks a writable temp folder, tests/.tmp as the last resort)
+addopts = "--capture=sys"

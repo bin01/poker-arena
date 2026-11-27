@@ -48,7 +48,7 @@ import tomllib
 from pathlib import Path
 
 from .agents import make_agent
-from .backends import BackendError, cli_version
+from .backends import BackendError, backend_exe, cli_version
 from .games import get_game
 from .games.holdem import json_safe
 
@@ -167,6 +167,27 @@ def check_implementation(doc: dict, fresh: dict, where, allow: bool) -> dict | N
     return {'t': round(time.time()), 'from': (cur or {}).get('fingerprint'), 'to': fresh, 'files': changed}
 
 
+def version_drift(pinned: dict | None, fresh: dict) -> list[str]:
+    """The CLIs whose version differs from the pinned one, as 'exe: old -> new' (a CLI not pinned is adopted)."""
+    pinned = pinned or {}
+    return [f'{e}: {pinned[e]} -> {fresh[e]}' for e in sorted(fresh) if e in pinned and pinned[e] != fresh[e]]
+
+
+def check_versions(doc: dict, fresh: dict, where, allow: bool) -> dict | None:
+    """None when the CLIs are the versions `doc` (a config or plan) recorded, last change included. Otherwise
+    ResumeMismatch, or with `allow` the change to record: {t, from, to, clis}."""
+    changes = doc.get('cli_version_changes') or []
+    pinned = changes[-1]['to'] if changes else doc.get('cli_versions')
+    drift = version_drift(pinned, fresh)
+    if not drift:
+        return None
+    if not allow:
+        raise ResumeMismatch(f'{where}: a CLI changed version since this was started ({"; ".join(drift)}); install '
+                             f'the recorded version, use a new folder, or pass --allow-code-change to continue with '
+                             f'this one (the change is recorded and voids the registration)')
+    return {'t': round(time.time()), 'from': pinned, 'to': {**(pinned or {}), **fresh}, 'clis': drift}
+
+
 def _append(path: Path, obj):
     with path.open('a') as f:
         f.write(json.dumps(obj, default=str) + '\n')
@@ -236,6 +257,56 @@ def _read_jsonl(path: Path):
 
 class ResumeMismatch(ValueError):
     """A stopped match or tournament was rerun with settings that would change the experiment."""
+
+
+def game_of(cfg: dict):
+    """The game a match config describes (its `game` entry), to replay its hands."""
+    desc = dict(cfg.get('game') or {})
+    name = desc.pop('name', 'holdem')
+    for k in ('unit', 'big_unit'):
+        desc.pop(k, None)
+    return get_game(name)(desc)
+
+
+def verify_match(d: Path, cfg: dict | None = None, hands=None, events=None) -> dict:
+    """Every committed hand of a match folder checked by the engine (games.holdem.verify_hand) against its seed,
+    button and events: {ok, hands, verified, failed: [{hand, errors}], evidence_hash}. `evidence_hash` is the
+    sha256 of the hands as recorded, so a decision can name exactly the evidence it was made on."""
+    d = Path(d)
+    cfg = cfg if cfg is not None else (json.loads((d / 'config.json').read_text()) if (d / 'config.json').exists() else {})
+    hands = hands if hands is not None else _read_jsonl(d / 'hands.jsonl')
+    events = events if events is not None else _read_jsonl(d / 'events.jsonl')
+    state = json.loads((d / 'state.json').read_text()) if (d / 'state.json').exists() else {}
+    committed = state.get('hands_committed', state.get('hands', len(hands)))
+    hands = hands[:committed]
+    failed = []
+    try:
+        game = game_of(cfg)
+    except (KeyError, TypeError, ValueError) as e:
+        game, failed = None, [{'hand': None, 'errors': [f'the config names no playable game ({e})']}]
+    by_hand = {}
+    for e in events:
+        by_hand.setdefault(e.get('episode'), []).append(e)
+    seeds, n = cfg.get('seeds') or [], len(cfg.get('players') or []) or 2
+    fps = cfg.get('deal_fingerprints') or []
+    for k, h in enumerate(hands):
+        if game is None:
+            break
+        errs = []
+        if h.get('hand') != k:
+            errs.append(f'row {k} records hand {h.get("hand")}')
+        if k >= len(seeds) or h.get('seed') != seeds[k]:
+            errs.append(f'seed {h.get("seed")} is not the planned seed of hand {k}')
+        if k < len(fps) and h.get('fingerprint') != fps[k]:
+            errs.append('the deal fingerprint is not the planned one')
+        if not errs:
+            errs = game.verify(seeds[k], k % n, h, by_hand.get(k, []))['errors'] if hasattr(game, 'verify') \
+                else ['this game has no verifier']
+        if errs:
+            failed.append({'hand': k, 'errors': errs})
+    blob = json.dumps(hands, sort_keys=True, default=str).encode()
+    return {'ok': not failed and bool(hands), 'hands': len(hands), 'verified': len(hands) - len(failed),
+            'failed': failed, 'evidence_hash': hashlib.sha256(blob).hexdigest()}
 
 
 def _public(spec: dict) -> dict:
@@ -331,15 +402,19 @@ async def run_match(game, seat_players: list[tuple[str, dict]], seeds: list[int]
         agents.append(a)
     exes = {a.backend.exe for a in agents if a.kind == 'model' and a.backend.exe}
     versions = {e: await asyncio.to_thread(cli_version, e) for e in sorted(exes)}
+    cli_change = check_versions(stored, versions, out, allow_code_change) if stored is not None else None
     if stored is None:
         config = {**fresh, **(meta or {}), 'code_version': code_version(), 'implementation': impl,
                   'cli_versions': versions, 'effective': [_same(a.describe()) for a in agents],
                   'started': round(time.time())}
         _write(out / 'config.json', config, indent=2)
-    elif change:
-        stored['implementation_changes'] = stored.get('implementation_changes', []) + [
-            {**change, 'after_hand': json.loads((out / 'state.json').read_text()).get('hands_committed', 0)
-             if (out / 'state.json').exists() else 0}]
+    elif change or cli_change:
+        after = json.loads((out / 'state.json').read_text()).get('hands_committed', 0) \
+            if (out / 'state.json').exists() else 0
+        if change:
+            stored['implementation_changes'] = stored.get('implementation_changes', []) + [{**change, 'after_hand': after}]
+        if cli_change:
+            stored['cli_version_changes'] = stored.get('cli_version_changes', []) + [{**cli_change, 'after_hand': after}]
         _write(out / 'config.json', stored, indent=2)
     system_sha = [hashlib.sha1(p.encode()).hexdigest()[:12] for p in fresh['system_prompts']]
 
@@ -355,6 +430,11 @@ async def run_match(game, seat_players: list[tuple[str, dict]], seeds: list[int]
     if len(_read_jsonl(out / 'hands.jsonl')) != done:
         raise RuntimeError(f'{out}: state.json commits {done} hands but hands.jsonl holds '
                            f'{len(_read_jsonl(out / "hands.jsonl"))}; the record is damaged')
+    if done and not change:
+        check = verify_match(out, stored or fresh)
+        if check['failed']:
+            raise RuntimeError(f'{out}: committed hands fail verification against their seeds '
+                               f'({check["failed"][0]}); the record is damaged')
     rebuilt = []
     for i, a in enumerate(agents):
         if a.kind == 'model' and (dropped or a.backend.rebuilding):
@@ -362,7 +442,8 @@ async def run_match(game, seat_players: list[tuple[str, dict]], seeds: list[int]
             rebuilt.append(i)
     if done or dropped or torn:
         resumes.append({'t': round(time.time()), 'after_hand': done, 'code_version': code_version(),
-                        'implementation': impl['fingerprint'], 'code_changed': bool(change), 'cli_versions': versions, 'dropped_rows': dropped, 'torn_lines': torn, 'rebuilt_seats': rebuilt})
+                        'implementation': impl['fingerprint'], 'code_changed': bool(change), 'cli_versions': versions,
+                        'cli_changed': bool(cli_change), 'dropped_rows': dropped, 'torn_lines': torn, 'rebuilt_seats': rebuilt})
         log(f'{out}: resuming after hand {done}' + (f'; dropped an interrupted hand, rebuilt seats {rebuilt}'
                                                     if dropped else ''))
     totals = [0] * n
@@ -437,13 +518,19 @@ async def run_match(game, seat_players: list[tuple[str, dict]], seeds: list[int]
                 **_thought_fields(d, last, err),
                 'seconds': round(sum(c.get('latency') or 0 for c in d.calls), 1),
                 'served_model': next((c['served_model'] for c in reversed(d.calls) if c.get('served_model')), None),
-                **{k: d.calls[-1].get(k) if d.calls else None for k in ('requested_model', 'observed_model', 'identity')},
+                **{k: d.calls[-1].get(k) if d.calls else None for k in ('requested_model', 'observed_model', 'identity',
+                                                                          'identity_reported', 'identity_match')},
                 'audit': d.calls[-1].get('audit') if d.calls else None}}
             _append(out / 'events.jsonl', thought)
             log_calls(seat, d.calls)
             flush()
         summary = {**ep.summary(), 'seed': seeds[k], 'fingerprint': fresh['deal_fingerprints'][k],
                    't': round(time.time(), 1)}  # when it finished: the viewer's progress and ETA
+        check = game.verify(seeds[k], k % n, summary, [e.to_json() for e in ep.events]) \
+            if hasattr(game, 'verify') else {'ok': True}
+        if not check['ok']:
+            raise RuntimeError(f'{out} hand {k}: the record does not replay ({"; ".join(check["errors"][:3])}); '
+                               f'not committed')
         totals = [t + x for t, x in zip(totals, ep.payoffs)]
         # the commit: the hand's rows reach the disk, then the checkpoint that counts them replaces the old one
         _append(out / 'hands.jsonl', summary)
@@ -554,65 +641,187 @@ def _declined(plan: dict) -> bool:
     return plan.get('registered') is False or (plan.get('design') or {}).get('registered') is False
 
 
+def decision_coverage(cfg: dict, events: list, calls: list, committed: int) -> dict:
+    """Per seat of one match, over its committed hands: whether every action has exactly one decision (`thought`
+    event) before it, for the same player, and every decision its call records. {seat: {actions, decisions,
+    missing, duplicate, orphan, misattributed, calls_expected, calls_recorded, complete}}."""
+    ids = cfg.get('players') or []
+    out = {i: {'actions': 0, 'decisions': 0, 'missing': 0, 'duplicate': 0, 'orphan': 0, 'misattributed': 0,
+               'calls_expected': 0, 'calls_recorded': 0} for i in range(len(ids))}
+    waiting = {}
+    for e in events:
+        k, data = e.get('episode'), e.get('data') or {}
+        if not isinstance(k, int) or k >= committed or e.get('kind') not in ('thought', 'action'):
+            continue
+        x = out.get(data.get('seat'))
+        if x is None:
+            continue
+        if e['kind'] == 'thought':
+            x['decisions'] += 1
+            x['calls_expected'] += int(data.get('tries') or 0)
+            x['misattributed'] += data.get('player') != ids[data['seat']]
+            waiting[(k, data['seat'])] = waiting.get((k, data['seat']), 0) + 1
+        else:
+            x['actions'] += 1
+            got = waiting.pop((k, data['seat']), 0)
+            x['missing'] += got == 0
+            x['duplicate'] += max(0, got - 1)
+    for (_, seat), extra in waiting.items():
+        out[seat]['orphan'] += extra
+    for c in calls:
+        x = out.get(c.get('seat'))
+        if x is not None and isinstance(c.get('hand'), int) and c['hand'] < committed:
+            x['calls_recorded'] += 1
+            x['misattributed'] += c.get('player') != ids[c['seat']]
+    for x in out.values():
+        x['complete'] = (x['actions'] > 0 and x['missing'] == x['duplicate'] == x['orphan'] == x['misattributed'] == 0
+                         and x['calls_expected'] == x['calls_recorded'])
+    return out
+
+
 def eligibility(out: Path, folders: list[str], players, registration: dict | None = None) -> dict:
     """The facts the judge's eligibility rules need about a pairing, from its match folders: the registration,
-    accepted code changes, and per player its kind, backend, requested model, protocol fingerprints, the models
-    its calls named and their identity status, and the audit status of every decision it made. Summaries per
-    player: `identity` 'attested' (every reply named the requested model) | 'unattested' (some named none) |
-    'mismatch' (some named another model) | 'none' (no replies yet), bots 'bot'; `audit` 'complete' (every decision
-    verified) | 'opaque' (some came from a backend that exposes no record) | 'incomplete'; `protocol_consistent`."""
-    from .ratings import same_model
-    facts = {p: {'kind': None, 'backend': None, 'requested_model': None, 'protocols': set(), 'replies': 0,
-                 'identity_counts': {}, 'observed_models': set(), 'decisions': 0, 'audit_counts': {}, 'fallbacks': 0}
+    accepted code and CLI version changes (CLI drift is listed with them), the engine's verification of every committed hand (`verification`, with
+    the `evidence_hash` of the hands judged), and per player its kind, backend, requested model, protocol
+    fingerprints, the models its calls named, and the audit status and record coverage of its decisions.
+
+    Fail closed: per player `identity` 'attested' (every reply named the requested model) | 'unattested' (some named
+    none) | 'mismatch' (some named another model) | 'none' (no replies), bots 'bot'; `identity_match` the same in
+    the calls' own terms ('match' | 'mismatch' | 'unattested' | 'none'); `audit` 'complete' only when every action
+    has exactly one decision record with all its calls and every decision was verified, 'opaque' (covered, but
+    from a backend that exposes no record), else 'incomplete'; `protocol_consistent` only when every match records
+    one and the same protocol fingerprint. `problems` (per player, and all of them at the top level with the
+    verification's) lists every failed check in words; the runner rejects the evidence while any remain."""
+    from .backends import identity_fields
+    facts = {p: {'kind': None, 'backend': None, 'requested_model': None, 'protocols': set(), 'protocols_missing': 0,
+                 'replies': 0, 'identity_counts': {}, 'identity_match_counts': {}, 'observed_models': set(),
+                 'decisions': 0, 'actions': 0, 'audit_counts': {}, 'fallbacks': 0,
+                 'coverage': {'actions': 0, 'decisions': 0, 'missing': 0, 'duplicate': 0, 'orphan': 0,
+                              'misattributed': 0, 'calls_expected': 0, 'calls_recorded': 0}, 'problems': []}
              for p in players}
     bump = lambda d, k: d.__setitem__(k, d.get(k, 0) + 1)
-    changes, started = [], []
+    changes, started, matches, failed, hashes, versions = [], [], 0, [], [], {}
+    record_problems, total, verified = [], 0, 0
+    pinned = (registration or {}).get('cli_versions')
     for f in folders:
         for label in ('a-first', 'b-first'):
             d = Path(out) / f / label
+            where = f'{f}/{label}'
             cfg = json.loads((d / 'config.json').read_text()) if (d / 'config.json').exists() else {}
+            if not cfg:
+                record_problems.append(f'{where}: no match record')
+                continue
+            matches += 1
             if cfg.get('started') is not None:
                 started.append(cfg['started'])
-            changes += [{'match': f'{f}/{label}', 'from': c.get('from'), 'to': (c.get('to') or {}).get('fingerprint'),
+            changes += [{'match': where, 'from': c.get('from'), 'to': (c.get('to') or {}).get('fingerprint'),
                          'files': c.get('files'), 'after_hand': c.get('after_hand')}
                         for c in cfg.get('implementation_changes') or []]
+            state = json.loads((d / 'state.json').read_text()) if (d / 'state.json').exists() else {}
+            seen = [cfg.get('cli_versions') or {}] + [r.get('cli_versions') or {} for r in state.get('resumes') or []]
+            for vs in seen:
+                for exe, ver in vs.items():
+                    versions.setdefault(exe, set()).add(ver)
+            drift = sorted({x for vs in seen[1:] for x in version_drift(seen[0], vs)} |
+                           {x for vs in seen for x in version_drift(pinned, vs)})
+            if drift:
+                changes.append({'match': where, 'kind': 'cli_version', 'files': [f'CLI {x}' for x in drift]})
+            events, calls = _read_jsonl(d / 'events.jsonl'), _read_jsonl(d / 'calls.jsonl')
+            hands = _read_jsonl(d / 'hands.jsonl')
+            check = verify_match(d, cfg, hands, events)
+            committed = check['hands']
+            total, verified = total + committed, verified + check['verified']
+            if not committed:
+                record_problems.append(f'{where}: no committed hands')
+            failed += [{'match': where, **x} for x in check['failed']]
+            hashes.append([where, check['evidence_hash']])
+            coverage = decision_coverage(cfg, events, calls, committed)
+            ids = cfg.get('players') or []
             for p, x in facts.items():
                 spec = (cfg.get('specs') or {}).get(p)
                 if spec:
                     x['kind'] = 'bot' if is_bot(spec) else 'model'
                     x['backend'] = spec.get('backend') or (f'bot:{spec["bot"]}' if is_bot(spec) else None)
                     x['requested_model'] = spec.get('model')
-                proto = ((cfg.get('protocol') or {}).get(p) or {}).get('fingerprint')
-                if proto:
-                    x['protocols'].add(proto)
-            for c in _read_jsonl(d / 'calls.jsonl'):
+                if p in ids:
+                    proto = ((cfg.get('protocol') or {}).get(p) or {}).get('fingerprint')
+                    if proto:
+                        x['protocols'].add(proto)
+                    else:
+                        x['protocols_missing'] += 1
+                    for seat in (i for i, q in enumerate(ids) if q == p):
+                        for key, val in coverage[seat].items():
+                            if key != 'complete':
+                                x['coverage'][key] += val
+            for c in calls:
                 x = facts.get(c.get('player'))
-                if x is None or c.get('backend_failed'):
+                if x is None or c.get('backend_failed') or not isinstance(c.get('hand'), int) or c['hand'] >= committed:
                     continue
                 x['replies'] += 1
                 bump(x['identity_counts'], c.get('identity') or 'unrecorded')
+                match = c.get('identity_match') or identity_fields(c.get('requested_model') or x['requested_model'],
+                                                                   c.get('observed_model'))['identity_match']
+                bump(x['identity_match_counts'], match)
                 if c.get('observed_model'):
                     x['observed_models'].add(c['observed_model'])
-            for e in _read_jsonl(d / 'events.jsonl'):
+            for e in events:
                 data = e.get('data') or {}
-                x = facts.get(data.get('player')) if e.get('kind') == 'thought' else None
+                if e.get('kind') != 'thought' or not isinstance(e.get('episode'), int) or e['episode'] >= committed:
+                    continue
+                x = facts.get(data.get('player'))
                 if x is not None:
                     x['decisions'] += 1
                     x['fallbacks'] += bool(data.get('fallback'))
                     bump(x['audit_counts'], data.get('audit') or ('bot' if x['kind'] == 'bot' else 'unrecorded'))
-    for x in facts.values():
+    from .ratings import same_model
+    for p, x in facts.items():
         x['protocols'], x['observed_models'] = sorted(x['protocols']), sorted(x['observed_models'])
-        x['protocol_consistent'] = len(x['protocols']) <= 1
+        cov = x['coverage']
+        x['actions'] = cov['actions']
+        cov['complete'] = (cov['actions'] > 0 and cov['missing'] == cov['duplicate'] == cov['orphan']
+                           == cov['misattributed'] == 0 and cov['calls_expected'] == cov['calls_recorded'])
+        problems = x['problems']
+        if not cov['actions']:
+            problems.append(f'{p}: no recorded actions')
+        for key, words in (('missing', 'actions without a decision record'), ('duplicate', 'extra decision records'),
+                           ('orphan', 'decision records without an action'),
+                           ('misattributed', 'records filed under another player')):
+            if cov[key]:
+                problems.append(f'{p}: {cov[key]} {words}')
+        if cov['calls_expected'] != cov['calls_recorded']:
+            problems.append(f'{p}: its decisions name {cov["calls_expected"]} model calls, '
+                            f'{cov["calls_recorded"]} are recorded')
+        if x['protocols_missing']:
+            problems.append(f'{p}: {x["protocols_missing"]} match(es) record no protocol fingerprint')
+        if len(x['protocols']) > 1:
+            problems.append(f'{p}: its protocol differs between matches')
+        x['protocol_consistent'] = len(x['protocols']) == 1 and not x['protocols_missing']
         if x['kind'] == 'bot':
-            x['identity'], x['audit'] = 'bot', 'complete'
+            x['identity'] = x['identity_match'] = 'bot'
+            x['audit'] = 'complete' if cov['complete'] else 'incomplete'
             continue
         wrong = [m for m in x['observed_models'] if not x['requested_model'] or not same_model(x['requested_model'], m)]
-        x['identity'] = ('none' if not x['replies'] else 'mismatch' if wrong else
-                         'attested' if set(x['identity_counts']) == {'attested'} else 'unattested')
+        counts = x['identity_match_counts']
+        x['identity_match'] = ('none' if not x['replies'] else 'mismatch' if wrong or counts.get('mismatch') else
+                               'match' if set(counts) == {'match'} else 'unattested')
+        x['identity'] = {'match': 'attested'}.get(x['identity_match'], x['identity_match'])
         audits = set(x['audit_counts'])
-        x['audit'] = 'opaque' if 'opaque' in audits else 'complete' if audits <= {'verified'} else 'incomplete'
+        if not cov['complete'] or not x['decisions'] or x['decisions'] != cov['decisions']:
+            x['audit'] = 'incomplete'
+        else:
+            x['audit'] = 'opaque' if 'opaque' in audits else 'complete' if audits == {'verified'} else 'incomplete'
+        if x['audit'] == 'incomplete' and cov['complete'] and x['decisions']:
+            problems.append(f'{p}: some decisions were not verified ({", ".join(sorted(audits - {"verified"}))})')
+    verification = {'matches': matches, 'hands': total, 'verified': verified, 'failed': failed,
+                    'evidence_hash': hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()}
+    verification['ok'] = bool(matches) and not failed and not record_problems
+    verification['problems'] = record_problems + [f'{x["match"]} hand {x["hand"]}: {"; ".join(x["errors"][:2])}'
+                                                  for x in failed]
     return {'registration': registration, 'implementation_changes': changes, 'conversations': len(folders),
-            'first_started': min(started) if started else None, 'players': facts}
+            'first_started': min(started) if started else None, 'cli_versions': {e: sorted(map(str, v))
+                                                                                 for e, v in versions.items()},
+            'verification': verification, 'players': facts,
+            'problems': verification['problems'] + [q for x in facts.values() for q in x['problems']]}
 
 
 def _record_decision(out: Path, a, b, v: dict):
@@ -704,6 +913,9 @@ async def run_plan(plan: dict, *, only=None, concurrency=None, log=print, allow_
             raise ResumeMismatch(f'{out}/plan.json: this tournament was planned with different {", ".join(diff)}; '
                                  f'rerun with the recorded plan or use a new `out`')
         change = check_implementation(stored, impl, f'{out}/plan.json', allow_code_change)
+    exes = sorted({e for p in involved if not is_bot(players[p]) for e in [backend_exe(players[p])] if e})
+    versions = {e: await asyncio.to_thread(cli_version, e) for e in exes}
+    cli_change = check_versions(stored, versions, f'{out}/plan.json', allow_code_change) if stored is not None else None
     bad = []
     for a, b in plan['matchups']:
         for r in range(1, rounds + 1):
@@ -718,6 +930,9 @@ async def run_plan(plan: dict, *, only=None, concurrency=None, log=print, allow_
                             bad.append(f'{cfg_path.parent.relative_to(out)} ({", ".join(diff)})')
                         elif not (cfg_path.parent / 'result.json').exists():
                             check_implementation(stored_cfg, impl, cfg_path.parent, allow_code_change)
+                            check_versions(stored_cfg, {e: v for e, v in versions.items()
+                                                        if e in (stored_cfg.get('cli_versions') or {})},
+                                           cfg_path.parent, allow_code_change)
     if bad:
         raise ResumeMismatch('recorded matches differ from this plan: ' + '; '.join(bad))
     out.mkdir(parents=True, exist_ok=True)
@@ -728,14 +943,21 @@ async def run_plan(plan: dict, *, only=None, concurrency=None, log=print, allow_
     reg = (stored or {}).get('registration')
     from . import ratings
     if reg is None and design and not _declined(plan) and not _played(out):
-        reg = ratings.registration(design)
+        reg = {**ratings.registration(design), 'cli_versions': versions}
     if reg and change and reg.get('status') != 'void':
         reg = {**reg, 'status': 'void', 'voided': change['t'],
                'void_reason': 'the code that plays or judges changed after registration (allow_code_change): '
                               + ', '.join(change['files'])}
+    if reg and cli_change and reg.get('status') != 'void':
+        reg = {**reg, 'status': 'void', 'voided': cli_change['t'],
+               'void_reason': 'a CLI changed version after registration (allow_code_change): '
+                              + '; '.join(cli_change['clis'])}
+    cli_changes = (stored or {}).get('cli_version_changes', []) + ([cli_change] if cli_change else [])
     _write(out / 'plan.json', {**plan, **manifest, 'labels': labels, 'code_version': code_version(),
                                'implementation': (stored or {}).get('implementation') or impl,
                                **({'implementation_changes': changes} if changes else {}),
+                               'cli_versions': (stored or {}).get('cli_versions') or versions,
+                               **({'cli_version_changes': cli_changes} if cli_changes else {}),
                                **({'registration': reg} if reg else {}),
                                'sources': sorted({*(stored or {}).get('sources', []), snapshot}),
                                'created': (stored or {}).get('created') or round(time.time())},
@@ -760,9 +982,16 @@ async def run_plan(plan: dict, *, only=None, concurrency=None, log=print, allow_
                     life.pairing(a, b, status='exhausted', looks_used=1)
                     return res
                 facts = eligibility(out, folders, (a, b), reg)
-                v = ratings.adjudicate({**ratings.pairing_data(out, folders, a), 'b': b}, design,
-                                       len(plan['matchups']), r, facts)
-                v = {**v, 'implementation': impl['fingerprint'],
+                data = {**ratings.pairing_data(out, folders, a), 'b': b}
+                proof = facts['verification']
+                if facts['problems']:   # fail closed: an unverified or incomplete record rejects the evidence
+                    known = {str(x.get('reason')) for x in data.get('rejected') or []}
+                    data['rejected'] = list(data.get('rejected') or []) + [
+                        {'reason': f'the record does not verify: {why}'} for why in facts['problems']
+                        if f'the record does not verify: {why}' not in known]
+                v = ratings.adjudicate(data, design, len(plan['matchups']), r, facts)
+                v = {**v, 'implementation': impl['fingerprint'], 'evidence_hash': proof['evidence_hash'],
+                     'verification': {k: proof[k] for k in ('ok', 'matches', 'hands', 'verified', 'problems')},
                      'eligibility': {**facts, 'registration': {k: w for k, w in (reg or {}).items() if k != 'design'}
                                      if reg else None}}
                 _record_decision(out, a, b, v)

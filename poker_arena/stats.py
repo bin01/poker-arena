@@ -24,8 +24,9 @@ Operations (model players):
 Audit (model players), from calls.jsonl: `audit` counts the replies that were used by how far their turn
 could be checked for tool use (verified, opaque: the backend exposes no record, unverified, unrecorded), and
 the replies rejected and asked again (tool_use_rejected, unverified_rejected) or that never came (no_reply);
-`identity` counts replies by whether the backend reported the model that answered (attested), did not
-(unattested), or reported another model than the one requested (mismatch).
+`identity_match` (also under `identity`) counts replies by `ratings.identity_match`: the backend reported the
+requested model (match), reported another (mismatch), or reported none (unattested); `identity_reported`
+counts the replies for which some model was reported at all. Reporting a model is not matching it.
 """
 from __future__ import annotations
 import json
@@ -107,11 +108,14 @@ def tally(d: Path) -> tuple[dict, dict]:
 
 
 AUDIT = ('verified', 'opaque', 'unverified', 'unrecorded', 'tool_use_rejected', 'unverified_rejected', 'no_reply')
-IDENTITY = ('attested', 'unattested', 'mismatch')
+IDENTITY = ('match', 'mismatch', 'unattested')
 
 
 def audit_counts(call: dict, model=None) -> dict:
-    """One call's contribution to the audit and identity counts (keys `audit:<status>`, `identity:<status>`)."""
+    """One call's contribution to the audit and identity counts (keys `audit:<status>`, `identity:<match>`,
+    `identity_reported`). The identity is `ratings.identity_match` of the model requested and the one the
+    backend reported, recomputed here: a call's own `identity` or `identity_match` field never makes a reply a
+    match, though a recorded 'mismatch' stands."""
     if call.get('backend_failed'):
         return {'audit:no_reply': 1}
     if call.get('rejected') in ('tool_use', 'unverified'):
@@ -119,14 +123,12 @@ def audit_counts(call: dict, model=None) -> dict:
     else:
         a = call.get('audit')
         out = {f'audit:{a if a in ("verified", "opaque", "unverified") else "unrecorded"}': 1}
+    from .ratings import identity_match
     observed = call.get('observed_model') or call.get('served_model')
-    requested = call.get('requested_model') or model
-    if observed and requested:
-        from .ratings import same_model
-        if not same_model(requested, observed):
-            return {**out, 'identity:mismatch': 1}
-    ident = call.get('identity') or ('attested' if observed else 'unattested')
-    return {**out, f'identity:{ident if ident in IDENTITY else "unattested"}': 1}
+    match = identity_match(call.get('requested_model') or model, observed)
+    if call.get('identity_match') == 'mismatch':
+        match = 'mismatch'
+    return {**out, f'identity:{match}': 1, **({'identity_reported': 1} if observed else {})}
 
 
 def add(into: dict, counts: dict):
@@ -177,6 +179,8 @@ def summarize(s: dict, served=()) -> dict:
         'served_models': sorted(served),
         'audit': {k: int(g(f'audit:{k}')) for k in AUDIT},
         'identity': {k: int(g(f'identity:{k}')) for k in IDENTITY},
+        'identity_match': {k: int(g(f'identity:{k}')) for k in IDENTITY},
+        'identity_reported': int(g('identity_reported')),
     }
     for key, prefix in (('by_opponent', 'vs:'), ('by_position', 'pos:')):
         names = sorted({k[len(prefix):].rsplit(':', 1)[0] for k in s if k.startswith(prefix)})

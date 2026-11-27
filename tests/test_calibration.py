@@ -253,22 +253,132 @@ class TestNullFalseWinners(unittest.TestCase):
         print(f'\nbeyond the family (t arm alone, through decide): {rows}')
 
 
+REG = R.registration(DESIGN, created=0)
+BOTS = {'registration': REG, 'implementation_changes': [], 'conversations': 0,
+        'players': {p: {'kind': 'bot', 'identity': 'bot', 'audit': 'complete', 'protocol_consistent': True}
+                    for p in ('x', 'y')}}
+
+
+def planning_deals(rng, n, edge, icc, rho, design=DESIGN, kind='normal'):
+    """n pairings of the design's conversations as the planner models them (deals of spread SD, a share icc
+    of their variance a normal conversation effect, AR(1) memory rho, a true edge), or with poker-like deals."""
+    reps, rounds, R_ = design['replicates'], design['max_rounds'], design['round_deals']
+    card = SD * math.sqrt(1 - icc)
+    e = deal_noise(kind, rng, (n, rounds * reps, R_))
+    for d in range(1, R_):
+        e[..., d] = rho * e[..., d - 1] + math.sqrt(1 - rho * rho) * e[..., d]
+    return edge + card * e + SD * math.sqrt(icc) * rng.standard_normal((n, rounds * reps, 1))
+
+
+def look_stats(x, design=DESIGN):
+    """What decide and assumptions compute at each look from conversations of equal length (n x C x deals):
+    the columns `ratings.verdicts_of` reads."""
+    reps, block = design['replicates'], design['block']
+    m = x.mean(-1)
+    k = -(-x.shape[-1] // block)
+    sums = np.add.reduceat(x, block * np.arange(k), axis=-1)
+    sizes = np.minimum(block, x.shape[-1] - block * np.arange(k))
+    w = k / (k - 1) * ((sums - sizes * m[..., None]) ** 2).sum(-1) / x.shape[-1] ** 2
+    cols = []
+    for j in range(design['max_rounds']):
+        C = (j + 1) * reps
+        mean, var = m[:, :C].mean(1), m[:, :C].var(1, ddof=1)
+        share = np.where(var > 0, np.round(np.maximum(0, 1 - w[:, :C].mean(1) / np.where(var > 0, var, 1)), 2), np.nan)
+        cols.append((mean, np.sqrt(var / C), share))
+    return cols
+
+
+def through_adjudicate(x, design=DESIGN, n_pairings=3):
+    """Each pairing judged as the runner judges it: `adjudicate` after every round on the deals so far, stopping
+    at the first terminal verdict. [(verdict, counts_toward_leader)]."""
+    reps, rounds, R_ = design['replicates'], design['max_rounds'], design['round_deals']
+    out = []
+    for seq in x:
+        for r in range(1, rounds + 1):
+            C = r * reps
+            data = {'a': 'x', 'b': 'y', 'xs': list(seq[:C].ravel()), 'groups': list(np.repeat(np.arange(C), R_)),
+                    'rejected': [], 'evidence_hash': 'simulated'}
+            v = R.adjudicate(data, design, n_pairings, r, BOTS)
+            if v['verdict'] in R.TERMINAL:
+                break
+        out.append((v['verdict'], v['counts_toward_leader']))
+    return out
+
+
 class TestPower(unittest.TestCase):
-    def test_planned_power_matches_simulation(self):
-        """The design's power under each planning scenario is what simulated tournaments of deals give."""
-        n = 20_000 if HEAVY else 3000
-        for i, sc in enumerate(DESIGN['power_scenarios']):
-            icc, rho = sc['assumed_icc'], sc['assumed_ar1']
-            card = SD * math.sqrt(1 - icc) * math.sqrt(R.design_effect(rho, DEALS) / DEALS)
-            share = icc * SD * SD / (icc * SD * SD + card * card)
-            m = conversations(np.random.default_rng(50 + i), n, C_MAX, 'normal', rho, 'normal', share,
-                              edge=DESIGN['target_edge_bb100'], card=math.sqrt(1 - icc))
-            _, right = t_arm(m)
-            with self.subTest(scenario=sc['scenario']):
-                self.assertAlmostEqual(right.mean(), sc['power'], delta=0.035)
+    """R5-#7: the power a plan advertises is the full adjudicator's: both arms, the minimum, the looks, and the
+    diagnostics a verdict needs to count. Checked three ways: the planner's decision logic against `adjudicate`
+    on the same data, the planner's numbers against `adjudicate` on fresh simulated pairings, and the
+    tournament's chance of a decided leader against a joint simulation."""
+
+    def test_planner_logic_is_the_adjudicators(self):
+        """On the same simulated pairings, `verdicts_of` (what the planner applies) and `adjudicate` (look by look,
+        as the runner calls it) reach the same verdict and the same counting decision."""
+        n = 1000 if HEAVY else 100
+        x = planning_deals(np.random.default_rng(70), n, DESIGN['target_edge_bb100'], 0.01, 0.2)
+        sign, counts, _ = R.verdicts_of(look_stats(x), DESIGN)
+        got = through_adjudicate(x)
+        words = {1: 'a', -1: 'b', 2: 'even', 0: 'exhausted'}
+        agree = np.mean([(words[s], bool(c)) == (v, bool(k)) for s, c, (v, k) in zip(sign, counts, got)])
+        self.assertGreaterEqual(agree, 0.95)
+        if HEAVY:
+            print(f'\nplanner logic vs adjudicate on the same pairings: {agree:.3f} agree ({n})')
+
+    def test_advertised_power_is_the_adjudicators(self):
+        """The design's counting power (moderate dependence, at the target) against fresh pairings through
+        `adjudicate`: within Monte Carlo error. Heavy: also the other scenarios and poker-like deals."""
+        n = 4000 if HEAVY else 300
+        cases = [('moderate', 'normal')] + ([('optimistic', 'normal'), ('pessimistic', 'normal'), ('moderate', 'poker')]
+                                           if HEAVY else [])
+        sc = {x['scenario']: x for x in DESIGN['power_scenarios']}
+        for i, (name, kind) in enumerate(cases):
+            s = sc[name]
+            x = planning_deals(np.random.default_rng(80 + i), n, DESIGN['target_edge_bb100'], s['assumed_icc'],
+                               s['assumed_ar1'], kind=kind)
+            got = through_adjudicate(x)
+            counting = np.mean([v == 'a' and k for v, k in got])
+            right = np.mean([v == 'a' for v in (g[0] for g in got)])
+            se = math.sqrt(s['power'] * (1 - s['power']) / n)
+            with self.subTest(scenario=name, deals=kind):
+                self.assertAlmostEqual(counting, s['power'], delta=3.5 * se + 0.01)
+                self.assertFalse(any(v == 'b' for v, _ in got))
             if HEAVY:
-                print(f'\npower, {sc["scenario"]}: design {sc["power"]:.3f}, simulated deals {right.mean():.3f}')
+                print(f'\ncounting power, {name}, {kind} deals: design {s["power"]:.3f} (decided {s["power_decided"]:.3f}), '
+                      f'adjudicate {counting:.3f} (decided {right:.3f}), {n} pairings')
+
+    def test_design_is_powered_by_counting_verdicts(self):
         self.assertGreaterEqual(DESIGN['power_at_max'], 0.8)
+        fewer = normalize_design({'deals': 50, 'design': {'max_rounds': DESIGN['max_rounds'] - 1}, 'replicates': 4,
+                                  'matchups': THREE})
+        self.assertLess(fewer['power_at_max'], 0.8)
+        for s in DESIGN['power_scenarios']:
+            self.assertLessEqual(s['power'], s['power_decided'])
+        self.assertIn('complete adjudicator', DESIGN['power_basis'])
+
+    def test_leader_chance(self):
+        """The chance of a decided leader under 'one best' is the product of its pairings' counting power; in a
+        joint simulation where the leader's pairings share cards (positively correlated), the joint chance is at
+        least the product of the pairings' own chances."""
+        lead = {x['scenario']: x for x in DESIGN['leader_chances']}
+        p = R.procedure(DESIGN, DESIGN['target_edge_bb100'])['counting']
+        self.assertAlmostEqual(lead['one best']['p_leader'], p ** 2, places=3)
+        nine = normalize_design({'deals': 50, 'design': {}, 'replicates': 4,
+                                 'matchups': [[a, b] for i, a in enumerate('abcdefghi') for b in 'abcdefghi'[i + 1:]]})
+        self.assertLess({x['scenario']: x for x in nine['leader_chances']}['one best']['p_leader'], lead['one best']['p_leader'])
+        if not HEAVY:
+            return
+        n, T, c = 1500, DESIGN['target_edge_bb100'], 0.6
+        rng = np.random.default_rng(90)
+        z = rng.standard_normal((n, C_MAX, DEALS)) * SD          # the leader's own luck on the shared cards
+        wins = []
+        for _ in ('b', 'c'):                                      # the same share of each deal's spread, so each
+            x = T + math.sqrt(1 - c * c) * (planning_deals(rng, n, T, 0.01, 0.2) - T) + c * z   # pairing keeps its power
+            wins.append(np.array([v == 'a' and k for v, k in through_adjudicate(x)]))
+        both, alone = (wins[0] & wins[1]).mean(), (wins[0].mean(), wins[1].mean())
+        print(f'\ndecided leader, one best by {T:.0f}, 3 players, pairings sharing {c * c:.0%} of each deal\'s variance: '
+              f'{both:.3f}; its pairings alone {alone[0]:.3f} and {alone[1]:.3f} (product {alone[0] * alone[1]:.3f}); '
+              f'the design says {lead["one best"]["p_leader"]:.3f}')
+        self.assertGreaterEqual(both, alone[0] * alone[1] - 3.5 * math.sqrt(0.25 / n))
 
     def test_signflip_arm_costs_little_power(self):
         n = 1000 if HEAVY else 120
@@ -276,7 +386,7 @@ class TestPower(unittest.TestCase):
                           edge=DESIGN['target_edge_bb100'], means=False)
         _, right = t_arm(x.mean(-1))
         both = np.mean([c == 'a' for c in through_decide(x)])
-        self.assertGreater(both, right.mean() - 0.08)
+        self.assertGreater(both, right.mean() - 3.5 * math.sqrt(0.2 / n))
         if HEAVY:
             print(f'\npower at the target, moderate dependence: t arm {right.mean():.3f}, both arms {both:.3f}')
 
@@ -297,6 +407,100 @@ class TestPower(unittest.TestCase):
         self.assertEqual((v['verdict'], v['basis'], v['conversations']), ('early', 'blocks', 1))
         self.assertIsNotNone(v['ci95'])
         self.assertIn('conversation', v['reason'])
+
+
+EQ_CARD = 100.0 / SD          # per-deal spread 100 bb/100: tight enough for 'even' to be reachable at all
+EQ_SHAPES = [(None, 0.0), ('exponential', 0.5), ('lognormal', 0.5), ('rare_loss', 0.5)]
+
+
+def eq_means(rng, n, edge, shape, share, orient=1, kind='normal', C=C_MAX, means=True, common=None):
+    """Conversation means (or deals) with a true edge and the conversation effect in either orientation
+    (orient -1 mirrors it: rare large wins instead of rare large losses)."""
+    x = conversations(rng, n, C, kind, 0.0, shape, share, edge=orient * edge, card=EQ_CARD, means=means,
+                      common=None if common is None else orient * common)
+    return orient * x
+
+
+def tost_arm(m, design=DESIGN, level=None):
+    """Whether each sequence of conversation means (n x C) ends 'even' under the t arm of decide: at each
+    deciding look a winner first, then the repeated interval inside +-EQUIV_BB100; the first decision stops it."""
+    reps, rounds, ap = design['replicates'], design['max_rounds'], design['alpha_pairing']
+    a1, _, _, eligible = R._calibrate(ap, rounds, reps)
+    aeq = R.equivalence_level(ap, rounds, reps) if level is None else level
+    live, even = np.ones(len(m), bool), np.zeros(len(m), bool)
+    for j in range(rounds):
+        C = (j + 1) * reps
+        if not eligible[j]:
+            continue
+        z = m[:, :C]
+        mu, se = z.mean(1), z.std(1, ddof=1) / math.sqrt(C)
+        win = live & (np.abs(mu) >= t_ppf(1 - a1 / 2, C - 1) * se)
+        q = t_ppf(1 - aeq / 2, C - 1)
+        eq = live & ~win & (mu - q * se > -R.EQUIV_BB100) & (mu + q * se < R.EQUIV_BB100)
+        even |= eq
+        live &= ~(win | eq)
+    return even
+
+
+class TestEquivalence(unittest.TestCase):
+    """R5-#8: 'even' (TOST at +-15 bb/100) is a false verdict whenever the true edge is at or beyond the margin.
+    Its chance there stays within alpha_pairing on either side, for normal results and for every skewed shape
+    of the calibrated family in either orientation (a skewed shape puts most of its crossings on one side, so
+    each side is calibrated, not the pair), through the vectorized t arm and through `decide` itself, alone and
+    for pairings that share cards."""
+    N = 200_000 if HEAVY else 12_000
+
+    def test_false_even_at_and_beyond_the_margin(self):
+        rates = {}
+        for i, (shape, share) in enumerate(EQ_SHAPES):
+            for orient in (1, -1):
+                for edge in (15.0, -15.0, 16.0, 20.0):
+                    rng = np.random.default_rng([300, i, orient + 1, int(edge) + 100])
+                    r = tost_arm(eq_means(rng, self.N, edge, shape, share, orient)).mean()
+                    rates[f'{shape or "normal"}{"" if orient > 0 else " mirrored"} @ {edge:+.0f}'] = round(float(r), 4)
+                    with self.subTest(shape=shape, orient=orient, edge=edge):
+                        self.assertLessEqual(r, bound(AP, self.N))
+        if HEAVY:
+            print(f'\nfalse even per pairing (t arm, target {AP:.4f}): {rates}')
+
+    def test_calibrating_the_pair_was_not_enough(self):
+        """The round 5 level (two-sided, calibrated as a pair) let the heavy side of a skewed shape through."""
+        old = R._calibrate(min(1.0, 2 * AP), DESIGN['max_rounds'], 4)[0]
+        self.assertGreater(old, R.equivalence_level(AP, DESIGN['max_rounds'], 4))
+        worst = max(tost_arm(eq_means(np.random.default_rng([310, o + 1, int(e) + 100]), self.N, e, 'rare_loss', 0.5, o), level=old).mean()
+                    for o in (1, -1) for e in (15.0, -15.0))
+        self.assertGreater(worst, AP)
+
+    def test_even_is_reachable_where_it_is_true(self):
+        r = tost_arm(eq_means(np.random.default_rng(320), self.N // 4, 0.0, None, 0.0)).mean()
+        self.assertGreater(r, 0.5)
+        p = R.procedure(DESIGN, 0.0, icc=0.0, ar1=0.0, sd=100.0)
+        self.assertAlmostEqual(p['even'], r, delta=0.03)
+        if HEAVY:
+            print(f'\neven at a true edge of 0, per-deal spread 100: t arm {r:.3f}, planner {p["even"]:.3f}; at '
+                  f'spread 350 (the default prior): planner {R.procedure(DESIGN, 0.0)["even"]:.3f}')
+
+    def test_false_even_through_decide(self):
+        n = 3000 if HEAVY else 300
+        x = eq_means(np.random.default_rng(330), n, -15.0, 'rare_loss', 0.5, 1, kind='poker', means=False)
+        rate = np.mean([c == 'even' for c in through_decide(x)])
+        self.assertLessEqual(rate, bound(AP, n, 3))
+        if HEAVY:
+            print(f'\nfalse even through decide (poker deals, rare-loss effects, edge -15): {rate:.4f}')
+
+    def test_simultaneous_pairings(self):
+        """Three pairings at the margin on shared slates: any false 'even' in the tournament at most alpha."""
+        n = self.N // 8
+        rng = np.random.default_rng(340)
+        z = rng.standard_normal((n, C_MAX, DEALS)).astype(np.float32) * SD * EQ_CARD
+        beta = {'a': 0.8, 'b': 0.0, 'c': -0.8}
+        anyone = np.zeros(n, bool)
+        for (p, q), edge in zip(THREE, (15.0, -15.0, 15.0)):
+            x = eq_means(rng, n, edge, 'exponential', 0.5, 1, means=False, common=(beta[p] - beta[q]) * 0.6 * z)
+            anyone |= tost_arm(x.mean(-1))
+        self.assertLessEqual(anyone.mean(), bound(DESIGN['alpha'], n))
+        if HEAVY:
+            print(f'\nany false even, 3 pairings at the margin with shared cards: {anyone.mean():.4f} (target 0.05)')
 
 
 def tournament(rng, players, true, slates, deals=50, su=0.5, rho=0.2, common=0.6, kind='poker'):

@@ -25,7 +25,9 @@ and asks again, as for tool use; gemini output without tool counts is one) or 'o
 one; its protocol says so, and the judge never counts such turns towards a decided result unless the design
 preregistered it). Every reply also says who answered: `requested_model`, `observed_model` (claude: the init
 event's model; agy: the transcript's; gemini: its stats' only model; openai_compat: the response's; codex and
-command: none) and `identity` ('attested' when the output named a model, else 'unattested'). `state()` / `restore()` let a stopped match resume; `rebuild()` starts a CLI conversation over
+command: none), `identity_reported` and `identity_match` ('match' | 'mismatch' | 'unattested', by
+ratings.same_model; the field every consumer judges identity by) and the older `identity` (only whether a model
+was named). `state()` / `restore()` let a stopped match resume; `rebuild()` starts a CLI conversation over
 from the turns the match committed, for when the CLI's own conversation may hold turns the record dropped.
 `protocol()` is what a player's results depend on, for its identity across runs.
 """
@@ -68,6 +70,24 @@ def cli_version(exe: str | None) -> str | None:
                 pass
         _VERSIONS[exe] = version
     return _VERSIONS[exe]
+
+
+def identity_fields(requested, observed) -> dict:
+    """{identity_reported, identity_match} for one reply (see Backend.identity)."""
+    from .ratings import same_model
+    if not observed:
+        return {'identity_reported': False, 'identity_match': 'unattested'}
+    return {'identity_reported': True,
+            'identity_match': 'match' if requested and same_model(requested, observed) else 'mismatch'}
+
+
+def backend_exe(spec: dict) -> str | None:
+    """The CLI a player's backend runs (None for bots and API backends), without starting it."""
+    kind = spec.get('backend')
+    if kind == 'command':
+        return (spec.get('command') or [None])[0]
+    cls = BACKENDS.get(kind)
+    return getattr(cls, 'exe', None) if cls else None
 
 
 @dataclass
@@ -224,10 +244,12 @@ class Backend:
 
     def identity(self, observed: str | None = None) -> dict:
         """Who was asked and who answered, for one call: `requested_model` (the configured model, None for the
-        CLI's default), `observed_model` (the model the backend's own output names, None when it names none) and
-        `identity`: 'attested' when the output named a model, else 'unattested' (the configured model is all
-        that is known). Whether the observed model is the requested one is the judge's question."""
-        out = {'requested_model': self.model, 'observed_model': observed or None,
+        CLI's default), `observed_model` (the model the backend's own output names, None when it names none),
+        `identity_reported` (whether the output named a model at all) and `identity_match`: 'match' when the named
+        model is the requested one (ratings.same_model), 'mismatch' when it is another model (or nothing was
+        requested), 'unattested' when the output named none. `identity` ('attested' | 'unattested') only says
+        whether a model was named; consumers judge identity by `identity_match`."""
+        out = {'requested_model': self.model, 'observed_model': observed or None, **identity_fields(self.model, observed),
                'identity': 'attested' if observed else 'unattested'}
         if getattr(self, 'effort', None) is not None:
             out['requested_effort'] = self.effort

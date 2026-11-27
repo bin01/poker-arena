@@ -82,5 +82,46 @@ class TestModelPipeline(unittest.TestCase):
             self.assertEqual(sum(1 for e in events if e['kind'] == 'hand_start'), 6)
 
 
+class TestReferenceBot(unittest.TestCase):
+    def test_versioned_deterministic_and_it_beats_the_baselines(self):
+        from poker_arena.agents import make_agent
+        ref = make_agent('reference', {'bot': 'reference'}, seed=3)
+        self.assertEqual(ref.describe()['version'], 'reference-1')
+        G = get_game('holdem')({'hands_per_match': 80})
+        seeds = list(range(1000, 1080))
+        with tempfile.TemporaryDirectory() as d:
+            nets = {}
+            for opp in ('rule', 'station', 'random'):
+                res = asyncio.run(run_duplicate(G, ('reference', {'bot': 'reference'}), (opp, {'bot': opp}),
+                                                seeds, Path(d) / opp, log=lambda *a: None))
+                nets[opp] = res[0]['net'][0] + res[1]['net'][1]
+            again = asyncio.run(run_duplicate(G, ('reference', {'bot': 'reference'}), ('rule', {'bot': 'rule'}),
+                                              seeds, Path(d) / 'again', log=lambda *a: None))
+            self.assertEqual(again[0]['net'][0] + again[1]['net'][1], nets['rule'])
+            first = lambda p: [json.loads(l)['actions'] for l in (p / 'reference__vs__rule' / 'a-first' / 'hands.jsonl')
+                               .read_text().splitlines()]
+            self.assertEqual(first(Path(d) / 'rule'), first(Path(d) / 'again'))
+        for opp, net in nets.items():
+            self.assertGreater(net, 0, opp)
+
+    def test_it_reads_position_and_price(self):
+        from poker_arena.agents import make_agent
+        G = get_game('holdem')({'hands_per_match': 2})
+        bot = make_agent('reference', {'bot': 'reference', 'sims': 300})
+
+        def decide(hole, button_seat, script=()):
+            ep = G.episode(button_seat, 1, ['A', 'B'])
+            ep.hole[0] = hole
+            for seat, act in script:
+                self.assertIsNone(ep.apply(seat, act))
+            self.assertEqual(ep.to_act, 0)
+            return asyncio.run(bot.act('', ep.request(0), None)).action['action']
+        self.assertEqual(decide(['As', 'Ah'], 0), 'raise')                      # opens aces on the button
+        self.assertEqual(decide(['7d', '2c'], 0), 'fold')                       # folds the worst hands there
+        self.assertEqual(decide(['7d', '2c'], 1, [(1, {'action': 'call'})]), 'check')   # free look in the big blind
+        self.assertEqual(decide(['As', 'Ah'], 1, [(1, {'action': 'all_in'})]), 'call')
+        self.assertEqual(decide(['7d', '2c'], 1, [(1, {'action': 'all_in'})]), 'fold')
+
+
 if __name__ == '__main__':
     unittest.main()

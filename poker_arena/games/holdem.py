@@ -434,6 +434,9 @@ class Holdem(Game):
     def episode(self, index, seed, names):
         return HoldemHand(self, index, seed, names)
 
+    def verify(self, seed, button, recorded_hand, events=None):
+        return verify_hand(self, seed, button, recorded_hand, events)
+
     def response_schema(self):
         return {
             'type': 'object', 'additionalProperties': False,
@@ -469,3 +472,100 @@ YOUR RESPONSE
 Reply with only a JSON object (no code fence, no other text):
 {{"reasoning": "your private thinking about this decision, brief", "action": "fold" | "check" | "call" | "raise" | "all_in", "amount": the total you are betting this street when you raise or bet (an integer), otherwise null, "say": "table talk" or "", "notes": "your updated notes" or null}}
 To bet when nobody has bet yet, use "raise" with the amount of your bet."""
+
+
+VERIFY_IGNORE = {'note', 'requested', 'correction'}   # how a reply was corrected: not part of what was played
+
+
+def _plain(x):
+    import json
+    return json.loads(json.dumps(x, default=str))
+
+
+# Fields the engine derives from the cards and actions (added to the logs over time). A record that lacks one is
+# checked on everything else; a record that has one must match the replay.
+DERIVED = {'pot_before', 'pot_odds', 'to_act', 'to_call', 'omniscient', 'made_hand'}
+
+
+def verify_hand(game: Holdem, seed, button, recorded_hand: dict, events: list | None = None) -> dict:
+    """Check a recorded hand against the engine, without trusting the record: regenerate the deal from `seed`,
+    replay the recorded actions through `apply` (each must be the legal move of the seat to act), and compare the
+    cards, board, every action's pot and price, the payouts and the summary with what was recorded. `events` (the
+    hand's rows from events.jsonl, optional) are checked the same way. Returns {ok, errors}."""
+    errors = []
+    rec = _plain(recorded_hand or {})
+    index = rec.get('hand')
+    if not isinstance(index, int) or index < 0:
+        return {'ok': False, 'errors': [f'the hand has no valid index ({index!r})']}
+    names = None
+    evs = [_plain(e) for e in events or []]
+    start = next((e for e in evs if e.get('kind') == 'hand_start'), None)
+    if start:
+        names = (start.get('data') or {}).get('names')
+    ep = HoldemHand(game, index, seed, list(names or [f'P{i}' for i in range(len(rec.get('hole') or []) or 2)]))
+    if button is not None and ep.button != button:
+        errors.append(f'button: recorded {button}, but hand {index} has the button on seat {ep.button}')
+    if rec.get('button') is not None and rec['button'] != ep.button:
+        errors.append(f'button: the record says {rec["button"]}, the engine {ep.button}')
+    if rec.get('hole') != _plain(ep.hole):
+        errors.append(f'hole cards differ from the deal of seed {seed}: recorded {rec.get("hole")}, dealt {ep.hole}')
+    for k, a in enumerate(rec.get('actions') or []):
+        if ep.done:
+            errors.append(f'action {k}: recorded after the hand was over')
+            break
+        if a.get('seat') != ep.to_act:
+            errors.append(f'action {k}: seat {a.get("seat")} acted, but seat {ep.to_act} was to act')
+            break
+        kind = {'bet': 'raise'}.get(a.get('action'), a.get('action'))
+        move = {'action': kind, 'amount': a.get('amount') if kind == 'raise' else None, 'say': a.get('say', '')}
+        err = ep.apply(ep.to_act, move)
+        if err:
+            errors.append(f'action {k} ({a.get("action")} {a.get("amount")}): illegal: {err}')
+            break
+        if ep.history[-1].get('correction'):
+            errors.append(f'action {k} ({a.get("action")} {a.get("amount")}): not playable as recorded '
+                          f'({ep.history[-1]["note"]})')
+            break
+        want = {x: v for x, v in a.items() if x not in VERIFY_IGNORE}
+        got = {x: v for x, v in _plain(ep.history[-1]).items()
+               if x not in VERIFY_IGNORE and (x in want or x not in DERIVED)}
+        if got != want:
+            diff = sorted(x for x in set(got) | set(want) if got.get(x) != want.get(x))
+            errors.append(f'action {k}: recorded {", ".join(f"{x}={want.get(x)!r}" for x in diff)}; '
+                          f'replayed {", ".join(f"{x}={got.get(x)!r}" for x in diff)}')
+    if not errors and not ep.done:
+        errors.append('the recorded actions end before the hand is over')
+    if not errors:
+        replayed = _plain(ep.summary())
+        for key in ('board', 'won', 'net', 'pot', 'showdown', 'best', 'omniscient'):
+            if key in DERIVED and key not in rec:
+                continue
+            if rec.get(key) != replayed.get(key):
+                errors.append(f'{key}: recorded {rec.get(key)!r}, replayed {replayed.get(key)!r}')
+        if sum(rec.get('net') or [1]) != 0:
+            errors.append(f'net results do not sum to zero: {rec.get("net")}')
+        if events is not None:
+            errors += _verify_events(ep, evs)
+    return {'ok': not errors, 'errors': errors}
+
+
+def _verify_events(ep: HoldemHand, evs: list) -> list[str]:
+    out = []
+    played = [e for e in evs if e.get('kind') != 'thought']
+    engine = [_plain(e.to_json()) for e in ep.events]
+    if len(played) != len(engine):
+        return [f'events: {len(played)} recorded, the replay emits {len(engine)}']
+    for k, (got, want) in enumerate(zip(played, engine)):
+        g, w = dict(got.get('data') or {}), dict(want['data'])
+        if got.get('kind') != want['kind'] or got.get('visible') != want['visible']:
+            out.append(f'event {k}: recorded {got.get("kind")} visible to {got.get("visible")}, '
+                       f'replayed {want["kind"]} visible to {want["visible"]}')
+            continue
+        if want['kind'] == 'action':
+            g = {x: v for x, v in g.items() if x not in VERIFY_IGNORE}
+            w = {x: v for x, v in w.items() if x not in VERIFY_IGNORE}
+        w = {x: v for x, v in w.items() if x in g or x not in DERIVED}
+        if g != w:
+            diff = sorted(x for x in set(g) | set(w) if g.get(x) != w.get(x))
+            out.append(f'event {k} ({want["kind"]}): {", ".join(diff)} differ from the replay')
+    return out

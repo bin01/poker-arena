@@ -228,7 +228,7 @@ class TestRounds(unittest.TestCase):
                 mock.patch.object(ratings, 'adjudicate', fake_adjudicate([]), create=True):
             asyncio.run(run_plan(plan, log=lambda *a: None))
         self.assertTrue(seen and all(r and r['status'] == 'registered' for r in seen))
-        self.assertEqual(set(seen[0]), {'status', 'design', 'judge_fingerprint', 'calibration_id', 'created'})
+        self.assertEqual(set(seen[0]), {'status', 'design', 'judge_fingerprint', 'calibration_id', 'created', 'cli_versions'})
         self.assertEqual(seen[0]['design'], plan_design(plan))
 
     def test_no_registration_when_declined_or_after_play(self):

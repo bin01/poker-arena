@@ -6,8 +6,9 @@ mixing a smoke test with a tournament makes neither readable.
     /api/runs                       every run: players, progress, pace and ETA, live or not
     /api/index?run=RUN              the run's matchups (both duplicate matches, and planned ones not started)
     /api/match?id=RUN/MATCHUP/a-first   one match: config, finished hands, and every event by hand
-    /api/ratings?run=RUN            the run's leaderboard, per-player stats and its audit summary (recomputed when a
-                                    hand finishes)
+    /api/ratings?run=RUN            the run's leaderboard, per-player stats and its audit summary (recomputed when
+                                    any of the run's record files changes)
+    /api/quiz?run=RUN               the run's poker-fundamentals quiz (quiz.json), when it has one
 The run `*` is every run together: its leaderboard comes from the history database (history.py), one player
 per model and reasoning level, and keeps runs whose folders have since been deleted.
 Running matches are followed live: the app polls while a match is unfinished.
@@ -31,7 +32,7 @@ LIVE_SECONDS = 180    # a match without a result that wrote an event this recent
 PACE_SECONDS = 1800   # the ETA uses the pace over the last half hour of finished hands
 
 
-BOT_NAMES = {'random': 'Random bot', 'station': 'Calling station', 'rule': 'Rule bot'}
+BOT_NAMES = {'random': 'Random bot', 'station': 'Calling station', 'rule': 'Rule bot', 'reference': 'Reference bot'}
 FAMILIES = {'claude': 'Claude', 'codex': 'GPT', 'agy': 'Gemini', 'gemini': 'Gemini'}
 LABELS: dict = {}   # labels from the current players.toml, which win over the ones recorded in old runs
 PLAYERS_FILE = ['players.toml']
@@ -296,7 +297,8 @@ def runs(root: Path):
         if live and len(recent) >= 4:
             rate = (len(recent) - 1) / max(1.0, recent[-1] - recent[0])
         life = lifecycle(root, run, ms)
-        out.append({'run': run, 'title': root.name if run == '.' else run.split('/')[-1], 'matchups': len(ms), 'matchups_started': sum(m['started'] for m in ms),
+        has_quiz = ((root if run == '.' else root / run) / 'quiz.json').exists()
+        out.append({'run': run, 'quiz': has_quiz, 'title': root.name if run == '.' else run.split('/')[-1], 'matchups': len(ms), 'matchups_started': sum(m['started'] for m in ms),
                     'matchups_finished': sum(m['finished'] for m in ms),
                     'players': sorted({m['a'] for m in ms} | {m['b'] for m in ms}),
                     'hands': done, 'hands_planned': planned, 'live': live,
@@ -358,22 +360,34 @@ AUDIT_KEYS = ('decisions', 'calls', 'tool_rejected', 'unverified', 'verified', '
               'retries', 'resized', 'failed_tries', 'rate_limited', 'backend_failures', 'rebuilt')
 
 
+def _same_model(want, seen) -> bool:
+    try:
+        from .ratings import same_model
+    except ImportError:
+        def same_model(a, b):
+            norm = lambda x: re.sub(r'[^a-z0-9]+', '-', str(x).lower()).strip('-')
+            return norm(a) == norm(b)
+    return bool(same_model(want, seen))
+
+
 def _identity(call: dict, model) -> str:
-    """'attested' when the backend reported the model it ran and it is the one asked for, 'mismatch' when it
-    reported another, else 'unattested'. The runner's own `identity` wins."""
-    if call.get('identity'):
-        return call['identity']
-    seen = call.get('observed_model') or call.get('served_model')
-    if not seen:
-        return 'unattested'
+    """'match' when the backend reported the model it ran and it is the one asked for, 'mismatch' when it
+    reported another, else 'unattested'. The runner's own `identity_match` wins; its older `identity` field only
+    says whether some model was reported, never that it matched, so it is not trusted for a match."""
+    from .ratings import identity_match
+    if call.get('identity_match') in ('mismatch', 'unattested'):
+        return call['identity_match']   # a recorded doubt stands; a recorded match is re-checked below
+    seen = [m for m in (call.get('observed_models') or [call.get('observed_model') or call.get('served_model')]) if m]
     want = call.get('requested_model') or model
-    return 'attested' if not want or str(want) == str(seen) or str(want) in str(seen) else 'mismatch'
+    if not want:
+        return 'unattested' if not seen else 'mismatch'
+    return identity_match(want, seen)   # recomputed from what was reported, never taken from the record
 
 
 def audit(root: Path, run: str) -> dict:
     """What the records say about how each model's decisions were made, from calls.jsonl and the decisions in
     events.jsonl: tool-use rejections, turns that could not be audited, fallbacks, retries, failed tries and
-    rate-limit waits, and how many calls attest the model that answered. Bots make no calls and are left out."""
+    rate-limit waits, and how many calls report a model that matches the one asked for. Bots make no calls and are left out."""
     from .history import ALL
     folders = [cfg.parent for cfg in sorted(root.rglob('config.json')) if cfg.parent.name in ('a-first', 'b-first')
                and (run in (None, ALL) or run_of(root, cfg.parent.parent) == run)]
@@ -423,9 +437,9 @@ def audit(root: Path, run: str) -> dict:
             model = models[pid].get('model')
             ident = _identity(c, model)
             a['identity'][ident] = a['identity'].get(ident, 0) + 1
-            seen = c.get('observed_model') or c.get('served_model')
-            if seen:
-                a['observed'].add(str(seen))
+            for seen in c.get('observed_models') or [c.get('observed_model') or c.get('served_model')]:
+                if seen:
+                    a['observed'].add(str(seen))
             if c.get('requested_model') or model:
                 a['requested'].add(str(c.get('requested_model') or model))
     out = {pid: {**a, 'observed': sorted(a['observed']), 'requested': sorted(a['requested'])} for pid, a in players.items()}
@@ -436,6 +450,24 @@ def audit(root: Path, run: str) -> dict:
             totals['identity'][k] = totals['identity'].get(k, 0) + n
     return {'players': out, 'totals': totals, 'recorded': any(a['verified'] or a['opaque'] or a['unverified'] or a['tool_rejected']
                                                               for a in out.values())}
+
+
+def quiz(root: Path, run):
+    """The run's quiz.json (poker-fundamentals spots answered by each player), or None."""
+    from .history import ALL
+    if run in (None, '', ALL):
+        return None
+    base = root if run == '.' else (root / run).resolve()
+    if base != root and root not in base.parents:
+        return None
+    data = _json(base / 'quiz.json')
+    if not isinstance(data, dict):
+        return None
+    labels, kinds = {}, {}
+    for m in _runs_and_matchups(root).get(run, []):
+        labels.update(m['labels'])
+        kinds.update(m['kinds'])
+    return {**data, 'labels': {**labels, **(data.get('labels') or {})}, 'kinds': {**kinds, **(data.get('kinds') or {})}}
 
 
 def ratings_for(root: Path, run, boot=200):
@@ -511,7 +543,25 @@ def export(root, out, players_file='players.toml') -> int:
                 put(f'match-{key(x["id"])}.json', data_)
         put(f'index-{key(r["run"])}.json', ms)
         put(f'ratings-{key(r["run"])}.json', ratings_for(root, r['run'], boot=300))
+        q = quiz(root, r['run'])
+        if q is not None:
+            put(f'quiz-{key(r["run"])}.json', q)
     return files
+
+
+def signature(base: Path, players_file='players.toml') -> tuple:
+    """What a run's ratings depend on: every record file under it (hands, events and calls, and the plan,
+    decisions, tournament, config and quiz files), and the players file that names them. For all runs the
+    history is synced from these same files, so they are its inputs too."""
+    files = [p for p in base.rglob('*.json*') if p.suffix in ('.json', '.jsonl')]
+    files.append(Path(players_file))
+    def stat(p):
+        try:
+            st = p.stat()
+            return st.st_mtime_ns, st.st_size
+        except OSError:
+            return 0, 0
+    return tuple(sorted((str(p), *stat(p)) for p in files))
 
 
 def serve(root, port=8800, host='127.0.0.1', players_file='players.toml'):
@@ -527,7 +577,7 @@ def serve(root, port=8800, host='127.0.0.1', players_file='players.toml'):
         base = root if run in (None, '', '.', ALL) else (root / run).resolve()
         if base != root and root not in base.parents:
             return None
-        stamp = tuple(sorted((str(p), _mtime(p)) for p in base.rglob('*.jsonl')))
+        stamp = signature(base, players_file)
         with lock:
             if cache.get(run, (None,))[0] != stamp:
                 cache[run] = (stamp, ratings_for(root, run))
@@ -558,6 +608,9 @@ def serve(root, port=8800, host='127.0.0.1', players_file='players.toml'):
                 if url.path == '/api/match':
                     data = match(root, q.get('id', [''])[0])
                     return self.send(200, json.dumps(data)) if data else self.send(404, '{"error": "no such match"}')
+                if url.path == '/api/quiz':
+                    data = quiz(root, run)
+                    return self.send(200, json.dumps(data)) if data is not None else self.send(404, '{"error": "no quiz in this run"}')
                 if url.path == '/api/ratings':
                     data = ratings_json(run)
                     return self.send(200, json.dumps(data)) if data is not None else self.send(404, '{"error": "no such run"}')

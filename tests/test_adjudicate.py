@@ -26,7 +26,7 @@ def strong(rng, a='x', b='y', edge=300, rounds=4, reps=2, effects=None):
 def data(xs_by_conv):
     xs = [x for c in xs_by_conv for x in c]
     groups = [f'm{i}' for i, c in enumerate(xs_by_conv) for _ in c]
-    return {'a': 'x', 'b': 'y', 'xs': xs, 'groups': groups, 'rejected': []}
+    return {'a': 'x', 'b': 'y', 'xs': xs, 'groups': groups, 'rejected': [], 'evidence_hash': 'verified-in-test'}
 
 
 class TestRegistration(unittest.TestCase):
@@ -203,7 +203,8 @@ class TestOfficial(unittest.TestCase):
         for look in range(1, 5):
             at = [x for x in deals if x['round'] <= look]
             out.append(R.adjudicate({'a': 'x', 'b': 'y', 'xs': [x['net_a'] / 4 * 100 for x in at],
-                                     'groups': [x['matchup'] for x in at], 'rejected': []},
+                                     'groups': [x['matchup'] for x in at], 'rejected': [],
+                                     'evidence_hash': R.evidence_hash(at)},
                                     d, 1, look, facts(p['registration'], 'xy')))
         return out
 
@@ -247,12 +248,12 @@ class TestAssumptions(unittest.TestCase):
         self.assertGreater(wide['conversation_share'], R.FAMILY_SHARE)
         self.assertEqual(wide['assumptions']['status'], 'unsupported')
         self.assertEqual(wide['assumptions']['checks']['conversation_share']['limit'], R.FAMILY_SHARE)
-        self.assertEqual(wide['standing'], 'decided (outside calibrated range)')
+        self.assertEqual(wide['standing'], 'decided (diagnostics failed: outside the calibrated family)')
         self.assertFalse(wide['counts_toward_leader'])
         self.assertIsNone(r['leader'])
         self.assertEqual(r['groups'][0]['leader_outside_calibration'], 'x')
-        self.assertTrue(any('Outside the calibrated range' in n for n in r['notes']))
-        self.assertIn('outside calibrated range', R.summary(r))
+        self.assertTrue(any('Diagnostics failed (outside the calibrated family)' in n for n in r['notes']))
+        self.assertIn('diagnostics failed: the data are outside the calibrated family', R.summary(r))
         for m in r['pairings']:
             self.assertIn(m['assumptions']['status'], ('supported', 'unsupported', 'unknown'))
 
@@ -265,7 +266,10 @@ class TestAssumptions(unittest.TestCase):
         self.assertIn('if the test\'s assumptions hold', r['guarantee'])
         self.assertIn('symmetric', r['guarantee'])
         text = R.summary(r)
-        self.assertIn('assumptions: supported', text)
+        self.assertIn('diagnostics passed; distribution assumptions unverified', text)
+        self.assertNotIn('within the calibrated range', text)
+        self.assertNotIn('within calibrated range', text)
+        self.assertEqual(r['pairings'][0]['assumptions']['summary'], 'diagnostics passed; distribution assumptions unverified')
         self.assertNotIn('at most 5% chance of any false verdict over', text.split('if its assumptions hold, ')[0])
 
     def test_repeated_deals_are_unsupported(self):
@@ -296,14 +300,24 @@ def match(root, name, a, b, nets, *, seeds=None, b_players=None, b_seeds=None, b
         (d / 'hands.jsonl').write_text('\n'.join(rows) + '\n')
 
 
+def stand_in(game, seed, button, hand, events):
+    """A record verifier for hand-written fixtures, which no engine dealt: only the chips must add up."""
+    net = hand.get('net')
+    return {'ok': isinstance(net, list) and sum(net) == 0, 'errors': [] if isinstance(net, list) and sum(net) == 0
+            else ['the chips do not add up']}
+
+
 class TestPairValidation(unittest.TestCase):
     """R4-#8: a duplicate deal counts only when b-first is a-first with the seats swapped."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
+        self.patch = mock.patch.object(R, 'verify_hand', stand_in)
+        self.patch.start()
 
     def tearDown(self):
+        self.patch.stop()
         self.tmp.cleanup()
 
     def test_mismatches_are_rejected_and_reported(self):
@@ -380,4 +394,4 @@ class TestAuditCounts(unittest.TestCase):
         s = summarize(total)
         self.assertEqual(s['audit'], {'verified': 2, 'opaque': 1, 'unverified': 0, 'unrecorded': 0,
                                       'tool_use_rejected': 1, 'unverified_rejected': 0, 'no_reply': 1})
-        self.assertEqual(s['identity'], {'attested': 2, 'unattested': 1, 'mismatch': 1})
+        self.assertEqual(s['identity'], {'match': 2, 'unattested': 1, 'mismatch': 1})

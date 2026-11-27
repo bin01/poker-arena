@@ -222,5 +222,84 @@ class TestBotsAndRatings(unittest.TestCase):
             self.assertEqual([h['hole'] for h in ha], [h['hole'] for h in hb])
 
 
+class TestVerifier(unittest.TestCase):
+    """verify_hand regenerates a recorded hand from its seed and replays its actions; any change to the cards,
+    board, actions, payouts or events is caught."""
+
+    @classmethod
+    def setUpClass(cls):
+        import copy, json, tempfile
+        from pathlib import Path
+        from poker_arena.runner import run_duplicate
+        cls.G = get_game('holdem')({'hands_per_match': 12})
+        cls.tmp = tempfile.TemporaryDirectory()
+        asyncio.run(run_duplicate(cls.G, ('rule', {'bot': 'rule', 'sims': 30}), ('random', {'bot': 'random'}),
+                                  list(range(40, 52)), Path(cls.tmp.name), log=lambda *a: None))
+        m = Path(cls.tmp.name) / 'rule__vs__random' / 'a-first'
+        rows = lambda f: [json.loads(l) for l in (m / f).read_text().splitlines()]
+        cls.hands, cls.events = rows('hands.jsonl'), rows('events.jsonl')
+        cls.copy = staticmethod(copy.deepcopy)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def check(self, h, events=None):
+        from poker_arena.games.holdem import verify_hand
+        evs = events if events is not None else [e for e in self.events if e['episode'] == h['hand']]
+        return verify_hand(self.G, h['seed'], h['hand'] % 2, h, evs)
+
+    def test_recorded_hands_verify(self):
+        for h in self.hands:
+            self.assertEqual(self.check(h), {'ok': True, 'errors': []})
+
+    def test_older_records_without_derived_fields_verify(self):
+        from poker_arena.games.holdem import DERIVED
+        h = max(self.hands, key=lambda h: len(h['actions']))
+        old = self.copy(h)
+        for k in DERIVED:
+            old.pop(k, None)
+        for a in old['actions']:
+            for k in DERIVED:
+                a.pop(k, None)
+        self.assertEqual(self.check(old)['errors'], [])
+        old['actions'][-1]['pot'] += 1
+        self.assertFalse(self.check(old)['ok'])
+        wrong = self.copy(h)
+        if any('to_call' in a for a in wrong['actions']):
+            next(a for a in wrong['actions'] if 'to_call' in a)['to_call'] = 999
+            self.assertFalse(self.check(wrong)['ok'])
+
+    def test_tampering_is_caught(self):
+        h = max(self.hands, key=lambda h: len(h['actions']))
+        cases = {
+            'duplicate aces': lambda x: x['hole'].__setitem__(0, ['As', 'As']),
+            'payoff': lambda x: x.__setitem__('net', [200000, -200000]),
+            'board': lambda x: x['board'].reverse(),
+            'amount': lambda x: x['actions'][-1].__setitem__('pot', x['actions'][-1]['pot'] + 1),
+            'out of turn': lambda x: x['actions'][0].__setitem__('seat', 1 - x['actions'][0]['seat']),
+            'dropped action': lambda x: x['actions'].pop(),
+            'won': lambda x: x.__setitem__('won', list(reversed(x['won']))),
+        }
+        for name, change in cases.items():
+            x = self.copy(h)
+            change(x)
+            r = self.check(x, [])
+            self.assertFalse(r['ok'], name)
+            self.assertTrue(r['errors'], name)
+        from poker_arena.games.holdem import verify_hand
+        self.assertFalse(verify_hand(self.G, h['seed'] + 1, h['hand'] % 2, h)['ok'])     # another deal
+        self.assertFalse(verify_hand(self.G, h['seed'], 1 - h['hand'] % 2, h)['ok'])     # the other button
+
+    def test_events_are_checked(self):
+        h = self.hands[0]
+        evs = self.copy([e for e in self.events if e['episode'] == h['hand']])
+        hole = next(e for e in evs if e['kind'] == 'hole')
+        hole['data']['cards'] = ['Ac', 'Ad']
+        self.assertFalse(self.check(h, evs)['ok'])
+        evs = [e for e in self.copy(self.events) if e['episode'] == h['hand'] and e['kind'] != 'result']
+        self.assertFalse(self.check(h, evs)['ok'])
+
+
 if __name__ == '__main__':
     unittest.main()

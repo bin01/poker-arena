@@ -149,10 +149,69 @@ class TestViewerData(unittest.TestCase):
         self.assertEqual(server.ratings_for(self.runs, 'pilot', boot=20)['run_audit']['totals'], a['totals'])
 
     def test_identity_of_a_call(self):
-        self.assertEqual(server._identity({'identity': 'unattested', 'served_model': 'x'}, 'x'), 'unattested')
-        self.assertEqual(server._identity({'served_model': 'claude-opus-5-5'}, 'claude-opus-5-5'), 'attested')
+        self.assertEqual(server._identity({'identity_match': 'unattested', 'served_model': 'x'}, 'x'), 'unattested')
+        self.assertEqual(server._identity({'served_model': 'claude-opus-5-5'}, 'claude-opus-5-5'), 'match')
         self.assertEqual(server._identity({'observed_model': 'claude-haiku-5'}, 'claude-opus-5-5'), 'mismatch')
         self.assertEqual(server._identity({}, 'claude-opus-5-5'), 'unattested')
+        # a reported model is not a matching one: 'attested' from the backend never displays as a match
+        probe = {'identity': 'attested', 'requested_model': 'claude-sonnet-5-5', 'observed_model': 'claude-haiku-5-5'}
+        self.assertEqual(server._identity(probe, 'claude-sonnet-5-5'), 'mismatch')
+        self.assertEqual(server._identity({'identity': 'attested', 'requested_model': 'claude-sonnet-5', 'observed_model': 'claude-sonnet-5-5'}, None), 'mismatch')
+        self.assertEqual(server._identity({'identity_match': 'mismatch', 'observed_model': 'claude-opus-5-5'}, 'claude-opus-5-5'), 'mismatch')
+        self.assertEqual(server._identity({'observed_models': ['gpt-6-luna', 'gpt-6-sol']}, 'gpt-6-luna'), 'mismatch')
+
+    def test_audit_never_calls_a_wrong_model_confirmed(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d).resolve()
+            m = root / 'r' / 'x__vs__y' / 'a-first'
+            m.mkdir(parents=True)
+            (m / 'config.json').write_text(json.dumps({'players': ['x', 'y'], 'specs': {'x': {'model': 'claude-sonnet-5-5'}, 'y': {'bot': 'rule'}}}))
+            (m / 'calls.jsonl').write_text(json.dumps({'player': 'x', 'identity': 'attested', 'requested_model': 'claude-sonnet-5-5',
+                                                       'observed_model': 'claude-haiku-5-5', 'audit': 'verified'}) + '\n')
+            a = server.audit(root, 'r')['players']['x']
+            self.assertEqual(a['identity'], {'mismatch': 1})
+            r = self.run_js_identity(a)
+            self.assertEqual(r, ['mismatch', 'wrong model'])
+
+    def run_js_identity(self, a):
+        script = (f'const Core = require({json.dumps(str(VIEWER / "core.js"))}); const s = Core.identityOf(null, {json.dumps(a)});'
+                  ' process.stdout.write(JSON.stringify([s, Core.IDENTITY[s]]));')
+        res = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=30)
+        return json.loads(res.stdout)
+
+    def test_quiz(self):
+        run = self.runs / 'pilot'
+        self.assertIsNone(server.quiz(self.runs, 'pilot'))
+        self.assertFalse(server.runs(self.runs)[0]['quiz'])
+        shutil.copy(Path(__file__).with_name('fixtures') / 'quiz.json', run / 'quiz.json')
+        try:
+            q = server.quiz(self.runs, 'pilot')
+            self.assertTrue(q['fixture'])
+            self.assertEqual(q['labels']['reference'], 'Reference bot')
+            self.assertEqual(q['labels']['rule'], 'Rule bot')                  # names from the run fill in the rest
+            self.assertTrue(server.runs(self.runs)[0]['quiz'])
+            self.assertIsNone(server.quiz(self.runs, '../..'))
+            with tempfile.TemporaryDirectory() as d:
+                server.export(self.runs, d)
+                self.assertTrue((Path(d) / 'data' / 'quiz-pilot.json').exists())
+        finally:
+            (run / 'quiz.json').unlink()
+
+    def test_cache_signature_covers_run_files(self):
+        run = self.runs / 'pilot'
+        before = server.signature(run)
+        names = {Path(p).name for p, *_ in before}
+        self.assertTrue({'plan.json', 'config.json', 'hands.jsonl', 'events.jsonl'} <= names)
+        plan = run / 'plan.json'
+        text = plan.read_text()
+        try:
+            plan.write_text(text + ' ')                                       # a verdict-only change: no .jsonl touched
+            self.assertNotEqual(server.signature(run), before)
+            (run / 'decisions.json').write_text('{}')
+            self.assertIn('decisions.json', {Path(p).name for p, *_ in server.signature(run)})
+        finally:
+            plan.write_text(text)
+            (run / 'decisions.json').unlink(missing_ok=True)
 
     def test_lifecycle_ineligible_is_terminal(self):
         with tempfile.TemporaryDirectory() as d:
@@ -544,7 +603,8 @@ class TestViewerLogic(unittest.TestCase):
         self.assertEqual([x[0] for x in r], ['unsupported', 'supported', 'unknown', 'supported'])
         self.assertIn('not established', r[0][1])
         self.assertEqual(r[0][2], 'outside calibrated range')
-        self.assertIn('which the data support', r[1][1])
+        self.assertIn('distribution assumptions remain unverified', r[1][1])
+        self.assertNotIn('data support', r[1][1])
         self.assertIn('not checked', r[2][1])
         for x in r:
             self.assertTrue(x[3])
@@ -579,21 +639,58 @@ class TestViewerLogic(unittest.TestCase):
         r = self.run_js('const by = {a: {strength: 300, component: 0}, b: {strength: -200, component: 0}};'
                         ' return [Core.basisOf({ci_basis: "blocks"}).short, Core.basisOf({basis: "conversations"}).key, Core.basisOf({}),'
                         ' Core.fitOf({a: "a", b: "b", edge: 270, ci95: [210, 330]}, by), Core.fitOf({a: "a", b: "b", edge: 480, ci95: [100, 860]}, by),'
-                        ' Core.fitOf({a: "a", b: "b", edge: 480, fitted_edge: 500, residual: -20, additivity: {warning: true}}, by)];')
+                        ' Core.fitOf({a: "a", b: "b", edge: 480, fitted_edge: 500, residual: -20, additivity: {warning: true}}, by),'
+                        ' Core.fitOf({a: "a", b: "b", edge: 480, fitted_edge: 480, residual: 0, additivity: {status: "untestable", z: null}}, by),'
+                        ' Core.fitOf({a: "a", b: "b", edge: 480, fitted_edge: 100, residual: 380, additivity: {status: "warning", z: 3.1}}, by),'
+                        ' Core.fitOf({a: "a", b: "b", edge: 480, fitted_edge: 470, residual: 10, additivity: {status: "ok", z: 0.2}}, by)];')
         self.assertEqual(r[0], 'within conversations')
         self.assertEqual(r[1], 'across')
         self.assertIsNone(r[2])
         self.assertEqual(r[3], {'fitted': 500, 'residual': -230, 'warn': True, 'estimated': True})
         self.assertFalse(r[4]['warn'])
         self.assertEqual(r[5], {'fitted': 500, 'residual': -20, 'warn': True, 'estimated': False})
+        self.assertEqual((r[6]['warn'], r[6]['untestable']), (False, True))   # insufficient evidence is not "off the fit"
+        self.assertEqual((r[7]['warn'], 'untestable' in r[7]), (True, False))
+        self.assertFalse(r[8]['warn'])
 
     def test_identity_and_names(self):
-        r = self.run_js('return [Core.identityOf({attestation: "unattested"}), Core.identityOf(null, {identity: {attested: 3}}),'
-                        ' Core.identityOf(null, {identity: {attested: 3, unattested: 1}}), Core.identityOf(null, {identity: {attested: 3, mismatch: 1}}),'
+        r = self.run_js('return [Core.identityOf({attestation: "unattested"}), Core.identityOf(null, {identity: {match: 3}}),'
+                        ' Core.identityOf(null, {identity: {match: 3, unattested: 1}}), Core.identityOf(null, {identity: {match: 3, mismatch: 1}}),'
                         ' Core.identityOf(null, {}), Core.identityOf(null, {identity: "unattested"}), Core.nameParts("Claude Sonnet · Default effort (protocol not recorded, 5 hands)"), Core.nameParts("Rule bot")];')
-        self.assertEqual(r[:6], ['unattested', 'attested', 'partly attested', 'mismatch', None, 'unattested'])
+        self.assertEqual(r[:6], ['unattested', 'match', 'partial', 'mismatch', None, 'unattested'])
         self.assertEqual(r[6], ['Claude Sonnet', 'Default effort', 'protocol not recorded, 5 hands'])
         self.assertEqual(r[7], ['Rule bot', '', ''])
+
+    def test_identity_never_trusts_bare_attested(self):
+        r = self.run_js('return [Core.identityOf({identity_status: "attested"}, {identity: {attested: 5}}), Core.identityOf({identity_match: "mismatch"}),'
+                        ' Core.ASSUME.supported];')
+        self.assertEqual(r[:2], [None, 'mismatch'])
+        self.assertEqual(r[2], 'diagnostics passed; distribution assumptions unverified')
+
+    def test_quiz_shape(self):
+        q = json.loads((Path(__file__).with_name('fixtures') / 'quiz.json').read_text())
+        r = self.run_js(f'const q = Core.quizOf({json.dumps(q)}); return [q.suite, q.spots.length, q.players.map(p => [p.player, p.correct, p.total, p.ev_lost_bb, p.reference]),'
+                        ' Core.quizOf({players: [{player: "m", score: 0.5, answers: [{spot: "s1", action: "call", ev_loss_bb: 2}]}], spots: [{id: "s1", correct: "fold"}]}),'
+                        ' Core.quizOf(null)];')
+        self.assertEqual(r[0], 'Poker fundamentals')
+        self.assertEqual(r[1], 6)
+        self.assertEqual(r[2][0], ['reference', 6, 6, 0, True])            # best first; the reference policy is flagged
+        self.assertEqual([p[0] for p in r[2]], ['reference', 'rule', 'station', 'random'])
+        self.assertAlmostEqual(r[2][1][3], 0.8)
+        alt = r[3]
+        self.assertEqual((alt['spots'][0]['best'], alt['players'][0]['correct'], alt['players'][0]['ev_lost_bb'], alt['players'][0]['score']), ('fold', 0, 2, 0.5))
+        self.assertIsNone(r[4])
+
+    def test_divergence_and_swings(self):
+        hand = HAND
+        r = self.run_js(f'const a = PokerTable.steps({json.dumps(hand)}).log; const b = JSON.parse(JSON.stringify(a));'
+                        ' const acts = b.filter(e => e.kind === "action"); const last = acts[acts.length - 1]; last.action = last.action === "fold" ? "call" : "fold";'
+                        ' return [Core.firstDifference(a, a), Core.firstDifference(a, b), last.street, last.step,'
+                        ' Core.bigSwings({0: 5, 1: -40, 2: 12, 3: 0, 4: 30}, 2), Core.bigSwings({0: 5, 1: -40}, 5, 10)];')
+        self.assertIsNone(r[0])
+        self.assertEqual((r[1]['street'], r[1]['steps'][1]), (r[2], r[3]))
+        self.assertEqual(r[4], [{'deal': 1, 'net': -40}, {'deal': 4, 'net': 30}])
+        self.assertEqual(r[5], [{'deal': 1, 'net': -40}])
 
     def test_table_context(self):
         r = self.run_js(f'const s = PokerTable.steps({json.dumps(HAND)}); return [s.steps.map(x => [x.toCall, x.potOdds && Math.round(x.potOdds * 100)]),'

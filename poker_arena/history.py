@@ -12,7 +12,9 @@ plays, i.e. the engine, agents, backends, runner and prompt template, not the ju
 version of its CLI). Only identical protocols and implementations pool: the same model with other
 instructions, isolation, tool policy, retry policy or conversation length is another player, and so is one
 played by other parsing, correction or tool-detection code or another CLI version, and a player from before
-protocols were recorded. An explicit equivalence list (`equivalences.json` beside the database:
+protocols were recorded. The implementation is taken hand by hand (`implementation_segments`): a code or CLI
+version change during a match splits the player at the hand it took effect, and a deal whose two plays
+straddle a change belongs to neither side. An explicit equivalence list (`equivalences.json` beside the database:
 {"implementations": [["5e6f7a8b", "9a0b1c2d", ...], ...], "reason": "..."}) merges implementations shown to
 play identically; each group pools under its first member, and the all-time output lists what was merged. A model whose recorded protocol predates the horizon carries it
 in its identity instead (`...#1a2b3c4d~h50`: 50 hands per conversation, memory reset at every match), so
@@ -22,8 +24,9 @@ one configured (in that run), is quarantined: listed, but left out of the all-ti
 under the same game settings pool (blinds and stacks change what bb/100 means); runs under other settings
 are listed as left out. The same pair often replays the same deal in several runs: each deal row keeps its
 seed and fingerprint, and the rating averages repeats into one observation. A duplicate pair is counted only
-if its b-first play is its a-first play with the seats swapped (ratings.check_pair); the rest are kept in the
-`rejected` table and listed.
+if its b-first play is its a-first play with the seats swapped (ratings.check_pair) and both of its hands replay
+from their seeds through the engine's record verifier (ratings.verify_play); the rest are kept in the `rejected`
+table and listed.
 
 All-time standings are descriptive only. Runs had different designs and stopped pairings at different
 times, so pooling them is not any run's preregistered test: no all-time verdict, rank or leader is decided.
@@ -48,7 +51,7 @@ from pathlib import Path
 
 from .stats import add, summarize, tally
 
-SCHEMA = 5
+SCHEMA = 6
 DB_NAME = 'arena.db'
 ALL = '*'   # the run name the viewer uses for the all-time leaderboard
 
@@ -59,7 +62,7 @@ CREATE TABLE IF NOT EXISTS matches (
     game TEXT, game_key TEXT, code_version TEXT, started REAL, hands_total INTEGER, hands_done INTEGER,
     finished INTEGER, config_sig TEXT, stamp TEXT, synced REAL);
 CREATE TABLE IF NOT EXISTS players (
-    run TEXT, pid TEXT, identity TEXT, label TEXT, kind TEXT, spec TEXT, PRIMARY KEY (run, pid));
+    run TEXT, pid TEXT, identity TEXT, label TEXT, kind TEXT, spec TEXT, PRIMARY KEY (run, pid, identity));
 CREATE TABLE IF NOT EXISTS hands (match_id TEXT, hand INTEGER, data TEXT, PRIMARY KEY (match_id, hand));
 CREATE TABLE IF NOT EXISTS deals (
     run TEXT, matchup TEXT, deal INTEGER, a TEXT, b TEXT, a_identity TEXT, b_identity TEXT,
@@ -88,13 +91,7 @@ def identity(pid: str, spec: dict, protocol: str | None = None, horizon: int | N
     return f'{backend}:{pid}{tag}'   # a CLI or command without a model setting: only its id says what it is
 
 
-def implementation_tag(cfg: dict, pid: str) -> str | None:
-    """The first 8 characters of the hash of what played `pid` in a match: the content hashes of the code that
-    plays (every recorded implementation file but the judge, ratings.py), the prompt template, and for a model
-    the version of its CLI. The implementation in force is the last accepted code change, if any. None when the
-    match recorded no implementation."""
-    changes = cfg.get('implementation_changes') or []
-    impl = (changes[-1].get('to') if changes else None) or cfg.get('implementation')
+def _tag(impl: dict | None, cli_versions: dict | None, cfg: dict, pid: str) -> str | None:
     if not isinstance(impl, dict) or not impl.get('files'):
         return None
     files = {k: v for k, v in impl['files'].items() if not k.endswith('/ratings.py')}
@@ -104,16 +101,65 @@ def implementation_tag(cfg: dict, pid: str) -> str | None:
         players, eff = cfg.get('players') or [], cfg.get('effective') or []
         seat = players.index(pid) if pid in players else None
         exe = (eff[seat] or {}).get('exe') if seat is not None and seat < len(eff) else None
-        cli = (cfg.get('cli_versions') or {}).get(exe) if exe else None
+        versions = cli_versions or {}
+        cli = versions.get(exe) if exe and exe in versions else (dict(sorted(versions.items())) or None)
     key = {'files': files, 'prompt_template': impl.get('prompt_template'), 'cli': cli}
     return hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()[:8]
 
 
-def match_identity(cfg: dict, pid: str) -> str:
-    """A player's identity in one match config."""
+def implementation_segments(cfg: dict, pid: str, state: dict | None = None) -> list[tuple[int, str | None]]:
+    """[(first hand, implementation tag)] of what played `pid` in a match, in hand order: the implementation
+    and CLI versions the match started with, then each accepted code change (implementation_changes), CLI
+    version change (cli_version_changes) and CLI version seen at a resume (state.json `resumes`) from the hand
+    it took effect. A tag is the first 8 characters of a hash of the code that plays (every recorded
+    implementation file but the judge, ratings.py), the prompt template and, for a model, the version of its CLI
+    (every recorded CLI version when its executable is not recorded)."""
+    impl, clis = cfg.get('implementation'), dict(cfg.get('cli_versions') or {})
+    steps = [(int(c.get('after_hand') or 0), 0, 'impl', c.get('to')) for c in cfg.get('implementation_changes') or []]
+    steps += [(int(c.get('after_hand') or 0), 1, 'cli', c.get('to')) for c in cfg.get('cli_version_changes') or []]
+    steps += [(int(r.get('after_hand') or 0), 2, 'cli', r.get('cli_versions'))
+              for r in (state or {}).get('resumes') or [] if r.get('cli_versions')]
+    out = [(0, _tag(impl, clis, cfg, pid))]
+    for at, _, kind, value in sorted(steps, key=lambda x: (x[0], x[1])):
+        if kind == 'impl' and isinstance(value, dict):
+            impl = value
+        elif kind == 'cli' and isinstance(value, dict):
+            clis = {**clis, **value}
+        tag = _tag(impl, clis, cfg, pid)
+        if tag != out[-1][1]:
+            out = [x for x in out if x[0] < at] + [(at, tag)]
+    return out
+
+
+def tag_at(segments, hand: int) -> str | None:
+    tag = segments[0][1] if segments else None
+    for at, t in segments:
+        if at <= hand:
+            tag = t
+    return tag
+
+
+def combined_tag(tags) -> str | None:
+    """One tag for play by several implementations (a deal whose two plays, or a match whose hands, were not
+    all played by the same one): never the tag of any of them, so such play pools with neither."""
+    tags = sorted({t for t in tags if t})
+    if len(tags) <= 1:
+        return tags[0] if tags else None
+    return hashlib.sha1('+'.join(tags).encode()).hexdigest()[:8]
+
+
+def implementation_tag(cfg: dict, pid: str, state: dict | None = None) -> str | None:
+    """The implementation tag of a whole match for `pid` (`implementation_segments`): its one tag, or
+    `combined_tag` of them when the code or a CLI changed during the match. None when the match recorded no
+    implementation."""
+    return combined_tag(t for _, t in implementation_segments(cfg, pid, state))
+
+
+def match_identity(cfg: dict, pid: str, state: dict | None = None, hand: int | None = None) -> str:
+    """A player's identity in one match config (at one hand of it, when `hand` is given)."""
     from .ratings import protocol_of
-    return identity(pid, (cfg.get('specs') or {}).get(pid, {}), protocol_of(cfg, pid), legacy_horizon(cfg, pid),
-                    implementation_tag(cfg, pid))
+    tag = implementation_tag(cfg, pid, state) if hand is None else tag_at(implementation_segments(cfg, pid, state), hand)
+    return identity(pid, (cfg.get('specs') or {}).get(pid, {}), protocol_of(cfg, pid), legacy_horizon(cfg, pid), tag)
 
 
 def legacy_horizon(cfg: dict, pid: str) -> int | None:
@@ -141,8 +187,10 @@ def connect(db) -> sqlite3.Connection:
             con.execute('ALTER TABLE deals ADD COLUMN fp TEXT')
             con.execute("UPDATE matches SET stamp = ''")
     row = con.execute("SELECT v FROM meta WHERE k = 'schema'").fetchone()
-    if row and int(row[0]) < 5:   # schemas 2-4: identities gain the protocol, horizon and implementation: read again
+    if row and int(row[0]) < 6:   # identities gain the protocol, horizon, implementation and its changes: read again
         with con:
+            con.execute('DROP TABLE players')
+            con.executescript(TABLES)
             con.execute("UPDATE matches SET stamp = ''")
     with con:
         con.execute("INSERT OR REPLACE INTO meta VALUES ('schema', ?)", (str(SCHEMA),))
@@ -168,7 +216,7 @@ def _lines(text: str):
 
 def _stamp(d: Path) -> str:
     parts = []
-    for name in ('config.json', 'hands.jsonl', 'events.jsonl', 'calls.jsonl', 'result.json'):
+    for name in ('config.json', 'hands.jsonl', 'events.jsonl', 'calls.jsonl', 'result.json', 'state.json'):
         try:
             st = (d / name).stat()
             parts.append(f'{name}:{st.st_size}:{st.st_mtime_ns}')
@@ -210,18 +258,22 @@ def sync(root, db=None) -> dict:
                 con.execute('DELETE FROM tallies WHERE match_id = ?', (mid,))
                 con.execute('DELETE FROM deals WHERE run = ? AND matchup = ?', (run, mdir.name))
             pids, specs = cfg.get('players', []), cfg.get('specs', {})
-            ids = [match_identity(cfg, p) for p in pids]
+            state = _state(d)
+            ids = [match_identity(cfg, p, state) for p in pids]
             hands = _lines(_read(d / 'hands.jsonl'))
             gk = game_key(cfg.get('game', {}))
             con.execute('INSERT OR REPLACE INTO matches VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', (
                 mid, run, mdir.name, d.name, json.dumps(pids), json.dumps(ids), json.dumps(cfg.get('game', {})), gk,
                 cfg.get('code_version'), cfg.get('started'), len(cfg.get('seeds', [])), len(hands),
                 int((d / 'result.json').exists()), sig, stamp, time.time()))
-            for p, ident in zip(pids, ids):
+            for p in pids:
                 spec = specs.get(p, {})
-                con.execute('INSERT OR REPLACE INTO players VALUES (?,?,?,?,?,?)', (
-                    run, p, ident, display_name(p, spec), 'bot' if 'bot' in spec else 'model',
-                    json.dumps({k: v for k, v in spec.items() if k in ('label', 'backend', 'model', 'effort', 'bot', 'sims')})))
+                every = {match_identity(cfg, p, state)} | {match_identity(cfg, p, state, at)
+                                                           for at, _ in implementation_segments(cfg, p, state)}
+                for ident in sorted(every):
+                    con.execute('INSERT OR REPLACE INTO players VALUES (?,?,?,?,?,?)', (
+                        run, p, ident, display_name(p, spec), 'bot' if 'bot' in spec else 'model',
+                        json.dumps({k: v for k, v in spec.items() if k in ('label', 'backend', 'model', 'effort', 'bot', 'sims')})))
             con.executemany('INSERT OR REPLACE INTO hands VALUES (?,?,?)',
                             [(mid, h['hand'], json.dumps(h)) for h in hands if 'hand' in h])
             counts, served = tally(d)
@@ -234,9 +286,19 @@ def sync(root, db=None) -> dict:
     return changed
 
 
+def _state(d: Path) -> dict:
+    try:
+        x = json.loads(_read(d / 'state.json') or '{}')
+    except ValueError:
+        return {}
+    return x if isinstance(x, dict) else {}
+
+
 def _sync_deals(con, mdir: Path, run: str, gk) -> int:
-    """The duplicate deals of one matchup that both plays have finished and that pass ratings.check_pair
-    (a is seat 0 of a-first); what fails is kept in `rejected` (deal -1: the whole conversation)."""
+    """The duplicate deals of one matchup that both plays have finished, that pass ratings.check_pair and whose
+    hands replay from their seeds (ratings.verify_play), a being seat 0 of a-first; what fails is kept in
+    `rejected` (deal -1: the whole conversation). Each deal carries its players' identities at that hand of
+    both plays: a deal played on both sides of a code or CLI version change gets an identity of its own."""
     a_dir, b_dir = mdir / 'a-first', mdir / 'b-first'
     if not (a_dir / 'config.json').exists() or not (b_dir / 'config.json').exists():
         return 0
@@ -248,28 +310,52 @@ def _sync_deals(con, mdir: Path, run: str, gk) -> int:
         cb = json.loads(_read(b_dir / 'config.json'))
     except ValueError:
         cb = None
-    from .ratings import check_pair, fingerprint
+    from .ratings import _hands, check_pair, fingerprint, verify_play
     players = cfg.get('players') or ['?', '?']
     a, b = players[:2]
-    ids = [match_identity(cfg, p) for p in (a, b)]
     game = cfg.get('game', {})
     bb = game.get('big_unit') or game.get('bb') or 1
     seeds = cfg.get('seeds', [])
-    ha = {h['hand']: h for h in _lines(_read(a_dir / 'hands.jsonl')) if 'hand' in h}
-    hb = {h['hand']: h for h in _lines(_read(b_dir / 'hands.jsonl')) if 'hand' in h}
+    ha, hb = _hands(a_dir), _hands(b_dir)
     good, rejected = check_pair(cfg, cb, ha, hb)
+    if good:
+        va, vb = verify_play(a_dir, cfg, {k: ha[k] for k in good}), verify_play(b_dir, cb, {k: hb[k] for k in good})
+        for k in list(good):
+            bad = [f'{side} hand {k} does not replay from its seed: {"; ".join(v[k]["errors"][:2])}'
+                   for side, v in (('a-first', va), ('b-first', vb)) if not v[k]['ok']]
+            if bad:
+                good.remove(k)
+                rejected.append({'hand': k, 'reason': '; '.join(bad)})
     con.execute('DELETE FROM deals WHERE run = ? AND matchup = ?', (run, mdir.name))
     con.execute('DELETE FROM rejected WHERE run = ? AND matchup = ?', (run, mdir.name))
     con.executemany('INSERT OR REPLACE INTO rejected VALUES (?,?,?,?)',
                     [(run, mdir.name, -1 if x['hand'] is None else x['hand'], x['reason']) for x in rejected])
+    sa, sb = _state(a_dir), _state(b_dir)
+    seg = {(side, p): implementation_segments(c, p, st) for side, c, st in (('a', cfg, sa), ('b', cb or {}, sb))
+           for p in (a, b)}
     rows = []
     for k in good:
         seed = seeds[k] if k < len(seeds) else None
+        ids = []
+        for p in (a, b):
+            tag = combined_tag([tag_at(seg[('a', p)], k), tag_at(seg[('b', p)], k)])
+            ids.append(identity(p, (cfg.get('specs') or {}).get(p, {}), _protocol(cfg, p), legacy_horizon(cfg, p), tag))
         rows.append((run, mdir.name, k, a, b, ids[0], ids[1], ha[k]['net'][0] + hb[k]['net'][1], bb, gk, seed,
                      fingerprint(game, seed, k % len(players))))
     con.executemany('INSERT OR REPLACE INTO deals (run, matchup, deal, a, b, a_identity, b_identity, net_a, bb, '
                     'game_key, seed, fp) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)', rows)
+    from .server import display_name
+    for p, ident in sorted({(a, r[5]) for r in rows} | {(b, r[6]) for r in rows}):
+        spec = (cfg.get('specs') or {}).get(p, {})
+        con.execute('INSERT OR REPLACE INTO players VALUES (?,?,?,?,?,?)', (
+            run, p, ident, display_name(p, spec), 'bot' if 'bot' in spec else 'model',
+            json.dumps({k: v for k, v in spec.items() if k in ('label', 'backend', 'model', 'effort', 'bot', 'sims')})))
     return len(rows)
+
+
+def _protocol(cfg, pid):
+    from .ratings import protocol_of
+    return protocol_of(cfg, pid)
 
 
 def current_labels(players_file='players.toml') -> dict:
