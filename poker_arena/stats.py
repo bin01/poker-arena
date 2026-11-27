@@ -6,7 +6,8 @@ Style (standard poker tracking definitions, per hand dealt):
     pfr    raised preflop
     af     aggression factor after the flop: (bets + raises) / calls
     wtsd   went to showdown, as a share of the hands where it saw the flop
-    wsd    won money at showdown, as a share of its showdowns
+    wsd    won the pot outright at showdown, as a share of its showdowns; a split pot is not a win, and is
+           counted separately as a showdown tie (sd_ties)
     talk   share of its decisions that came with table talk
 
 Operations (model players):
@@ -61,8 +62,12 @@ def tally(d: Path) -> tuple[dict, dict]:
             if len(h.get('board', [])) >= 3 and not folded_pre:
                 s['saw_flop'] += 1
             if h.get('showdown') and seat in contenders:
+                won = h.get('won') or [0] * len(players)
+                mine_won = seat < len(won) and won[seat] > 0
+                others = any(won[o] > 0 for o in contenders if o != seat and o < len(won))
                 s['showdowns'] += 1
-                s['won_sd'] += (h.get('won') or [0] * (seat + 1))[seat] > 0
+                s['won_sd'] += mine_won and not others
+                s['sd_ties'] += mine_won and others
             s['decisions'] += len(mine)
             s['talk'] += sum(bool(a.get('say')) for a in mine)
             s['corrected'] += sum(bool(a.get('note')) for a in mine)
@@ -99,6 +104,7 @@ def summarize(s: dict, served=()) -> dict:
         'vpip': _ratio(g('vpip'), g('hands')), 'pfr': _ratio(g('pfr'), g('hands')),
         'af': _ratio(g('aggr'), g('calls_post')) if g('calls_post') else None,
         'wtsd': _ratio(g('showdowns'), g('saw_flop')), 'wsd': _ratio(g('won_sd'), g('showdowns')),
+        'showdowns': int(g('showdowns')), 'won_sd': int(g('won_sd')), 'sd_ties': int(g('sd_ties')),
         'talk': _ratio(g('talk'), g('decisions')), 'decisions': int(g('decisions')),
         'corrected': int(g('corrected')), 'fallbacks': int(g('fallbacks')),
         'calls': int(g('calls')), 'retries': int(g('retries')),

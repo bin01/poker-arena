@@ -30,6 +30,7 @@ PACE_SECONDS = 1800   # the ETA uses the pace over the last half hour of finishe
 
 
 BOT_NAMES = {'random': 'Random bot', 'station': 'Calling station', 'rule': 'Rule bot'}
+FAMILIES = {'claude': 'Claude', 'codex': 'GPT', 'agy': 'Gemini', 'gemini': 'Gemini'}
 LABELS: dict = {}   # labels from the current players.toml, which win over the ones recorded in old runs
 PLAYERS_FILE = ['players.toml']
 
@@ -56,7 +57,11 @@ def display_name(pid: str, spec: dict) -> str:
     if 'bot' in spec:
         return BOT_NAMES.get(spec['bot'], f'{spec["bot"]} bot')
     if not spec.get('model'):
-        return pid
+        family = FAMILIES.get(spec.get('backend'))
+        if not family:
+            return pid
+        name = f'{family} (model not recorded)'
+        return name + (f' · {spec["effort"].title()}' if spec.get('effort') else '')
     from .runner import EFFORT_BACKENDS
     effort = spec.get('effort') or ('default' if spec.get('backend') in EFFORT_BACKENDS else '')
     name = pretty_model(str(spec['model']))
@@ -140,25 +145,73 @@ def _matchup(root: Path, m: Path):
             'times': [h['t'] for s in hands.values() for h in s if h.get('t')]}
 
 
+def _plan_specs(plan_path: Path, plan: dict) -> dict:
+    """The specs of a plan's players from its players file, if that file can still be found."""
+    from .runner import load_players
+    name = plan.get('players_file') or PLAYERS_FILE[0]
+    for f in (Path(name), plan_path.parent / name, Path(PLAYERS_FILE[0])):
+        try:
+            return load_players(f, plan.get('effort'))
+        except Exception:
+            continue
+    return {}
+
+
+def _who(pid, specs: list) -> tuple:
+    """(name, kind) for a player that hasn't played yet: from the first spec source that knows it."""
+    for src in specs:
+        if pid in src:
+            s = src[pid]
+            return LABELS.get(pid) or display_name(pid, s), 'bot' if 'bot' in s else 'model'
+    return LABELS.get(pid) or pid, None
+
+
 def _runs_and_matchups(root: Path):
     """{run: [matchup]} including matchups a plan.json lists that haven't started."""
-    by = {}
+    by, seen = {}, {}
     for cfg in sorted(root.rglob('a-first/config.json')):
         m = _matchup(root, cfg.parent.parent)
         by.setdefault(m['run'], []).append(m)
+        seen.setdefault(m['run'], {}).update((_json(cfg) or {}).get('specs', {}))
     for plan_path in root.rglob('plan.json'):
         plan = _json(plan_path) or {}
         rel = plan_path.parent.relative_to(root)
         run = str(rel) if str(rel) != '.' else '.'
         have = {(m['a'], m['b']) for m in by.get(run, [])}
-        for a, b in plan.get('matchups', []):
-            if (a, b) not in have:
-                by.setdefault(run, []).append({
-                    'id': str(rel / f'{a}__vs__{b}') if run != '.' else f'{a}__vs__{b}', 'run': run, 'a': a, 'b': b,
-                    'started': False, 'round': 1, 'matches': [], 'deals_total': plan.get('deals', 0), 'pairs_done': 0,
-                    'pair_net_a': 0, 'kinds': {}, 'labels': {**{k: v for k, v in plan.get('labels', {}).items() if v != k}, **LABELS}, 'bb': 1, 'live': False, 'finished': False,
-                    'updated': 0, 'times': []})
+        missing = [(a, b) for a, b in plan.get('matchups', []) if (a, b) not in have]
+        if not missing:
+            continue
+        from .runner import EFFORT_BACKENDS
+        here = [{p: {'label': lab, **({'bot': True} if m['kinds'].get(p) == 'bot' else {})} for p, lab in m['labels'].items()}
+                for m in by.get(run, [])]
+        effort = plan.get('effort')
+        elsewhere = [{p: {**s, 'effort': effort or s.get('effort')} if effort and s.get('backend') in EFFORT_BACKENDS else s
+                      for p, s in specs.items()} for r, specs in seen.items() if r != run]
+        sources = here + [_plan_specs(plan_path, plan)] + elsewhere
+        for a, b in missing:
+            (la, ka), (lb, kb) = _who(a, sources), _who(b, sources)
+            by.setdefault(run, []).append({
+                'id': str(rel / f'{a}__vs__{b}') if run != '.' else f'{a}__vs__{b}', 'run': run, 'a': a, 'b': b,
+                'started': False, 'round': 1, 'matches': [], 'deals_total': plan.get('deals', 0), 'pairs_done': 0,
+                'pair_net_a': 0, 'kinds': {p: k for p, k in ((a, ka), (b, kb)) if k}, 'labels': {a: la, b: lb},
+                'bb': 1, 'live': False, 'finished': False, 'updated': 0, 'times': []})
     return by
+
+
+def roster(root: Path, run: str) -> list:
+    """Every player of a run, from its plan when there is one, with where it stands: awaiting its first
+    matchup, playing, or done."""
+    ms = _runs_and_matchups(root).get(run, [])
+    plan = _json((root if run == '.' else root / run) / 'plan.json') or {}
+    names = list(plan.get('players') or [])
+    names += sorted(({m['a'] for m in ms} | {m['b'] for m in ms}) - set(names))
+    out = []
+    for p in names:
+        mine = [m for m in ms if p in (m['a'], m['b'])]
+        status = ('done' if mine and all(m['finished'] for m in mine)
+                  else 'playing' if any(m['started'] for m in mine) else 'awaiting')
+        out.append({'player': p, 'status': status})
+    return out
 
 
 def _public(m):
@@ -251,7 +304,16 @@ def ratings_for(root: Path, run, boot=200):
     base = root if run in (None, '', '.') else (root / run).resolve()
     if root != base and root not in base.parents:
         return None
-    return ratings(base, boot=boot)
+    r = ratings(base, boot=boot)
+    key = run if run not in (None, '') else '.'
+    r.setdefault('roster', roster(root, key))
+    labels, kinds = {}, {}
+    for m in _runs_and_matchups(root).get(key, []):
+        labels.update(m['labels'])
+        kinds.update(m['kinds'])
+    r['labels'] = {**labels, **(r.get('labels') or {})}
+    r['kinds'] = {**kinds, **(r.get('kinds') or {})}
+    return r
 
 
 def key(s: str) -> str:

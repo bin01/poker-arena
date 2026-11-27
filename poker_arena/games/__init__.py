@@ -1,5 +1,5 @@
 """Game registry. Add a game by writing a module with a `Game` subclass and registering it here."""
-from .base import Game, Episode, Event, Request
+from .base import Game, Episode, Event, Request, deal_fingerprint
 
 GAMES = {}
 
@@ -17,4 +17,4 @@ def get_game(name: str):
     return GAMES[name]
 
 
-__all__ = ['Game', 'Episode', 'Event', 'Request', 'register', 'get_game', 'GAMES']
+__all__ = ['Game', 'Episode', 'Event', 'Request', 'register', 'get_game', 'GAMES', 'deal_fingerprint']

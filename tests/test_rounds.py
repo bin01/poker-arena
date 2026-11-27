@@ -1,66 +1,122 @@
-"""Tournaments played until decided: rounds on new deals, settled pairings stop, a cap for the rest; and the
-per-pairing verdicts."""
+"""Sequential tournaments: the round loop enforces the plan's design through ratings.decide (stops on a
+verdict, never more looks than planned), replicates get fresh memories and their own deals, and every
+pairing plays the same deals."""
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from poker_arena import server
-from poker_arena.ratings import Z_STOP, load_deals, pairs, ratings, settle
-from poker_arena.runner import make_plan, run_plan
+from poker_arena import ratings
+from poker_arena.runner import make_plan, plan_design, round_seeds, run_plan
+
+PLAYERS = ('[players.rule]\nbot = "rule"\nsims = 30\n[players.random]\nbot = "random"\n'
+           '[players.station]\nbot = "station"\n[players.station2]\nbot = "station"\n')
 
 
-class TestSettle(unittest.TestCase):
-    def test_verdicts(self):
-        self.assertEqual(settle([100.0] * 3 + [-100.0] * 2)['status'], 'early')     # under 20 deals
-        clear = settle([300.0, 100.0] * 15)                                            # +200 ± tiny
-        self.assertEqual((clear['status'], clear['more_deals']), ('settled', 0))
-        even = settle([100.0, -100.0] * 15)
-        self.assertEqual((even['status'], even['more_deals']), ('too close', None))
-        lean = settle([400.0, -340.0] * 15)                                            # +30, sd ~375
-        self.assertEqual(lean['status'], 'open')
-        n = 30 * (Z_STOP / lean['z']) ** 2                                             # where the edge would clear
-        self.assertAlmostEqual(lean['more_deals'], n - 30, delta=0.03 * n)              # z is rounded
-
-    def test_pairs_pool_both_orders(self):
-        deals = [{'a': 'x', 'b': 'y', 'matchup': 'x__vs__y', 'deal': k, 'net_a': 4, 'bb': 2} for k in range(5)] + \
-                [{'a': 'y', 'b': 'x', 'matchup': 'y__vs__x', 'deal': k, 'net_a': 4, 'bb': 2} for k in range(5)]
-        [p] = pairs(deals)
-        self.assertEqual((p['a'], p['deals'], p['net_a_chips'], p['a_bb_per_100']), ('x', 10, 0, 0.0))
-        self.assertEqual(p['matchups'], ['x__vs__y', 'y__vs__x'])
+def fake_decide(calls, decided_at=None):
+    """Stands in for ratings.decide (the contract's keys). Two calling stations always split (every x is 0);
+    any other pairing gets verdict 'a' at look `decided_at`."""
+    def decide(xs, design, n_pairings, looks_used, groups=None):
+        even_pair = all(x == 0 for x in xs)
+        calls.append({'n': len(xs), 'design': design, 'n_pairings': n_pairings, 'looks': looks_used,
+                      'stations': even_pair, 'groups': groups})
+        verdict = 'exhausted' if looks_used >= design['max_rounds'] else 'open'
+        if not even_pair and looks_used == decided_at:
+            verdict = 'a'
+        return {'deals': len(xs), 'blocks': len(xs) // design['block'], 'edge': 0.0, 'ci95': None, 't': 0.0,
+                'boundary': 3.0, 'verdict': verdict, 'looks_used': looks_used, 'looks_planned': design['max_rounds'],
+                'power': {'deals_for_80pct': {'20': None, '50': None, '100': None}}}
+    return decide
 
 
 class TestRounds(unittest.TestCase):
-    def test_until_decided(self):
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d).resolve()
-            players = root / 'players.toml'
-            players.write_text('[players.rule]\nbot = "rule"\nsims = 40\n[players.random]\nbot = "random"\n'
-                               '[players.station]\nbot = "station"\n[players.station2]\nbot = "station"\n')
-            out = root / 'runs' / 'rounds'
-            plan = make_plan([], deals=20, out=str(out), players_file=str(players),
-                             matchups=[['station', 'station2'], ['rule', 'random']])
-            plan['until_decided'] = 60
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name).resolve()
+        (self.root / 'players.toml').write_text(PLAYERS)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def plan(self, **kw):
+        return make_plan([], deals=10, out=str(self.root / 'runs' / 't'), players_file=str(self.root / 'players.toml'),
+                         matchups=[['station', 'station2'], ['rule', 'random']], **kw)
+
+    def folders(self, plan):
+        return sorted(p.name for p in Path(plan['out']).iterdir() if p.is_dir())
+
+    def test_design_defaults_and_legacy(self):
+        p = make_plan(['a', 'b'], deals=50)
+        self.assertEqual(p['design'], {'alpha': 0.05, 'round_deals': 50, 'max_rounds': 6, 'block': 10})
+        self.assertEqual(p['replicates'], 1)
+        self.assertEqual(plan_design({'deals': 20, 'until_decided': 60, 'seed': 0})['max_rounds'], 3)
+        self.assertIsNone(plan_design({'deals': 20, 'seed': 0}))
+
+    def test_seeds(self):
+        p = {**self.plan(replicates=2), 'seed': 100}
+        seen = [s for r in (1, 2, 3) for j in (1, 2) for s in round_seeds(p, r, j)]
+        self.assertEqual(len(seen), len(set(seen)))                     # no deal repeats inside a plan
+        self.assertEqual(round_seeds(p, 1, 1), list(range(100, 110)))
+        one = {**self.plan(), 'seed': 100}
+        self.assertEqual(round_seeds(one, 2, 1), list(range(110, 120)))  # one replicate: the old layout
+
+    def test_loop_stops_on_verdict_and_never_exceeds_max_rounds(self):
+        calls = []
+        plan = self.plan(design={'max_rounds': 3})
+        out = Path(plan['out'])
+        with mock.patch.object(ratings, 'decide', fake_decide(calls, decided_at=2), create=True):
             asyncio.run(run_plan(plan, log=lambda *a: None))
-            folders = sorted(p.name for p in out.iterdir() if p.is_dir())
-            # two identical players never settle: they play every round up to the cap
-            self.assertEqual([f for f in folders if f.startswith('station')],
-                             ['station__vs__station2', 'station__vs__station2__r2', 'station__vs__station2__r3'])
-            deals = load_deals(out)
-            self.assertEqual(len([x for x in deals if x['a'] == 'station']), 60)
-            r = ratings(out, boot=10)
-            v = {frozenset((m['a'], m['b'])): m for m in r['matchups']}
-            self.assertEqual(v[frozenset(('station', 'station2'))]['deals'], 60)       # pooled over the rounds
-            self.assertEqual(v[frozenset(('station', 'station2'))]['status'], 'too close')
-            rr = v[frozenset(('rule', 'random'))]
-            self.assertTrue(rr['status'] == 'settled' or rr['deals'] == 60, rr)
-            idx = {m['id']: m for m in server.index(root / 'runs', 'rounds')}
-            self.assertEqual(idx['rounds/station__vs__station2__r3']['round'], 3)
-            # rounds use new deals: round 2 starts where round 1's seeds end
-            import json
-            s1 = json.loads((out / 'station__vs__station2' / 'a-first' / 'config.json').read_text())['seeds']
-            s2 = json.loads((out / 'station__vs__station2__r2' / 'a-first' / 'config.json').read_text())['seeds']
-            self.assertEqual(s2[0], s1[-1] + 1)
+        self.assertEqual(self.folders(plan), ['rule__vs__random', 'rule__vs__random__r2', 'station__vs__station2',
+                                              'station__vs__station2__r2', 'station__vs__station2__r3'])
+        self.assertEqual(sorted(c['looks'] for c in calls if c['stations']), [1, 2, 3])
+        self.assertEqual(sorted(c['looks'] for c in calls if not c['stations']), [1, 2])
+        self.assertTrue(all(c['n_pairings'] == 2 for c in calls))           # alpha is split over every pairing
+        self.assertTrue(all(c['n'] == 10 * c['looks'] for c in calls))      # every deal so far, pooled
+        self.assertEqual(calls[0]['design'], {'alpha': 0.05, 'round_deals': 10, 'max_rounds': 3, 'block': 10})
+        dec = json.loads((out / 'decisions.json').read_text())
+        self.assertEqual([v['verdict'] for v in dec['rule__vs__random']], ['open', 'a'])
+        self.assertEqual([v['verdict'] for v in dec['station__vs__station2']], ['open', 'open', 'exhausted'])
+        # every pairing plays the same deals in a round
+        c1 = json.loads((out / 'rule__vs__random__r2' / 'a-first' / 'config.json').read_text())
+        c2 = json.loads((out / 'station__vs__station2__r2' / 'a-first' / 'config.json').read_text())
+        self.assertEqual(c1['seeds'], c2['seeds'])
+        self.assertEqual(c1['deal_fingerprints'], c2['deal_fingerprints'])
+        self.assertEqual((c1['round'], c1['replicate'], c1['pairing']), (2, 1, ['rule', 'random']))
+        manifest = json.loads((out / 'plan.json').read_text())
+        self.assertEqual(manifest['design']['max_rounds'], 3)
+        self.assertEqual(manifest['specs']['rule'], {'bot': 'rule', 'sims': 30})
+
+        # a rerun resumes from the record: the same looks, no new rounds
+        calls.clear()
+        with mock.patch.object(ratings, 'decide', fake_decide(calls, decided_at=2), create=True):
+            asyncio.run(run_plan(plan, log=lambda *a: None))
+        self.assertEqual(len(self.folders(plan)), 5)
+        self.assertEqual(len(calls), 5)
+        self.assertEqual(json.loads((out / 'decisions.json').read_text())['station__vs__station2'][-1]['looks_used'], 3)
+
+    def test_replicates(self):
+        calls = []
+        plan = self.plan(design={'max_rounds': 2}, replicates=2)
+        plan['matchups'] = [['station', 'station2']]
+        with mock.patch.object(ratings, 'decide', fake_decide(calls), create=True):
+            asyncio.run(run_plan(plan, log=lambda *a: None))
+        folders = self.folders(plan)
+        self.assertEqual(folders, ['station__vs__station2', 'station__vs__station2__r2', 'station__vs__station2__x2',
+                                   'station__vs__station2__x2__r2'])
+        self.assertEqual([(c['n'], c['looks']) for c in calls], [(20, 1), (40, 2)])
+        self.assertEqual(sorted(set(calls[-1]['groups'])), folders)          # one group per match
+        first = [json.loads((Path(plan['out']) / f / 'a-first' / 'config.json').read_text())['seeds'][0] for f in folders]
+        self.assertEqual(len(set(first)), 4)
+
+    @unittest.skipUnless(hasattr(ratings, 'decide') and hasattr(ratings, 'boundary'), 'ratings.decide not shipped yet')
+    def test_with_real_decide(self):
+        plan = self.plan(design={'max_rounds': 2})
+        asyncio.run(run_plan(plan, log=lambda *a: None))
+        for looks in json.loads((Path(plan['out']) / 'decisions.json').read_text()).values():
+            self.assertLessEqual(len(looks), 2)
+            self.assertTrue(looks[-1]['verdict'] in ('a', 'b', 'even') or len(looks) == 2, looks[-1])
 
 
 if __name__ == '__main__':

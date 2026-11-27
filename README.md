@@ -1,13 +1,13 @@
 # Poker Arena
 
 An eval in which language models play **duplicate No-Limit Texas Hold'em** against each other (and against
-three baseline bots), with a leaderboard on the Elo scale and a web viewer that replays every hand with each
-player's reasoning and table talk.
+three baseline bots), with standings in bb/100 that say how sure they are, and a web viewer that replays every
+hand with each player's reasoning and table talk.
 
 It borrows its shape from [Clocktower](https://github.com/dwarkeshsp/clocktower): every seat is one ongoing
 model conversation for a whole match, the dealer is plain seeded code, side-swapped pairs cancel the luck of the
-deal, one Bradley–Terry fit turns results into ratings with bootstrap intervals, and every call is logged so any
-result can be traced back to the hand and the reasoning behind it.
+deal, one paired-comparison fit turns results into strengths with bootstrap intervals, and every call is logged so
+any result can be traced back to the hand and the reasoning behind it.
 
 Models run through the labs' **official command-line tools signed in with your own subscription** (Claude
 Code, Codex, Antigravity), so a tournament costs nothing beyond the plans you already pay for.
@@ -36,13 +36,14 @@ Code, Codex, Antigravity), so a tournament costs nothing beyond the plans you al
 - **Bots.** `random` (random legal moves), `station` (always checks or calls) and `rule` (Monte Carlo equity
   against pot odds, value bets, never bluffs). They are free, play instantly, anchor the scale and catch a
   broken prompt or backend at once.
-- **Ratings.** Deals are grouped into sessions of 10 deals (20 hands). A player wins a session if it is up by
-  more than 1 big blind over it (closer is a tie). A player with fewer than 3 sessions is shown as provisional, with
-  no interval. One Bradley–Terry fit over all sessions gives an Elo-scale rating (200 points ≈ winning 76% of
-  sessions), centred on 1500, with 90% intervals from a bootstrap over sessions within each matchup. bb/100 (big
-  blinds won per 100 hands, with a standard error) is reported next to it. Sessions rather than single deals,
-  because most deals are tiny pots: counted one by one, a random bot that wins many small pots and loses whole
-  stacks rates near the top.
+- **Ratings.** Chips decide, as the models are told. A player's **strength** is its edge in bb/100 against the
+  average opponent of its group, from a least-squares fit over duplicate deals; the difference of two strengths
+  is the predicted edge between them. Intervals are 95%, from a block bootstrap that keeps runs of 10 deals
+  together (a model remembers earlier hands). A rank is shown only when a player is separated from every other
+  one after Holm's adjustment, and there is a leader only when one player is separated above all the others;
+  otherwise the standings say "No established leader yet". Session Elo (share of 10-deal sessions won) is shown
+  as a secondary statistic and never decides anything. [docs/methodology.md](docs/methodology.md) has the
+  method, the calibration results and the limits.
 
 ## Quick start
 
@@ -101,31 +102,38 @@ python -m poker_arena view runs/pilot                                 # follows 
 `tournament` resumes: rerun the same command after a crash or a stop, and each match continues after its last
 finished hand. Write your own plan with `python -m poker_arena plan A B C --deals 50 --out runs/mine --write plans/mine.json`.
 
-### How many deals it takes
+### How sure the results are
 
-Even with duplicate deals, one deal swings a lot: in the first model runs, the result per deal had a spread of
-about 350 bb/100. So the number of deals a pairing needs to show who is better depends on how far apart the two are
-(95% confidence, 80% chance of catching the edge):
+Even with duplicate deals, one deal swings a lot: in the first model runs the result per deal had a spread of
+about 340 bb/100. So the number of deals a pairing needs depends on how far apart the two players really are.
+For an 80% chance of catching the edge, with the default design and 3 pairings:
 
-| real gap | deals per pairing |
+| real edge | deals per pairing |
 |---|---|
-| 100 bb/100 (a mismatch) | ~100 |
-| 50 bb/100 (clearly better) | ~380 |
-| 20 bb/100 (solidly better) | ~2,400 |
-| 10 bb/100 (slightly better) | ~9,500 |
+| 100 bb/100 (a mismatch) | ~170 |
+| 50 bb/100 (clearly better) | ~680 |
+| 20 bb/100 (solidly better) | ~4,200 |
 
-Rather than guess, play until decided:
+Each pairing's verdict reports this table from its own observed spread (`power.deals_for_80pct`). It is a
+planning number, not a forecast for that pairing.
 
-```sh
-python -m poker_arena tournament plans/pilot.json --until-decided 1000
-```
+A plan carries a sequential **design**, by default `{"alpha": 0.05, "round_deals": 50, "max_rounds": 6,
+"block": 10}`: each pairing plays rounds of 50 deals, and after each round its result is checked against a
+stopping bar. Checking after every round gives a false winner more chances, so the bar is calibrated by
+simulation for exactly this schedule (a group-sequential design), and the 5% is split over the pairings
+(Bonferroni), so that with no real edge the chance of naming any false winner in the whole tournament stays
+under 5%. `tests/test_calibration.py` checks that on every test run for normal, heavy-tailed and poker-like
+results. A pairing ends with one of these verdicts:
 
-The plan's `deals` becomes a round. After each round, a pairing whose edge is settled stops; the rest play another
-round on new deals (the same new deals for every pairing still playing), up to 1,000 deals. Rounds go in their own
-folders (`a__vs__b__r2`, ...), each with fresh memories, and pool in the ratings. A pairing is **settled** when its
-edge is 2.7 standard errors from even, not 1.96: checking after every round gives a false winner more chances,
-and 2.7 keeps the chance under 5% for up to 25 checks (a simulated Pocock boundary). Running it again on a finished
-plan with `--until-decided` continues from the rounds already played, so a fixed-length run can be extended.
+- **a is better / b is better**: the edge crossed the bar.
+- **even**: the edge is shown to be within ±15 bb/100 (an equivalence test). This needs thousands of deals.
+- **undecided after every planned look**: the data can't tell the two apart at this size. That is *not*
+  evidence that they are equally good.
+- **undecided so far** (more rounds to come) or **too few deals to judge**.
+
+Repeated deals (the same pair on the same cards in another run) are averaged, not counted twice. Players with
+no exact model version recorded (no `model`, or a bare alias like `sonnet`) are not pooled into all-time
+standings. Players that never met, directly or through others, are ranked in separate groups.
 
 **How long it takes.** A model makes about 2–3 decisions per hand, and a CLI call takes roughly 5–30 seconds,
 so 100 hands take 30–90 minutes per model seat. The pilot is about 6,000 model calls: most of a day at
@@ -160,7 +168,9 @@ python -m poker_arena history runs     # update arena.db and print the all-time 
 
 The all-time leaderboard rates a player by **what it is: its model and reasoning level** (or a bot and its
 settings), not by its id in one run. Two ids with the same model and level pool their results, and the same model
-at another level is a different player. Sessions never span runs. Deals only pool when they were played under
+at another level is a different player. A player without an exact model version (no `model`, or a bare alias
+like `sonnet`) is listed but not rated, since two runs of it may not be the same model. A deal the same pair
+already played in another run (same seeds, same settings) is averaged with it rather than counted again. Deals only pool when they were played under
 the same game settings (blinds and stacks change what bb/100 means); runs under other settings are listed as
 left out. Deals between two entries of the same model and level don't count. Runs from different code versions do
 pool, and the leaderboard says so. The viewer shows it as **All runs** in the run picker.
@@ -170,26 +180,42 @@ pool, and the leaderboard says so. The viewer shows it as **All runs** in the ru
 `python -m poker_arena view runs` serves every run under `runs/` at http://127.0.0.1:8800, with a picker for the
 run (a tournament's `out` folder, or a `play --out`). It follows running matches live.
 
-The look is a card room: green felt, ivory cards, chips and brass. Players are shown by their `label` from
-`players.toml` (or a name made from their model), never by the CLI that runs them.
+The look is a card room: green felt, ivory cards, chips and brass. Players are always shown as a model and its
+reasoning level (e.g. "GPT-6 Luna · High", from `label` in `players.toml` or made from `model` and `effort`), never
+by the CLI that runs them. A player whose model wasn't recorded shows as, say, "GPT (model not recorded)".
 
-- **Standings.** Progress of the run (hands played, pace, time left), the top three as a hand of cards, then:
-  - **Ratings**: Elo with its 90% interval on a shared axis, bb/100 with its 95% margin (coloured only when the
-    margin excludes zero), sessions won–tied–lost. Only players with at least 3 sessions are ranked; the rest
-    are listed with how far they are from a rating.
-  - **Is it settled?**: for each pairing, the leader's edge with its margin, how close it is to settled, and
-    roughly how many more deals that takes at the current gap (or "too close to call", meaning over 10,000 more).
-    Above it, one line says whether the top player is the winner, and if not, what it still needs.
-  - **Head to head**: bb/100 for every pair, shaded when the edge is larger than its margin; a cell opens the matchup.
-  - **How they play**: VPIP, PFR, aggression after the flop, how often it goes to showdown and wins there, and
-    how often it talks.
-- **Matches.** Every matchup (playing, played, not started) with its score. A row of chips, one per deal,
-  coloured by who won it over both plays and brighter the bigger the swing. Each deal shows **both plays side by
-  side at the table** (same cards, seats swapped):
-  hole cards, board, every action in big blinds, the table talk, each decision's private reasoning (and the
-  CLI's own thinking where it exposes it), and each player's notes on its opponent. A move the model didn't make
-  (no playable answer, so the game checked or folded for it) and an illegal bet size are marked. **Replay** (or <kbd>space</kbd>) deals both plays again step by step. <kbd>←</kbd> <kbd>→</kbd> move between deals,
-  <kbd>r</kbd> hides the reasoning.
+- **Standings.** One line on what the page is, a **Watch the games** button, and a short *How to read the
+  standings* legend (open on the first visit, remembered once closed). Then:
+  - **Who is winning?** The established leader as an ace, only when a model beats every other model by more than
+    the noise. Otherwise a face-down card: *No established leader yet*, with who is ahead on points and how many
+    deals it would take to tell a 50 bb/100 edge apart.
+  - **Standings**: strength in bb/100 against the average opponent, with its 95% range on a shared axis around
+    zero. A rank number appears only when a model is clearly separated from the ones below it; otherwise `=`, and
+    "level with ..." names who it can't yet be told apart from. Net big blinds and hands, and session Elo (sessions
+    won–tied–lost and its interval) as a secondary number. Players still waiting to play are listed. When some
+    players have never been connected by games (the all-runs view), each group gets its own table. Players whose
+    exact model is unknown are shown under **Not rated**.
+  - **Matchups**: each pair's edge with its 95% range and the verdict of the sequential test (*wins*, *even*,
+    *undecided*, *no winner*, *too early*), how many of its planned checks it has used, the deals needed to detect
+    a 20/50/100 bb/100 edge, and a link to watch it.
+  - **Head to head** (three or more players): bb/100 for every pair, shaded when the range excludes zero.
+  - **How they play**: VPIP, PFR, aggression after the flop, how often it goes to showdown and wins there
+    outright (split pots apart), and how often it talks.
+- **Watch.** Every matchup (playing, played, not started). The header leads with the net big blinds over both
+  plays and bb/100, deals won as a second line, and the matchup's verdict. A row of chips, one per deal, coloured
+  by who won it over both plays. Each deal shows **both plays side by side at the table** (same cards, seats
+  swapped): stacks, the chips each seat has put in on this street, the player to act, board and pot all move step
+  by step, and the winner lights up only at the end. Below each table is a one-line-per-action log with the table
+  talk; **why?** opens that decision's private reasoning (and the CLI's own thinking where it exposes it),
+  **Reasoning** opens all of them. When the game changed a move, the log says what the model asked for, what was
+  played and why (*resized*, *asked again*, *auto-played*). Each model's notes on its opponent are folded below.
+  Keys: <kbd>space</kbd> play or pause, <kbd>,</kbd> <kbd>.</kbd> step, <kbd>←</kbd> <kbd>→</kbd> deals,
+  <kbd>r</kbd> reasoning. `?deal=12&step=4` in the address opens a deal at a step.
+- **Live.** A run with a table playing refreshes every 6 seconds, an unfinished but quiet one every minute; the
+  header shows the last action and when the page last checked. A refresh never interrupts a replay.
+
+The table (`viewer/table.js`) is its own component: it builds one snapshot per step from a hand's events and
+shows any snapshot, for two or three seats, with a seat's cards optionally face down, so a human seat can reuse it.
 
 ```sh
 python -m poker_arena status runs                 # the same progress in the terminal
@@ -229,4 +255,5 @@ plugged in as a `command` backend if you want to compare harnesses.
     is a condensed version read from agy's transcript.
   Every reply also carries its own `reasoning` field, so the viewer has something for every model.
 - Results from different backends of the same model (CLI vs API) shouldn't be mixed on one leaderboard.
-- 50 deals per matchup separates large skill gaps; close models need several hundred.
+- 50 deals per pairing separates only large skill gaps; close models need several hundred to thousands (see
+  "How sure the results are").

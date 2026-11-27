@@ -18,20 +18,21 @@ def cmd_play(args):
     res = asyncio.run(run_duplicate(game, (args.a, players[args.a]), (args.b, players[args.b]), seeds, Path(args.out)))
     for label, r in zip(('a-first', 'b-first'), res):
         print(label, dict(zip(r['players'], r['net'])))
-    from .ratings import ratings, table, SESSION
-    print(table(ratings(args.out, boot=100)))
-    if args.deals < SESSION:
-        print(f'\nElo needs at least {SESSION // 2} deals per matchup (sessions are {SESSION} deals); '
-              f'with {args.deals} only bb/100 is meaningful.')
+    from .ratings import ratings, summary
+    print(summary(ratings(args.out, boot=100)))
 
 
 def cmd_plan(args):
+    design = {k: v for k, v in (('alpha', args.alpha), ('max_rounds', args.max_rounds), ('block', args.block)) if v is not None}
     plan = make_plan(args.players_list, deals=args.deals, seed=args.seed, out=args.out, players_file=args.players,
-                     concurrency=args.concurrency)
+                     concurrency=args.concurrency, design=design, replicates=args.replicates)
     text = json.dumps(plan, indent=2)
     if args.write:
         Path(args.write).write_text(text + '\n')
-        print(f'wrote {args.write}: {len(plan["matchups"])} matchups, {2 * len(plan["matchups"]) * args.deals} hands')
+        d, n = plan['design'], len(plan['matchups'])
+        per_round = 2 * n * args.deals * plan['replicates']
+        print(f'wrote {args.write}: {n} pairings, {per_round} hands per round, at most {d["max_rounds"]} rounds '
+              f'({per_round * d["max_rounds"]} hands); a pairing stops once decided (alpha {d["alpha"]} over all pairings)')
     else:
         print(text)
 
@@ -43,31 +44,30 @@ def cmd_tournament(args):
     if args.until_decided:
         plan['until_decided'] = args.until_decided
     if args.dry_run:
+        from .runner import plan_design
+        d = plan_design(plan)
+        reps = plan.get('replicates', 1)
         for a, b in plan['matchups']:
-            more = f', then rounds of {plan["deals"]} until settled (at most {plan["until_decided"]} deals)' \
-                if plan.get('until_decided') else ''
-            print(f'{a} vs {b}: 2 x {plan["deals"]} hands -> {plan["out"]}/{a}__vs__{b}{more}')
+            more = (f', in rounds; stops once decided, at most {d["max_rounds"]} rounds '
+                    f'({d["max_rounds"] * plan["deals"]} deals)') if d else ''
+            print(f'{a} vs {b}: {reps} x 2 x {plan["deals"]} hands per round -> {plan["out"]}/{a}__vs__{b}{more}')
         return
     asyncio.run(run_plan(plan, only=args.only, concurrency=args.concurrency))
-    from .ratings import ratings, table, verdicts
-    r = ratings(plan['out'], boot=200)
-    print(table(r) + '\n\n' + verdicts(r))
+    from .ratings import ratings, summary
+    print(summary(ratings(plan['out'])))
 
 
 def cmd_ratings(args):
-    from .ratings import ratings, table
-    anchor = None
-    if args.anchor:
-        name, value = args.anchor.split('=')
-        anchor = (name, float(value))
-    r = ratings(args.root, boot=args.boot, anchor=anchor)
+    from .ratings import ratings, summary
+    r = ratings(args.root, boot=args.boot)
     if args.json:
         Path(args.json).write_text(json.dumps(r, indent=2))
-    print(table(r))
-    from .ratings import verdicts
-    print('\n' + verdicts(r))
-    print(f'\n{r["deals"]} duplicate deals in {r["sessions"]} sessions of {r["session_deals"]} deals '
-          f'({2 * r["session_deals"]} hands). Elo: chance of winning a session; bb/100: big blinds won per 100 hands.')
+    if not r['players']:
+        print('No finished duplicate deals yet.')
+        return
+    print(summary(r))
+    print(f'\n{r["deals"]} duplicate deals ({r["hands"]} hands), {r["observations"]} distinct. Strength and verdicts: '
+          f'{r["objective"]}; session Elo: share of {r["session_deals"]}-deal sessions won (secondary).')
 
 
 def cmd_view(args):
@@ -89,13 +89,10 @@ def cmd_history(args):
         print('No finished duplicate deals yet.')
         return
     print(history.table(r))
-    print(f'\n{r["deals"]:,} duplicate deals from {len(r["runs"])} runs, one player per model and reasoning level.')
-    for x in r['left_out']:
-        print(f'Left out: {x["run"]} (other game settings)')
+    print(f'\n{r["deals"]:,} duplicate deals from {len(r["runs"])} runs ({r["observations"]:,} distinct), '
+          f'one player per model and reasoning level.')
     if len(r['code_versions']) > 1:
-        print(f'Played on {len(r["code_versions"])} code versions: {", ".join(r["code_versions"])}')
-    if r['unversioned_runs']:
-        print(f'From before code versions were recorded: {", ".join(r["unversioned_runs"])}')
+        print(f'Code versions: {", ".join(r["code_versions"])}')
 
 
 def cmd_export(args):
@@ -173,7 +170,7 @@ def cmd_doctor(args):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog='poker_arena', description='LLM agents playing duplicate poker, rated on the Elo scale.')
+    ap = argparse.ArgumentParser(prog='poker_arena', description='LLM agents playing duplicate poker, rated by bb/100 over duplicate deals.')
     sub = ap.add_subparsers(dest='cmd', required=True)
 
     p = sub.add_parser('play', help='one duplicate pair between two players')
@@ -194,6 +191,10 @@ def main(argv=None):
     p.add_argument('--players', default='players.toml')
     p.add_argument('--concurrency', type=int, default=2)
     p.add_argument('--write', help='file to write the plan to (default: print it)')
+    p.add_argument('--max-rounds', type=int, help='rounds of --deals a pairing may play before it stops undecided (default 6)')
+    p.add_argument('--alpha', type=float, help='chance of naming any false winner across the whole tournament (default 0.05)')
+    p.add_argument('--block', type=int, help='deals per block in the uncertainty estimate (default 10)')
+    p.add_argument('--replicates', type=int, default=1, help='independent duplicate pairs per pairing per round, each with fresh memories')
     p.set_defaults(fn=cmd_plan)
 
     p = sub.add_parser('tournament', help='run (or resume) every matchup of a plan')
@@ -207,10 +208,10 @@ def main(argv=None):
                         'or at MAX_DEALS deals')
     p.set_defaults(fn=cmd_tournament)
 
-    p = sub.add_parser('ratings', help='Elo and bb/100 from every finished duplicate deal under a folder')
+    p = sub.add_parser('ratings', help='strength (bb/100), verdicts per pairing and session Elo from every finished '
+                                       'duplicate deal under a folder')
     p.add_argument('root', nargs='?', default='runs')
-    p.add_argument('--boot', type=int, default=300)
-    p.add_argument('--anchor', help='fix one player, e.g. station=1000 (default: players average 1500)')
+    p.add_argument('--boot', type=int, default=300, help='bootstrap resamples (default 300)')
     p.add_argument('--json', help='also write the ratings as JSON')
     p.set_defaults(fn=cmd_ratings)
 
@@ -247,7 +248,11 @@ def main(argv=None):
     p.set_defaults(fn=cmd_doctor)
 
     args = ap.parse_args(argv)
-    args.fn(args)
+    from .runner import ResumeMismatch
+    try:
+        args.fn(args)
+    except ResumeMismatch as e:
+        sys.exit(f'Not resuming: {e}')
 
 
 if __name__ == '__main__':

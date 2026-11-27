@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from poker_arena.backends import make_backend
+from poker_arena.backends import Backend, Reply, make_backend
 
 # A stand-in `agy` that checks the argument layout and answers like `agy --output-format json`.
 FAKE_AGY = r'''#!/usr/bin/env python3
@@ -43,6 +43,44 @@ class TestAgy(unittest.TestCase):
         self.assertTrue(json.loads(r2.text)['resumed'])
         self.assertEqual(be.session, 'conv-1')
         self.assertEqual(r1.usage, {'input_tokens': 1})
+
+
+class Echo(Backend):
+    stateful = True
+
+    async def _call(self, text):
+        out = await self.run(['echo', self.system, text])
+        self.session = 'sess'
+        return Reply(out.strip())
+
+
+class TestAuditAndRebuild(unittest.TestCase):
+    def test_argv_raw_and_describe(self):
+        be = Echo('SYSTEM ' * 100, timeout=5, retries=0, key='secret')
+        r = asyncio.run(be.send('hi'))
+        self.assertEqual(r.meta['argv'], ['echo', '<system prompt>', 'hi'])
+        self.assertEqual(r.meta['raw']['returncode'], 0)
+        d = be.describe()
+        self.assertEqual((d['timeout'], d['retries'], d['stateful']), (5, 0, True))
+        self.assertFalse({'system', 'turns', 'session', 'key', 'workdir'} & set(d))
+
+    def test_rebuild_replays_committed_turns(self):
+        be = Echo('SYS', retries=0)
+        asyncio.run(be.send('turn one'))
+        st = be.state()
+        fresh = Echo('SYS', retries=0)
+        fresh.restore(st)
+        self.assertEqual((fresh.session, fresh.rebuilding), ('sess', False))   # same folder: resume as is
+        gone = dict(st, workdir='/nonexistent/poker-arena')
+        lost = Echo('SYS', retries=0)
+        lost.restore(gone)
+        self.assertEqual((lost.session, lost.rebuilding), (None, True))        # folder gone: rebuild
+        r = asyncio.run(lost.send('turn two'))
+        self.assertIn('turn one', r.text)
+        self.assertIn('interrupted', r.text)
+        self.assertEqual(r.meta['rebuilt_from_turns'], 1)
+        self.assertFalse(lost.rebuilding)
+        self.assertEqual(lost.turns[-1][0], 'turn two')                       # the record keeps the real turn
 
 
 if __name__ == '__main__':

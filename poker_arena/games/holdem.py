@@ -4,10 +4,11 @@ Every hand is dealt from its own seed, so a duplicate match deals the same cards
 and only the models in those seats change. The button moves one seat each hand.
 
 Actions (the `action` field of a reply): fold, check, call, raise (with `amount`: the total you
-bet this street, "raise to"; a first bet on a street is also a raise), all_in. A raise below the
-minimum is raised to the minimum, one above your stack is an all-in, and the seat is told.
+bet this street, "raise to"; a first bet on a street is also a raise), all_in. `HoldemHand.apply` has the
+correction policy: strategically different or unplayable replies are sent back, fixable sizes are adjusted.
 """
 from __future__ import annotations
+import math
 import random
 
 from ..cards import shuffled, evaluate, describe
@@ -16,6 +17,27 @@ from .base import Game, Episode, Event, Request
 
 STREETS = ['preflop', 'flop', 'turn', 'river']
 ACTIONS = ['fold', 'check', 'call', 'raise', 'all_in']
+
+
+def whole_chips(x):
+    """(chips, None) for a usable amount, else (None, why not). Infinity, NaN, booleans and text are refused."""
+    if isinstance(x, bool) or x is None:
+        return None, 'The amount is missing.' if x is None else f'{x!r} is not an amount.'
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return None, f'{x!r} is not a number.'
+    if not math.isfinite(f):
+        return None, f'{x!r} is not a finite number.'
+    return int(round(f)), None
+
+
+def json_safe(x):
+    if x is None or isinstance(x, (bool, int, str)):
+        return x
+    if isinstance(x, float):
+        return x if math.isfinite(x) else str(x)
+    return str(x)
 
 
 def cards_text(cards):
@@ -154,28 +176,59 @@ class HoldemHand(Episode):
     def fallback(self, seat):
         return {'action': 'check' if 'check' in self.legal(seat) else 'fold'}
 
+    def raise_closed(self, seat):
+        """The seat may not raise only because the betting wasn't reopened (an all-in short of a full raise)."""
+        others = [i for i in self._in_hand() if i != seat and self.stacks[i] > 0]
+        return not self.can_raise[seat] and bool(others) and self.street_bet[seat] + self.stacks[seat] > self.current_bet
+
     def apply(self, seat, action: dict) -> str | None:
-        """Apply a seat's reply; returns an error message (nothing changed) if it can't be played.
-        Fixable sizes are corrected, and the correction is returned in the logged action's `note`."""
+        """Apply a seat's reply, or return an error (nothing changed) so the seat is asked again.
+
+        The correction policy: an action that isn't allowed, or that would have to become a strategically
+        different action (fold when you can check, raise when the betting is closed, a raise that isn't
+        above the current bet, a missing or non-finite amount), is an error. A legal intent whose size can't
+        be played is adjusted: a call with nothing to call is a check, a raise when you can only call (all in,
+        or against an all-in) is a call, a raise below the minimum is the minimum, one above your stack is
+        all in. The logged action then carries `requested`, `correction` = {kind: 'sizing', reason} and
+        `note` (the reason, which the seat is shown)."""
         assert not self.done and seat == self.to_act
         kind = str(action.get('action') or '').strip().lower().replace('-', '_').replace(' ', '_')
         kind = {'bet': 'raise', 'allin': 'all_in', 'shove': 'all_in', 'jam': 'all_in'}.get(kind, kind)
         legal = self.legal(seat)
         tc, rb = self.to_call(seat), self.raise_bounds(seat)
         note = None
-        if kind == 'check' and 'check' not in legal:
-            return f'You cannot check: there is {tc} to call. Choose fold, call' + (' or raise.' if rb else '.')
-        if kind == 'call' and 'call' not in legal:
-            kind, note = 'check', 'nothing to call: treated as a check'
-        if kind == 'fold' and 'fold' not in legal:
-            kind, note = 'check', 'nothing to call: a fold is treated as a check'
-        if kind in ('raise', 'all_in') and not rb:
-            if 'call' in legal:
-                kind, note = 'call', 'you cannot raise here: treated as a call'
-            else:
-                kind, note = 'check', 'you cannot raise here: treated as a check'
         if kind not in ACTIONS:
             return f'Unknown action {action.get("action")!r}. Use one of: {", ".join(legal)}.'
+        if kind == 'check' and 'check' not in legal:
+            return f'You cannot check: there is {tc} to call. Choose fold, call' + (' or raise.' if rb else '.')
+        if kind == 'fold' and 'fold' not in legal:
+            return 'You cannot fold: there is nothing to call. Choose check' + (' or bet.' if rb else '.')
+        if kind == 'call' and 'call' not in legal:
+            kind, note = 'check', 'nothing to call: treated as a check'
+        if kind in ('raise', 'all_in') and not rb:
+            if self.raise_closed(seat):
+                return ('You cannot raise: the last all-in was less than a full raise, so the betting is not '
+                        'reopened for you. Choose ' + ('fold or call.' if 'call' in legal else 'check.'))
+            if 'call' in legal:
+                kind, note = 'call', 'you can only call here (all in, or against an all-in): treated as a call'
+            else:
+                kind, note = 'check', 'you cannot bet here: treated as a check'
+        to = None
+        if kind == 'raise':
+            lo, hi = rb
+            asked = action.get('amount')
+            to, why = whole_chips(asked)
+            if why:
+                return f'{why} A raise needs "amount": your total for this street, a whole number from {lo} to {hi}.'
+            if isinstance(asked, float) and asked != to:
+                note = f'{asked} rounded to {to}'
+            if to > hi:
+                to, note = hi, f'{asked} is more than you have: all in for {hi}'
+            elif to <= self.current_bet:
+                return (f'A raise to {to} is not a raise: the bet this street is already {self.current_bet}. '
+                        f'"amount" is your total for this street (raise to), from {lo} to {hi}.')
+            elif to < lo:
+                to, note = lo, f'{asked} is below the minimum: raised to {lo}'
 
         say = str(action.get('say') or '').strip()
         entry = {'seat': seat, 'street': STREETS[self.street], 'action': kind, 'say': say}
@@ -189,18 +242,8 @@ class HoldemHand(Episode):
             if self.stacks[seat] == 0:
                 entry['all_in'] = True
         else:
-            lo, hi = rb
             if kind == 'all_in':
-                to = hi
-            else:
-                try:
-                    to = int(round(float(action.get('amount'))))
-                except (TypeError, ValueError):
-                    return f'A raise needs an amount: your total for this street, between {lo} and {hi}.'
-                if to > hi:
-                    to, note = hi, f'{action.get("amount")} is more than you have: all in for {hi}'
-                elif to < lo:
-                    to, note = lo, f'{action.get("amount")} is below the minimum: raised to {lo}'
+                to = rb[1]
             increment = to - self.current_bet
             full = increment >= self.min_raise
             opening = self.current_bet == 0
@@ -217,6 +260,8 @@ class HoldemHand(Episode):
                 self.min_raise = increment
         if note:
             entry['note'] = note
+            entry['requested'] = {'action': json_safe(action.get('action')), 'amount': json_safe(action.get('amount'))}
+            entry['correction'] = {'kind': 'sizing', 'reason': note}
         self.acted[seat] = True
         self.can_raise[seat] = False
         entry['pot'] = self.pot

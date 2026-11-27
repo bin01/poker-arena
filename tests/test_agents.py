@@ -21,6 +21,31 @@ class TestParse(unittest.TestCase):
         self.assertEqual(parse_json('{bad} then {"ok": true}'), {'ok': True})
 
 
+class TestModelAgent(unittest.TestCase):
+    def test_refusals_are_kept(self):
+        from poker_arena.agents import ModelAgent
+        from poker_arena.backends import BackendError, Reply
+        replies = ['nope', '{"action": "raise", "amount": "Infinity"}', '{"action": "call"}']
+
+        class Stub:
+            async def send(self, text):
+                if not replies:
+                    raise BackendError('gone')
+                return Reply(replies.pop(0))
+        G = get_game('holdem')({'hands_per_match': 1})
+        ep = G.episode(0, 1, ['A', 'B'])
+        agent = ModelAgent('m', 'command', command=['x'])
+        agent.backend = Stub()
+        validate = lambda act: ep.__class__.apply(__import__('copy').deepcopy(ep), 0, act)
+        d = asyncio.run(agent.act('go', ep.request(0), validate))
+        self.assertEqual(d.action['action'], 'call')
+        self.assertEqual([e['requested'] for e in d.errors], [None, {'action': 'raise', 'amount': 'Infinity'}])
+        self.assertEqual(len(d.calls), 3)
+        with self.assertRaises(BackendError) as cm:
+            asyncio.run(agent.act('go', ep.request(0), validate))
+        self.assertTrue(cm.exception.calls[-1]['backend_failed'])
+
+
 class TestModelPipeline(unittest.TestCase):
     """A full duplicate pair with a stand-in model CLI (the `command` backend): prompts, JSON parsing,
     retries after malformed replies, table talk, notes, logs and resume."""

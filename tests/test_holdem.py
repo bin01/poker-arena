@@ -96,6 +96,49 @@ class TestEngine(unittest.TestCase):
         self.assertEqual(len(ep.board), 5)
         self.assertEqual(sum(ep.payoffs), 0)
 
+    def test_correction_policy(self):
+        ep = self.G.episode(0, 5, ['A', 'B'])
+        for bad in ('Infinity', float('inf'), float('nan'), '-inf', 'lots', True, None):
+            err = ep.apply(0, {'action': 'raise', 'amount': bad})              # refused: asked again, no crash
+            self.assertIsNotNone(err, bad)
+            self.assertEqual(ep.history, [])
+        self.assertIn('not a raise', ep.apply(0, {'action': 'raise', 'amount': 2}))   # the bet is already 2
+        self.assertIsNone(ep.apply(0, {'action': 'call'}))
+        self.assertIn('cannot fold', ep.apply(1, {'action': 'fold'}))      # nothing to call: no silent check
+        self.assertIsNone(ep.apply(1, {'action': 'call'}))                  # a call of nothing is a check (sizing)
+        last = ep.history[-1]
+        self.assertEqual(last['action'], 'check')
+        self.assertEqual(last['correction']['kind'], 'sizing')
+        self.assertEqual(last['requested'], {'action': 'call', 'amount': None})
+        self.assertIsNone(ep.apply(1, {'action': 'bet', 'amount': 7.6}))    # rounded, with a notice
+        self.assertEqual((ep.history[-1]['amount'], ep.history[-1]['note']), (8, '7.6 rounded to 8'))
+        self.assertIsNone(ep.apply(0, {'action': 'raise', 'amount': '20'}))  # a numeric string is fine
+        self.assertNotIn('correction', ep.history[-1])
+
+    def test_raise_against_all_in_is_a_call_but_a_closed_raise_is_refused(self):
+        ep = self.G.episode(0, 5, ['A', 'B'])
+        ep.stacks[1] = 10 - ep.committed[1]                                  # B has 10 in all
+        ep.apply(0, {'action': 'raise', 'amount': 20})
+        self.assertIsNone(ep.apply(1, {'action': 'raise', 'amount': 50}))   # can only call all in: same chips
+        self.assertEqual(ep.history[-1]['action'], 'call')
+        self.assertEqual(ep.history[-1]['correction']['kind'], 'sizing')
+        # three-handed: an all-in short of a full raise doesn't reopen the betting for the raiser
+        ep = self.G.episode(0, 5, ['A', 'B', 'C'])
+        ep.stacks[1] = 14 - ep.committed[1]
+        self.assertIsNone(ep.apply(0, {'action': 'raise', 'amount': 10}))
+        self.assertIsNone(ep.apply(1, {'action': 'all_in'}))                # to 14: +4, less than the raise of 8
+        self.assertIsNone(ep.apply(2, {'action': 'call'}))
+        self.assertTrue(ep.raise_closed(0))
+        self.assertIn('not reopened', ep.apply(0, {'action': 'raise', 'amount': 40}))
+        self.assertIn('not reopened', ep.apply(0, {'action': 'all_in'}))
+        self.assertIsNone(ep.apply(0, {'action': 'call'}))
+
+    def test_deal_fingerprints(self):
+        G2 = get_game('holdem')({'hands_per_match': 99})
+        self.assertEqual(self.G.deal_fingerprint(7), G2.deal_fingerprint(7))   # match length isn't the deal
+        self.assertNotEqual(self.G.deal_fingerprint(7), self.G.deal_fingerprint(8))
+        self.assertNotEqual(self.G.deal_fingerprint(7), get_game('holdem')({'stack': 100}).deal_fingerprint(7))
+
     def test_fold_awards_pot(self):
         ep = self.G.episode(0, 9, ['A', 'B'])
         ep.apply(0, {'action': 'fold'})

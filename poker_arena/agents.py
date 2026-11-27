@@ -3,8 +3,9 @@
 A model agent keeps one conversation for the whole match (its backend), so it remembers earlier hands,
 the table talk and its own replies. Each turn it gets the events it saw since its last turn plus the
 request prompt, and answers with the game's JSON (reasoning, action, amount, say, notes). A reply that
-can't be parsed or played is sent back with the error; after `max_fixes` tries the seat takes the
-game's fallback (check or fold) and the failure is logged.
+can't be parsed or played (the game's `apply` returns an error, which includes strategically different
+actions it won't convert) is sent back with the error; after `max_fixes` tries the seat takes the game's
+fallback (check or fold). Every attempt is kept in `Decision.calls`, every refusal in `Decision.errors`.
 
 Bots read the request's structured data and never talk. They cost nothing and anchor the ratings.
 """
@@ -14,8 +15,9 @@ import random
 import re
 from dataclasses import dataclass, field
 
-from .backends import make_backend
+from .backends import BackendError, make_backend
 from .cards import equity
+from .games.holdem import json_safe
 
 
 @dataclass
@@ -26,6 +28,7 @@ class Decision:
     raw: str = ''
     calls: list = field(default_factory=list)   # one entry per model call made for this decision
     fallback: bool = False
+    errors: list = field(default_factory=list)  # [{requested: {action, amount} | None, error}] per refused reply
 
 
 def parse_json(text: str) -> dict | None:
@@ -66,9 +69,14 @@ def parse_json(text: str) -> dict | None:
 class Agent:
     kind = 'agent'
     notes: str = ''
+    spec: dict = {}
 
     def start(self, system: str, schema: dict):
         pass
+
+    def describe(self) -> dict:
+        """The settings this seat actually plays with, defaults included, for the match's config."""
+        return dict(self.spec)
 
     async def act(self, text: str, request, validate) -> Decision:
         raise NotImplementedError
@@ -93,6 +101,10 @@ class ModelAgent(Agent):
     def start(self, system, schema):
         self.backend = make_backend(self.backend_kind, system, label=self.player_id, **self.backend_kw)
 
+    def describe(self):
+        return {'backend': self.backend_kind, 'max_fixes': self.max_fixes, 'max_say_words': self.max_say_words,
+                'max_notes_words': self.max_notes_words, **(self.backend.describe() if self.backend else self.backend_kw)}
+
     def state(self):
         return {'notes': self.notes, 'backend': self.backend.state() if self.backend else {}}
 
@@ -109,9 +121,15 @@ class ModelAgent(Agent):
     async def act(self, text, request, validate) -> Decision:
         """`validate(action) -> error or None` checks an action without playing it."""
         message = text
-        calls = []
+        calls, errors = [], []
         for attempt in range(self.max_fixes + 1):
-            reply = await self.backend.send(message)
+            try:
+                reply = await self.backend.send(message)
+            except BackendError as e:  # the CLI gave up: keep what was tried, for the log
+                calls.append({'prompt': message, 'output': None, 'attempt': attempt, 'error': str(e)[:2000],
+                              'backend_failed': True, **getattr(e, 'meta', {})})
+                e.calls = calls
+                raise
             obj = parse_json(reply.text)
             calls.append({'prompt': message, 'output': reply.text, 'thinking': reply.thinking, 'usage': reply.usage,
                           'latency': reply.latency, 'attempt': attempt, **reply.meta})
@@ -123,11 +141,14 @@ class ModelAgent(Agent):
             if not error:
                 if obj.get('notes'):
                     self.notes = self._cap(obj['notes'], self.max_notes_words)
-                return Decision(obj, str(obj.get('reasoning') or ''), reply.thinking, reply.text, calls)
+                return Decision(obj, str(obj.get('reasoning') or ''), reply.thinking, reply.text, calls, errors=errors)
             calls[-1]['error'] = error
+            errors.append({'requested': None if obj is None else
+                           {'action': json_safe(obj.get('action')), 'amount': json_safe(obj.get('amount'))},
+                           'error': error})
             message = (f'That reply could not be played: {error}\nReply again with only the JSON object.\n\n'
                        f'{request.prompt}')
-        return Decision({}, '', '', calls[-1]['output'] if calls else '', calls, fallback=True)
+        return Decision({}, '', '', calls[-1]['output'] if calls else '', calls, fallback=True, errors=errors)
 
 
 # ---- baseline bots ------------------------------------------------------------------------------
@@ -169,6 +190,9 @@ class RuleBot(Agent):
     def __init__(self, seed=0, sims=300, **_):
         self.rng, self.sims = random.Random(seed), sims
 
+    def describe(self):
+        return {**self.spec, 'sims': self.sims}
+
     async def act(self, text, request, validate):
         d = request.data
         eq = equity(d['hole'], d['board'], self.rng, opponents=d['n'] - 1, sims=self.sims)
@@ -203,7 +227,9 @@ def make_agent(player_id: str, spec: dict, seed: int = 0) -> Agent:
     spec.pop('label', None)
     spec.pop('description', None)
     if 'bot' in spec:
-        return BOTS[spec.pop('bot')](seed=seed, **spec)
+        agent = BOTS[spec['bot']](seed=seed, **{k: v for k, v in spec.items() if k != 'bot'})
+        agent.spec = {**spec, 'seed': seed}
+        return agent
     if 'backend' not in spec:
         raise ValueError(f'player {player_id!r} needs either `bot` or `backend`')
     return ModelAgent(player_id, spec.pop('backend'), **spec)

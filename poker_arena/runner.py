@@ -5,18 +5,27 @@ matches on the same deals with the seats swapped: in hand k each player gets, in
 cards against the other player, so the luck of the deal cancels.
 
 A match directory holds:
-    config.json   the game, the players by seat, the deal seeds
-    events.jsonl  every event, with which seats could see it (the viewer reads this)
-    calls.jsonl   every model call: prompt, raw reply, reasoning, usage, latency, errors
-    hands.jsonl   one line per finished hand: cards, board, actions, net result per seat
-    state.json    what a stopped match needs to resume (finished hands, notes, CLI sessions)
-    result.json   written when the match finishes
+    config.json       the manifest (game, players by seat, specs, seeds, deal fingerprints, system prompts)
+                      and the audit (code version, CLI versions, effective settings per seat, round/replicate)
+    events.jsonl      every event, with which seats could see it (the viewer reads this); `thought` events
+                      carry requested / executed / correction for every decision
+    calls.jsonl       every model call: prompt, reply, reasoning, usage, latency, command line, errors, and
+                      the failed tries and rate-limit waits before it
+    raw.jsonl         the CLI's raw output for every call
+    hands.jsonl       one line per finished hand: cards, board, actions, net result per seat, seed, fingerprint
+    state.json        what a stopped match needs to resume (finished hands, notes, CLI sessions, past resumes)
+    interrupted.jsonl rows of hands a stopped run had started; they are replayed from scratch
+    result.json       written when the match finishes
 
-Rerunning a stopped match resumes after its last finished hand.
+Rerunning a stopped match resumes after its last finished hand, only with the recorded settings. If the
+stopped run was inside a hand, every CLI conversation is rebuilt from the committed turns, so no seat
+remembers a hand that the record dropped. A tournament directory also holds plan.json (the plan and the
+players' specs, which a rerun must match) and decisions.json (every look of the sequential design).
 """
 from __future__ import annotations
 import asyncio
 import copy
+import hashlib
 import itertools
 import json
 import time
@@ -24,7 +33,9 @@ import tomllib
 from pathlib import Path
 
 from .agents import make_agent
+from .backends import BackendError, cli_version
 from .games import get_game
+from .games.holdem import json_safe
 
 NAMES = ['Alex', 'Blair', 'Casey', 'Devon', 'Emery', 'Finley', 'Gray', 'Harper', 'Indy']
 
@@ -76,39 +87,111 @@ def _read_jsonl(path: Path):
     return out
 
 
+class ResumeMismatch(ValueError):
+    """A stopped match or tournament was rerun with settings that would change the experiment."""
+
+
+def _public(spec: dict) -> dict:
+    return {k: v for k, v in spec.items() if 'key' not in k.lower()}
+
+
+def _same(x):
+    return json.loads(json.dumps(x, default=str))
+
+
+def match_manifest(game, seat_players: list[tuple[str, dict]], seeds: list[int]) -> dict:
+    """What defines a match: resuming it with anything different would be another experiment."""
+    names = NAMES[:len(seat_players)]
+    return _same({'game': game.describe(), 'players': [p for p, _ in seat_players], 'names': names, 'seeds': list(seeds),
+                  'deal_fingerprints': [game.deal_fingerprint(s, k % len(seat_players)) for k, s in enumerate(seeds)],
+                  'specs': {p: _public(s) for p, s in seat_players},
+                  'system_prompts': [game.system_prompt(names[i], names, len(seeds)) for i in range(len(seat_players))]})
+
+
+def manifest_diff(stored: dict, fresh: dict) -> list[str]:
+    """Keys whose values differ. A key the stored manifest lacks (written by older code) is adopted."""
+    return [k for k in fresh if k in stored and _same(stored[k]) != _same(fresh[k])]
+
+
+def _thought_fields(d, last, err) -> dict:
+    """requested / executed / correction for a decision (see HoldemHand.apply for the policy)."""
+    executed = {'action': last.get('action'), 'amount': last.get('amount')}
+    final = {'action': json_safe(d.action.get('action')), 'amount': json_safe(d.action.get('amount'))}
+    if d.fallback or err:
+        reasons = [e['error'] for e in d.errors] + ([err] if err else [])
+        requested = d.errors[-1]['requested'] if d.errors else (None if d.fallback else final)
+        correction = {'kind': 'fallback', 'reason': '; '.join(reasons) or 'no playable reply'}
+    elif d.errors:
+        requested = d.errors[0]['requested']
+        reason = ' Then: '.join([d.errors[0]['error']] + ([last['correction']['reason']] if last.get('correction') else []))
+        correction = {'kind': 'retry', 'reason': f'asked again {len(d.errors)}x: {reason}'}
+    elif last.get('correction'):
+        requested, correction = last['requested'], last['correction']
+    else:
+        requested, correction = final, None
+    return {'requested': requested, 'executed': executed, 'correction': correction, 'retries': d.errors}
+
+
 async def run_match(game, seat_players: list[tuple[str, dict]], seeds: list[int], out: Path, *,
-                    log=print, agent_seed: int = 0) -> dict:
-    """Play one match. `seat_players` is [(player_id, player_spec)] by seat; `seeds` one per hand."""
+                    log=print, agent_seed: int = 0, meta: dict | None = None) -> dict:
+    """Play one match. `seat_players` is [(player_id, player_spec)] by seat; `seeds` one per hand.
+    `meta` (round, replicate, ...) is recorded in the config. Rerunning resumes; a rerun whose game,
+    players, specs, seeds or prompts differ from the recorded config raises ResumeMismatch first."""
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
+    n = len(seat_players)
+    fresh = match_manifest(game, seat_players, seeds)
+    names, ids = fresh['names'], fresh['players']
+    stored = json.loads((out / 'config.json').read_text()) if (out / 'config.json').exists() else None
+    if stored is not None:
+        diff = manifest_diff(stored, fresh)
+        if diff:
+            raise ResumeMismatch(f'{out}: the recorded match differs in {", ".join(diff)}; '
+                                 f'rerun with the recorded settings or use a new folder')
     if (out / 'result.json').exists():
         return json.loads((out / 'result.json').read_text())
-    n = len(seat_players)
-    names = NAMES[:n]
-    ids = [p for p, _ in seat_players]
-    config = {'game': game.describe(), 'players': ids, 'names': names, 'seeds': seeds,
-              'code_version': code_version(), 'started': round(time.time()),
-              'specs': {p: {k: v for k, v in s.items() if 'key' not in k.lower()} for p, s in seat_players}}
-    if not (out / 'config.json').exists():
-        (out / 'config.json').write_text(json.dumps(config, indent=2))
     schema = game.response_schema()
     agents = []
     for i, (pid, spec) in enumerate(seat_players):
         a = make_agent(pid, spec, seed=agent_seed * 100 + i)
-        a.start(game.system_prompt(names[i], names, len(seeds)), schema)
+        a.start(fresh['system_prompts'][i], schema)
         agents.append(a)
+    exes = {a.backend.exe for a in agents if a.kind == 'model' and a.backend.exe}
+    versions = {e: await asyncio.to_thread(cli_version, e) for e in sorted(exes)}
+    if stored is None:
+        config = {**fresh, **(meta or {}), 'code_version': code_version(), 'cli_versions': versions,
+                  'effective': [_same(a.describe()) for a in agents], 'started': round(time.time())}
+        (out / 'config.json').write_text(json.dumps(config, indent=2))
+    system_sha = [hashlib.sha1(p.encode()).hexdigest()[:12] for p in fresh['system_prompts']]
 
     state = json.loads((out / 'state.json').read_text()) if (out / 'state.json').exists() else {}
     done = state.get('hands', 0)
     pending = state.get('pending', [''] * n)
+    resumes = state.get('resumes', [])
     for a, st in zip(agents, state.get('agents', [])):
         a.restore(st)
-    if done:
-        log(f'{out}: resuming after hand {done}')
-    # drop partial-hand logs from an interrupted run so the logs match what is replayed
-    for fname in ('events.jsonl', 'calls.jsonl'):
-        rows = [r for r in _read_jsonl(out / fname) if r.get('episode', r.get('hand', 0)) < done]
-        (out / fname).write_text(''.join(json.dumps(r, default=str) + '\n' for r in rows))
+    # rows of a hand the stopped run had started: moved to interrupted.jsonl, so the logs match what is
+    # replayed, and the CLI conversations (which may still hold those turns) are rebuilt from the committed ones
+    dropped = {}
+    for fname in ('events.jsonl', 'calls.jsonl', 'raw.jsonl'):
+        rows = _read_jsonl(out / fname)
+        keep = [r for r in rows if r.get('episode', r.get('hand', 0)) < done]
+        if len(keep) < len(rows):
+            dropped[fname] = len(rows) - len(keep)
+            for r in rows:
+                if r.get('episode', r.get('hand', 0)) >= done:
+                    _append(out / 'interrupted.jsonl', {'file': fname, 'after_hand': done, 'resume': len(resumes) + 1, **r})
+            (out / fname).write_text(''.join(json.dumps(r, default=str) + '\n' for r in keep))
+    rebuilt = []
+    for i, a in enumerate(agents):
+        if a.kind == 'model' and (dropped or a.backend.rebuilding):
+            a.backend.rebuild()
+            rebuilt.append(i)
+    if done or dropped:
+        resumes.append({'t': round(time.time()), 'after_hand': done, 'code_version': code_version(),
+                        'cli_versions': versions, 'dropped_rows': dropped, 'rebuilt_seats': rebuilt})
+        log(f'{out}: resuming after hand {done}' + (f'; dropped an interrupted hand, rebuilt seats {rebuilt}'
+                                                    if dropped else ''))
     totals = [0] * n
     for h in _read_jsonl(out / 'hands.jsonl')[:done]:
         totals = [t + x for t, x in zip(totals, h['net'])]
@@ -132,6 +215,16 @@ async def run_match(game, seat_players: list[tuple[str, dict]], seeds: list[int]
                             pending[i] = (pending[i] + '\n' + line).strip()
             seen = len(ep.events)
 
+        def log_calls(seat, calls):
+            for c in calls:
+                c = dict(c)
+                raw = c.pop('raw', None)
+                _append(out / 'calls.jsonl', {'hand': k, 'seat': seat, 'player': ids[seat],
+                                              'system_sha1': system_sha[seat], **c})
+                if raw:
+                    _append(out / 'raw.jsonl', {'hand': k, 'seat': seat, 'attempt': c.get('attempt'), **raw}
+                            if isinstance(raw, dict) else {'hand': k, 'seat': seat, 'raw': raw})
+
         flush()
         while not ep.done:
             seat = ep.to_act
@@ -139,7 +232,11 @@ async def run_match(game, seat_players: list[tuple[str, dict]], seeds: list[int]
             text = (pending[seat] + '\n\n' + req.prompt).strip()
             pending[seat] = ''
             validate = lambda act, ep=ep, seat=seat: copy.deepcopy(ep).apply(seat, act)
-            d = await agents[seat].act(text, req, validate)
+            try:
+                d = await agents[seat].act(text, req, validate)
+            except BackendError as e:
+                log_calls(seat, getattr(e, 'calls', []))
+                raise
             action = d.action
             if d.fallback:
                 fallbacks[seat] += 1
@@ -152,45 +249,50 @@ async def run_match(game, seat_players: list[tuple[str, dict]], seeds: list[int]
             # the private side of the decision, for the viewer: placed just before the public action event
             thought = {'kind': 'thought', 'episode': k, 'visible': [], 'data': {
                 'seat': seat, 'player': ids[seat], 'reasoning': d.reasoning, 'thinking': d.thinking,
-                'notes': agents[seat].notes if agents[seat].kind == 'model' else '', 'fallback': d.fallback,
+                'notes': agents[seat].notes if agents[seat].kind == 'model' else '', 'fallback': d.fallback or bool(err),
                 'tries': len(d.calls), 'action': last.get('action'), 'amount': last.get('amount'),
+                **_thought_fields(d, last, err),
                 'seconds': round(sum(c.get('latency') or 0 for c in d.calls), 1),
                 'served_model': next((c['served_model'] for c in reversed(d.calls) if c.get('served_model')), None)}}
             _append(out / 'events.jsonl', thought)
-            for c in d.calls:
-                _append(out / 'calls.jsonl', {'hand': k, 'seat': seat, 'player': ids[seat], **c})
+            log_calls(seat, d.calls)
             flush()
-        summary = {**ep.summary(), 't': round(time.time(), 1)}  # when it finished: the viewer's progress and ETA
+        summary = {**ep.summary(), 'seed': seeds[k], 'fingerprint': fresh['deal_fingerprints'][k],
+                   't': round(time.time(), 1)}  # when it finished: the viewer's progress and ETA
         totals = [t + x for t, x in zip(totals, ep.payoffs)]
         _append(out / 'hands.jsonl', summary)
-        state = {'hands': k + 1, 'pending': pending, 'agents': [a.state() for a in agents], 'fallbacks': fallbacks}
+        state = {'hands': k + 1, 'pending': pending, 'agents': [a.state() for a in agents], 'fallbacks': fallbacks,
+                 'resumes': resumes}
         (out / 'state.json').write_text(json.dumps(state, default=str))
         log(f'{out.name} hand {k + 1}/{len(seeds)}: ' + ', '.join(f'{ids[i]} {ep.payoffs[i]:+d}' for i in range(n))
             + ' | total ' + ', '.join(f'{ids[i]} {totals[i]:+d}' for i in range(n)))
 
     result = {'players': ids, 'names': names, 'hands': len(seeds), 'net': totals,
               'bb_per_100': [round(t / game.big_unit / len(seeds) * 100, 1) for t in totals],
-              'fallbacks': fallbacks, 'seconds': round(time.time() - started, 1)}
+              'fallbacks': fallbacks, 'resumes': len(resumes), 'seconds': round(time.time() - started, 1)}
     (out / 'result.json').write_text(json.dumps(result, indent=2))
     return result
 
 
-def matchup_name(a, b, round_=1):
-    """The folder of a matchup; a tournament played until decided adds rounds as `a__vs__b__r2`, ..."""
-    return f'{a}__vs__{b}' + (f'__r{round_}' if round_ > 1 else '')
+def matchup_name(a, b, round_=1, replicate=1):
+    """The folder of a matchup. A sequential tournament adds rounds as `a__vs__b__r2`, ...; replicates (fresh
+    memories, their own deals) add `__x2`, ... before the round: `a__vs__b__x2__r3`."""
+    return f'{a}__vs__{b}' + (f'__x{replicate}' if replicate > 1 else '') + (f'__r{round_}' if round_ > 1 else '')
 
 
 async def run_duplicate(game, a: tuple[str, dict], b: tuple[str, dict], seeds, out: Path, *, sems=(), log=print,
-                        round_=1):
+                        round_=1, replicate=1):
     """Both matches of a duplicate pair; they share deals and run at the same time (each holding `sems`,
     the concurrency slots of the CLIs it uses, while it plays)."""
-    out = Path(out) / matchup_name(a[0], b[0], round_)
+    out = Path(out) / matchup_name(a[0], b[0], round_, replicate)
+    meta = {'pairing': [a[0], b[0]], 'round': round_, 'replicate': replicate}
 
     async def one(order, label, s):
         for sem in sems:
             await sem.acquire()
         try:
-            return await run_match(game, order, seeds, out / label, log=log, agent_seed=s)
+            return await run_match(game, order, seeds, out / label, log=log, agent_seed=s,
+                                   meta={**meta, 'order': label})
         finally:
             for sem in sems:
                 sem.release()
@@ -198,62 +300,144 @@ async def run_duplicate(game, a: tuple[str, dict], b: tuple[str, dict], seeds, o
     return await asyncio.gather(one([a, b], 'a-first', 1), one([b, a], 'b-first', 2))
 
 
+DESIGN = {'alpha': 0.05, 'max_rounds': 6, 'block': 10}   # plus round_deals = the plan's deals
+
+
 def make_plan(player_ids, deals=50, seed=1000, out='runs/pilot', game='holdem', game_config=None,
-              players_file='players.toml', concurrency=2, matchups=None):
+              players_file='players.toml', concurrency=2, matchups=None, design=None, replicates=1):
+    """A tournament. Every pairing plays rounds of `deals` duplicate deals (times `replicates` independent
+    pairs, each with fresh memories and its own deals) until `ratings.decide` calls it or `max_rounds` is used."""
     return {'game': game, 'game_config': game_config or {}, 'players_file': players_file, 'players': player_ids,
             'matchups': matchups or [list(p) for p in itertools.combinations(player_ids, 2)],
-            'deals': deals, 'seed': seed, 'out': out, 'concurrency': concurrency}
+            'deals': deals, 'seed': seed, 'out': out, 'concurrency': concurrency,
+            'design': {**DESIGN, 'round_deals': deals, **(design or {})}, 'replicates': replicates}
+
+
+def plan_design(plan: dict) -> dict | None:
+    """The plan's sequential design; an older plan's `until_decided` (a cap in deals) becomes max_rounds.
+    None: one round and no stopping rule."""
+    if plan.get('design'):
+        return {**DESIGN, 'round_deals': plan['deals'], **plan['design']}
+    if plan.get('until_decided'):
+        return {**DESIGN, 'round_deals': plan['deals'], 'max_rounds': max(1, plan['until_decided'] // plan['deals'])}
+    return None
+
+
+def round_seeds(plan: dict, round_: int, replicate: int) -> list[int]:
+    """Every pairing plays the same deals in the same round and replicate; no deal repeats within a plan."""
+    design, reps = plan_design(plan), plan.get('replicates', 1)
+    size = design['round_deals'] if design else plan['deals']
+    start = plan['seed'] + ((round_ - 1) * reps + replicate - 1) * size
+    return list(range(start, start + size))
 
 
 def is_bot(spec):
     return 'bot' in spec
 
 
+def _pair_xs(out: Path, folders: list[str], a: str, bb: float) -> tuple[list[float], list[str]]:
+    """a's result per duplicate deal in bb/100, in play order over the given matchup folders, and the folder
+    of each deal (so blocks never span two matches)."""
+    xs, groups = [], []
+    for f in folders:
+        ha = {h['hand']: h for h in _read_jsonl(out / f / 'a-first' / 'hands.jsonl')}
+        hb = {h['hand']: h for h in _read_jsonl(out / f / 'b-first' / 'hands.jsonl')}
+        first = (json.loads((out / f / 'a-first' / 'config.json').read_text())['players'][0]
+                 if (out / f / 'a-first' / 'config.json').exists() else a)
+        sign = 1 if first == a else -1
+        both = sorted(set(ha) & set(hb))
+        xs += [sign * (ha[k]['net'][0] + hb[k]['net'][1]) / bb / 2 * 100 for k in both]
+        groups += [f] * len(both)
+    return xs, groups
+
+
+def _record_decision(out: Path, a, b, v: dict):
+    path = out / 'decisions.json'
+    allv = json.loads(path.read_text()) if path.exists() else {}
+    looks = allv.setdefault(matchup_name(a, b), [])
+    looks[v['looks_used'] - 1:] = [{'t': round(time.time()), **v}]
+    path.write_text(json.dumps(allv, indent=2, default=str))
+
+
 async def run_plan(plan: dict, *, only=None, concurrency=None, log=print):
-    """Every matchup of the plan as a duplicate pair, on the same deals (so every player sees the same
+    """Every matchup of the plan as duplicate pairs, on the same deals (so every player sees the same
     cards across the whole tournament). `concurrency` caps how many matches use each backend (each CLI)
     at once, so one subscription's rate limits don't stall the others; bot-only matches run freely.
 
-    With `until_decided` (a number of deals) in the plan, `deals` is a round: after each round a pairing
-    whose edge is settled (ratings.settle) stops, and the rest play another round on new deals (the same
-    new deals for every pairing), until settled or `until_decided` deals. Rerun to resume."""
+    The plan's `design` is enforced here: after each round of a pairing, `ratings.decide` judges all of its
+    deals so far; the pairing stops on a verdict ('a', 'b', 'even') or after `max_rounds` looks, never more.
+    Every look is kept in the run's decisions.json. The plan and the players' specs are recorded in
+    plan.json; a rerun resumes, and one that would change the experiment raises ResumeMismatch before any
+    model is called."""
     players = load_players(plan.get('players_file', 'players.toml'), effort=plan.get('effort'))
-    cfg = {'hands_per_match': plan['deals'], **plan.get('game_config', {})}
+    design, reps = plan_design(plan), plan.get('replicates', 1)
+    rounds = design['max_rounds'] if design else 1
+    cfg = {'hands_per_match': design['round_deals'] if design else plan['deals'], **plan.get('game_config', {})}
     game = get_game(plan.get('game', 'holdem'))(cfg)
-    seeds = [plan['seed'] + k for k in range(plan['deals'])]
     limit = concurrency or plan.get('concurrency', 2)
-    Path(plan['out']).mkdir(parents=True, exist_ok=True)
+    out = Path(plan['out'])
+    for a, b in plan['matchups']:
+        missing = [p for p in (a, b) if p not in players]
+        if missing:
+            raise KeyError(f'not in {plan.get("players_file")}: {", ".join(missing)}')
+    involved = sorted({p for m in plan['matchups'] for p in m})
+    manifest = _same({'game': plan.get('game', 'holdem'), 'game_config': plan.get('game_config', {}),
+                      'players': plan['players'], 'matchups': plan['matchups'], 'deals': plan['deals'],
+                      'seed': plan['seed'], 'design': design, 'replicates': reps, 'effort': plan.get('effort'),
+                      'specs': {p: _public(players[p]) for p in involved}})
+    stored = json.loads((out / 'plan.json').read_text()) if (out / 'plan.json').exists() else None
+    if stored is not None:
+        diff = manifest_diff({**stored, 'design': plan_design(stored), 'replicates': stored.get('replicates', 1)}
+                             if 'deals' in stored else stored, manifest)
+        if diff:
+            raise ResumeMismatch(f'{out}/plan.json: this tournament was planned with different {", ".join(diff)}; '
+                                 f'rerun with the recorded plan or use a new `out`')
+    bad = []
+    for a, b in plan['matchups']:
+        for r in range(1, rounds + 1):
+            for j in range(1, reps + 1):
+                seeds = round_seeds(plan, r, j)
+                for label, order in (('a-first', [a, b]), ('b-first', [b, a])):
+                    cfg_path = out / matchup_name(a, b, r, j) / label / 'config.json'
+                    if cfg_path.exists():
+                        diff = manifest_diff(json.loads(cfg_path.read_text()),
+                                             match_manifest(game, [(p, players[p]) for p in order], seeds))
+                        if diff:
+                            bad.append(f'{cfg_path.parent.relative_to(out)} ({", ".join(diff)})')
+    if bad:
+        raise ResumeMismatch('recorded matches differ from this plan: ' + '; '.join(bad))
+    out.mkdir(parents=True, exist_ok=True)
     from .server import display_name
     labels = {pid: display_name(pid, spec) for pid, spec in players.items() if pid in plan['players']}
-    (Path(plan['out']) / 'plan.json').write_text(json.dumps({**plan, 'labels': labels}, indent=2))  # for the viewer
+    (out / 'plan.json').write_text(json.dumps({**plan, **manifest, 'labels': labels, 'code_version': code_version(),
+                                               'created': (stored or {}).get('created') or round(time.time())},
+                                              indent=2))  # for the viewer, and the manifest a rerun must match
     sems = {}
     tasks = []
-    cap = plan.get('until_decided')
 
     async def pairing(a, b, mine):
-        r = 1
-        while True:
-            round_seeds = seeds if r == 1 else [plan['seed'] + (r - 1) * plan['deals'] + k for k in range(plan['deals'])]
-            res = await run_duplicate(game, (a, players[a]), (b, players[b]), round_seeds, Path(plan['out']),
-                                      sems=mine, log=log, round_=r)
-            if not cap:
+        folders = []
+        for r in range(1, rounds + 1):
+            names = [matchup_name(a, b, r, j) for j in range(1, reps + 1)]
+            res = await asyncio.gather(*[
+                run_duplicate(game, (a, players[a]), (b, players[b]), round_seeds(plan, r, j), out, sems=mine,
+                              log=log, round_=r, replicate=j) for j in range(1, reps + 1)])
+            folders += names
+            if not design:
                 return res
-            from .ratings import load_deals, settle
-            xs = [(d['net_a'] if d['a'] == a else -d['net_a']) / d['bb'] / 2 * 100
-                  for d in load_deals(plan['out']) if {d['a'], d['b']} == {a, b}]
-            v = settle(xs)
-            if v['status'] == 'settled' or len(xs) + plan['deals'] > cap:
-                log(f'{a} vs {b}: {"settled" if v["status"] == "settled" else "stopped at the cap"} after '
-                    f'{len(xs)} deals, {a} {v["a_bb_per_100"]:+.0f} bb/100')
-                return res
-            r += 1
+            from . import ratings
+            xs, groups = _pair_xs(out, folders, a, game.big_unit)
+            v = ratings.decide(xs, design, len(plan['matchups']), r, groups=groups)
+            _record_decision(out, a, b, v)
+            if v['verdict'] in ('a', 'b', 'even') or r >= rounds:
+                who = {'a': f'{a} is ahead', 'b': f'{b} is ahead', 'even': 'even'}.get(v['verdict'], v['verdict'])
+                log(f'{a} vs {b}: {who} after {r} of {rounds} rounds ({v.get("deals")} deals, '
+                    f'{a} {v.get("edge") if v.get("edge") is not None else "?"} bb/100)')
+                return v
 
     for a, b in plan['matchups']:
         if only and matchup_name(a, b) not in only and a not in only and b not in only:
             continue
-        missing = [p for p in (a, b) if p not in players]
-        if missing:
-            raise KeyError(f'not in {plan.get("players_file")}: {", ".join(missing)}')
         kinds = sorted({players[p]['backend'] for p in (a, b) if not is_bot(players[p])})  # sorted: no deadlock
         mine = [sems.setdefault(k, asyncio.Semaphore(limit)) for k in kinds]
         tasks.append(pairing(a, b, mine))

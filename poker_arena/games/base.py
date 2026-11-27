@@ -16,8 +16,19 @@ Episodes emit Events. Each event says which seats may see it; the runner shows e
 it may see, in order, as text (`Episode.render(event, seat)`), and logs every event for the viewer.
 """
 from __future__ import annotations
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any
+
+PLAY_ONLY = {'hands_per_match'}   # settings that don't change what a deal is
+
+
+def deal_fingerprint(game: dict, seed, button=0) -> str:
+    """Names one deal across runs: the game settings that shape it, its seed and the seat holding the button.
+    Two deals with the same fingerprint are the same cards in the same positions (see ratings.fingerprint)."""
+    from ..ratings import fingerprint
+    return fingerprint(game, seed, button)
 
 
 @dataclass
@@ -46,7 +57,7 @@ class Episode:
     events: list[Event]
 
     def request(self, seat: int) -> Request: ...
-    def apply(self, seat: int, action: dict) -> str | None: ...
+    def apply(self, seat: int, action: dict) -> str | None: ...   # an error means: ask the seat again
     def fallback(self, seat: int) -> dict: ...          # the action taken when a seat fails to answer
     def render(self, event: Event, seat: int) -> str: ...
     def summary(self) -> dict: ...                       # for result logs and the viewer
@@ -68,3 +79,6 @@ class Game:
 
     def describe(self) -> dict:
         return {'name': self.name, 'unit': self.unit, 'big_unit': self.big_unit, **self.config}
+
+    def deal_fingerprint(self, seed, button=0) -> str:
+        return deal_fingerprint(self.describe(), seed, button)
