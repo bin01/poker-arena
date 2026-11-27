@@ -811,7 +811,11 @@ function referenceSection(view, rt) {
     return `${short3(other)} ${signed(e, 0)}`;
   });
   const limits = [].concat(info.limits || []).map(esc);
-  const results = Array.isArray(info.results) ? info.results.map(x => `${short3(x.opponent || x.player)} ${signed(x.edge, 0)}`) : record;
+  const results = Array.isArray(info.results) ? info.results.map(x => {
+    const opp = x.opponent || x.player || (x.a === 'reference' || x.a === ref ? x.b : x.a);
+    const e = x.edge ?? x.edge_bb100;
+    return opp && e != null ? `${short3(opp)} ${signed(e, 0)}${x.se != null ? ` ±${Math.round(x.se)}` : ''}` : null;
+  }).filter(Boolean) : record;
   return section('Against the reference bot', 'the fixed yardstick: bb/100 won against it, so above 0 beats it',
     `<div class="ref-list">${rows}</div>`,
     `<b>What the reference is.</b> ${esc(info.description || REF_LIMITS)}${limits.length ? ` Limits: ${limits.join('; ')}.` : ''}
