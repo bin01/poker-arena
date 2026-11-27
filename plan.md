@@ -226,3 +226,46 @@ Round 3 report: `/private/tmp/claude-501/-Users-snehal-Code-poker-arena/7391e5d9
   navigation grouped pairing → round → replicate with correct counts (R3-#14); during playback the scoreboard and deal
   map collapse so the table is in the first viewport on mobile, and matchup labels are complete (R3-#15); position split
   and visible "Plays preflop"/"Raises preflop" labels (R3-#16); unregistered runs say so.
+
+---
+
+# Round 4 → 5
+
+Round 4 report: `/private/tmp/claude-501/-Users-snehal-Code-poker-arena/7391e5d9-a258-4fd4-b230-fb0d350c6f8f/scratchpad/review/r4-report.md`
+(ux=7 gameplay=8 evals=6 judges=5 overall=6). Issues R4-#n. Same tracks and file ownership.
+
+## Contract additions
+- **One adjudicator (A defines, C calls, B shows):** `ratings.adjudicate(pairing_data, design, n_pairings, look, eligibility) -> dict`
+  wraps `decide` and applies every eligibility rule (identity attested/consistent, audit complete, protocol consistent,
+  registration valid, assumptions supported). Returns decide's keys plus `eligible: bool`, `ineligible_reasons: [..]`,
+  `assumptions: {status: 'supported'|'unsupported'|'unknown', checks: {...}}` and a terminal verdict
+  `ineligible` when not eligible. The runner stops and records only through `adjudicate`; ratings/CLI/viewer report the
+  **recorded** decision as official (`official: true`, with the judge implementation hash) and any recomputation by
+  today's code as `retrospective` (R4-#3, #6).
+- **Registration (A, C):** `registered` is never recomputed; it is true only when a `registration` artifact written
+  before the first hand exists in plan.json: `{design, judge_fingerprint, calibration_id, created}`. An explicit
+  `registered: false` stays false. An `--allow-code-change` that changes the engine/backends/judge marks the registration
+  `void` with reason (R4-#1, #6).
+- **Assumptions (A):** each verdict carries its assumption status (e.g. conversation_share within the calibrated range);
+  a decided verdict whose assumptions are `unsupported` is shown as "decided (outside calibrated range)" and never
+  counts towards a decided leader unless the design preregistered how to treat it (default: it doesn't). Wording never
+  states the error bound without its assumptions (R4-#2).
+- **Identity (C records, A uses):** calls carry `requested_model`, `observed_model` (claude: init event `model`;
+  agy: transcript model; codex/command: null) and `identity: 'attested'|'unattested'`. A player whose identity is
+  unattested is eligible only if the design says `allow_unattested: [backend...]` (default allows codex, since it has no
+  attestation, but it's shown as "unattested" everywhere) (R4-#4).
+- **Audit eligibility (C, A):** gemini missing tool stats → `unverified`; `opaque` (command backend) never eligible for
+  decided results unless preregistered (R4-#5).
+- **History identity (A):** includes the implementation fingerprint of behaviour-relevant files and CLI versions;
+  an explicit equivalence list may merge them (R4-#7).
+- **Pair validation (A):** loaders verify b-first is a-first with seats swapped, same settings, same fingerprints per
+  hand; mismatches are rejected and reported (R4-#8).
+- **Fit diagnostics (A computes, B shows):** per pairing `fitted_edge`, `residual`, and an `additivity` warning when
+  residuals exceed their uncertainty; direct pairwise evidence stays primary (R4-#9).
+- **Engine context (C):** action events carry `to_act` (next actor, null at hand end), `to_call`, `pot_before`,
+  `pot_odds`; hand_start carries initial `to_act`; each player's `made_hand` description per street is available
+  (computed from cards; omniscient fields labelled) (R4-#13, #14).
+- **Viewer (B):** interval basis labelled at the number ("within conversations" vs "across conversations"), compact
+  outcome row instead of tall hero, one expandable planning panel, audit summary per run (tool rejections, unverified,
+  fallbacks, identity coverage) and per-decision audit/identity details, mobile label overflow fixed and mobile stats
+  metric selector, made-hand / to-call / pot-odds / duplicate comparison in replay, fit residuals (R4-#10–#15, #2, #9).
