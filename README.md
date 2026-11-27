@@ -65,13 +65,14 @@ Install and sign in to the CLIs you want to use (`claude`, `codex`, `agy`), then
 python -m poker_arena doctor          # each model player: does it answer, is the JSON valid, does it remember?
 ```
 
-Players live in [`players.toml`](players.toml). Each model entry names its CLI (`backend`), the `model` to ask for
-(always set it: otherwise the CLI uses whatever default your own settings have) and a `label`, the name the viewer
-shows. A bot entry names the `bot`.
+Players live in [`players.toml`](players.toml). A model player is **a model at a reasoning level**: each entry
+names its CLI (`backend`), the exact `model` and the `effort` (always set both: otherwise the CLI uses whatever
+default your own settings have, and nothing records it). The viewer names the player after the two, e.g.
+"Claude Opus 5.5 · max"; `label` overrides that. A bot entry names the `bot`.
 
 | backend | tool | plan | memory |
 |---|---|---|---|
-| `claude` | Claude Code, `claude -p` | Claude Pro / Max | the CLI keeps the session (`--resume`); tools off; thinking summaries shown |
+| `claude` | Claude Code, `claude -p` | Claude Pro / Max | the CLI keeps the session (`--resume`); tools off; `effort` is `--effort`; thinking summaries shown |
 | `codex` | Codex CLI, `codex exec` | ChatGPT Plus / Pro | the CLI keeps the thread (`exec resume`); the game prompt replaces Codex's coding instructions; read-only sandbox |
 | `agy` | Google Antigravity CLI, `agy -p` | Google account (Gemini) | the CLI keeps the conversation (`--conversation`); the game prompt is a tool-less agent; MCP, commands, files and URLs denied; thinking read from its transcript |
 | `gemini` | Gemini CLI, `gemini -p` (older installs) | Google account | the transcript is re-sent each turn |

@@ -5,31 +5,32 @@
 #   agy     -> Google Antigravity CLI (Gemini models, Google account)
 #   gemini  -> Gemini CLI, where still installed
 #   command -> any CLI that reads a prompt on stdin, e.g. pi or ollama
-# `label` is the name the leaderboard and replays show; the [players.ID] key names the run folders.
-# Always set `model`: without it a CLI uses whatever default your own settings have, and nothing records it.
+# A model player is a model at a reasoning level: always set both `model` and `effort`. Without them a CLI
+# uses whatever default your own settings have, and nothing records it. The viewer names the player after
+# them (e.g. "Claude Opus 5.5 · max"); set `label` only to override that. The [players.ID] key names the
+# run folders, so give a new ID to a new model or effort rather than editing an old one.
 # Optional keys for any model: extra_args (list), timeout (seconds per call), rate_limit_wait (seconds
 # to wait when the plan's usage limit is hit), max_wait (total seconds to keep waiting).
 # Check them with: python -m poker_arena doctor
 
 [players.claude-opus]
-label = "Claude Opus 5.5"
 backend = "claude"
 model = "claude-opus-5-5"
+effort = "max"        # low, medium, high, xhigh, max (claude --effort)
 
 [players.claude-sonnet]
-label = "Claude Sonnet 5.5"
 backend = "claude"
 model = "claude-sonnet-5-5"
+effort = "max"
 
 [players.codex-gpt]
-label = "GPT-6 Luna (high)"
 backend = "codex"
 model = "gpt-6-luna"
-effort = "high"
+effort = "max"        # model_reasoning_effort
 
 [players.gemini-agy]
-label = "Gemini 4 Neon High"
 backend = "agy"
+# Gemini's reasoning level is part of the model name here (the "-high" variant); see `agy models`.
 # Always set a model: agy's default comes from your own settings and can be a non-Gemini model.
 model = "gemini-4-neon-high"   # see `agy models`
 

@@ -145,9 +145,10 @@ class ClaudeCLI(Backend):
     Thinking is shown as summaries (`--thinking-display summarized`) so the viewer can show it."""
     stateful = True
 
-    def __init__(self, system, *, isolate: bool = True, thinking_display: str | None = 'summarized', **kw):
+    def __init__(self, system, *, isolate: bool = True, thinking_display: str | None = 'summarized',
+                 effort: str | None = None, **kw):
         super().__init__(system, **kw)
-        self.isolate, self.thinking_display = isolate, thinking_display
+        self.isolate, self.thinking_display, self.effort = isolate, thinking_display, effort
 
     async def _call(self, text):
         cmd = ['claude', '-p', '--output-format', 'stream-json', '--verbose', '--tools', '',
@@ -158,6 +159,8 @@ class ClaudeCLI(Backend):
             cmd += ['--thinking-display', self.thinking_display]
         if self.model:
             cmd += ['--model', self.model]
+        if self.effort:  # low, medium, high, xhigh or max; unset, Claude Code's default may not think at all
+            cmd += ['--effort', self.effort]
         if self.session:
             cmd += ['--resume', self.session]
         out = await self.run(cmd + self.extra_args, stdin=text)

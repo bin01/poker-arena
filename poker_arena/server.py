@@ -54,7 +54,7 @@ def display_name(pid: str, spec: dict) -> str:
         return BOT_NAMES.get(spec['bot'], f'{spec["bot"]} bot')
     if not spec.get('model'):
         return pid
-    return pretty_model(str(spec['model'])) + (f' ({spec["effort"]})' if spec.get('effort') else '')
+    return pretty_model(str(spec['model'])) + (f' · {spec["effort"]}' if spec.get('effort') else '')
 
 
 def load_labels(players_file='players.toml') -> dict:
