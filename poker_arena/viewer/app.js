@@ -135,12 +135,15 @@ async function route() {
     $run.parentElement.hidden = false;
     const run = parts[0] === 'r' && parts[1] ? decodeURIComponent(parts[1]) : null;
     if (!run || !state.runs.find(r => r.run === run)) {
-      location.replace(runLink(state.runs[0].run));
+      // the newest run, not the all-runs history, is where a visit starts
+      location.replace(runLink((state.runs.find(r => !r.all) || state.runs[0]).run));
       return;
     }
     state.run = run;
-    $run.innerHTML = state.runs.map(r => `<option value="${esc(r.run)}" ${r.run === run ? 'selected' : ''}>
-      ${esc(runLabel(r.run))}${r.live ? ' · live' : ''}</option>`).join('');
+    const option = r => `<option value="${esc(r.run)}" ${r.run === run ? 'selected' : ''}>
+      ${esc(runLabel(r.run))}${r.live && !r.all ? ' · live' : ''}</option>`;
+    const all = state.runs.filter(r => r.all), each = state.runs.filter(r => !r.all);
+    $run.innerHTML = all.map(option).join('') + (all.length ? `<optgroup label="Runs">${each.map(option).join('')}</optgroup>` : each.map(option).join(''));
     $run.onchange = () => { location.hash = runLink($run.value); };
     const tab = parts[2] === 'm' ? 'matches' : 'board';
     document.querySelectorAll('nav a').forEach(a => {
@@ -148,6 +151,7 @@ async function route() {
       a.href = runLink(run, a.dataset.tab === 'matches' ? '/m' : '');
     });
     state.index = await api('index', ['run', run]);
+    state.labels = {}; state.kinds = {};   // per run: an id can name another model, or level, in another run
     for (const m of state.index) { Object.assign(state.kinds, m.kinds || {}); Object.assign(state.labels, m.labels || {}); }
     sectionCount = 0;
     if (tab === 'matches') {
@@ -171,8 +175,9 @@ async function route() {
 window.addEventListener('hashchange', route);
 
 // ---- standings ----------------------------------------------------------------------------------
-function runHead() {
+function runHead(rt) {
   const r = state.runs.find(x => x.run === state.run);
+  if (r.all) return historyHead(r, rt);
   const deals = Math.max(0, ...state.index.map(m => m.deals_total || 0));
   const sub = [plural(r.players.length, 'player'), plural(r.matchups, 'matchup'), `${deals} duplicate deals each`];
   const share = r.hands_planned ? r.hands / r.hands_planned : 0;
@@ -188,9 +193,30 @@ function runHead() {
       <div class="line">${line}${r.hands_per_hour ? ` · ${r.hands_per_hour.toLocaleString()} hands an hour` : ''}</div></div></div>`;
 }
 
+// The all-runs page: every run pooled, one player per model and reasoning level.
+function historyHead(r, rt) {
+  const models = rt.players.filter(p => !isBot(p.player)).length;
+  const sub = [plural(rt.runs.length, 'run'), plural(models, 'model'), plural(rt.players.length - models, 'bot'),
+    plural(2 * rt.deals, 'duplicate hand')];
+  const notes = [];
+  if (rt.left_out.length) notes.push(`Left out, because they were played under other game settings: ${rt.left_out.map(x => esc(runLabel(x.run))).join(', ')}.`);
+  if (rt.code_versions.length > 1) notes.push(`Played on ${rt.code_versions.length} versions of the arena (${rt.code_versions.map(esc).join(', ')}).`);
+  if (rt.unversioned_runs.length) notes.push(`${plural(rt.unversioned_runs.length, 'run')} from before versions were recorded: ${rt.unversioned_runs.map(x => esc(runLabel(x))).join(', ')}.`);
+  const gone = rt.runs.filter(x => !state.runs.some(y => y.run === x.run)).length;
+  if (gone) notes.push(`${plural(gone, 'run')} kept from the history after ${gone === 1 ? 'its folder was' : 'their folders were'} deleted.`);
+  const self = rt.runs.reduce((n, x) => n + x.self_play, 0);
+  if (self) notes.push(`${plural(self, 'deal')} between two entries of the same model and level don't count.`);
+  return `<div class="page-head"><div><div class="eyebrow">History</div><h1>All runs</h1><div class="sub">${sub.join(' · ')}</div></div>
+    <div class="progress-block"><div class="line">One player per model and reasoning level, pooled across every run
+      ${r.started_at ? `since ${new Date(r.started_at * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}` : ''}</div>
+      ${notes.length ? `<div class="line soft small">${notes.join(' ')}</div>` : ''}</div></div>`;
+}
+
 async function renderBoard() {
   const r = await api('ratings', ['run', state.run]);
-  let html = runHead();
+  Object.assign(state.labels, r.labels || {});
+  Object.assign(state.kinds, r.kinds || {});
+  let html = runHead(r);
   if (!r.players.length) {
     $app.innerHTML = html + `<div class="card-box empty"><div class="big-suits">♠ ♥ ♦ ♣</div><h2>The cards are in the air</h2>
       <p>A deal counts once both of its plays are finished. Watch the first ones on the <a href="${runLink(state.run, '/m')}"><u>Matches</u></a> page.</p></div>`;
@@ -297,7 +323,8 @@ function headToHead(r) {
       const clear = Math.abs(c.v) > 1.96 * c.se;
       const alpha = clear ? (0.12 + 0.3 * Math.sqrt(Math.abs(c.v) / max)).toFixed(2) : 0;
       const bg = clear ? `background:rgba(var(--${c.v > 0 ? 'pos' : 'neg'}-rgb),${alpha})` : '';
-      const link = ids[c.id] ? matchLink(ids[c.id]) : '';
+      const full = state.index.some(m => m.id === c.id) ? c.id : ids[c.id];
+      const link = full ? matchLink(full) : '';
       return `<td class="cell" style="${bg}"><a href="${link}" title="${label(a)} against ${label(b)}: ${plural(c.hands, 'hand')}, ±${Math.round(1.96 * c.se)} bb/100">
         <span class="v ${clear ? cls(c.v) : 'soft'}">${signed(c.v, 0)}</span></a></td>`;
     }).join('')}</tr>`).join('')}</tbody></table>`;
@@ -340,14 +367,18 @@ async function renderMatches(id, params) {
   }
   const started = state.index.filter(m => m.started);
   const cur = state.index.find(m => m.id === id) || started.find(m => m.live) || started[0] || state.index[0];
+  const own = (m, p) => esc((m.labels || {})[p] || labelText(p));   // across runs, one id can be two players
+  Object.assign(state.labels, cur.labels || {});
   const groups = [['Playing now', state.index.filter(m => m.live)], ['Played', started.filter(m => !m.live)],
     ['Not started', state.index.filter(m => !m.started)]];
   const list = groups.filter(g => g[1].length).map(([title, ms]) => `<div class="group">${title}</div>` + ms.map(m => {
-    const meta = !m.started ? '<span>waiting for a free seat</span>' : `<span>${m.pairs_done} of ${m.deals_total} deals</span>`
-      + (m.pairs_done ? `<b class="${cls(m.pair_net_a)}" title="${label(m.a)}'s net over both plays">${signedBB(m.pair_net_a, m.bb)}</b>` : '');
+    const where = state.run === '*' ? `${esc(runLabel(m.run))} · ` : '';
+    const count = where ? `${m.pairs_done}/${m.deals_total} deals` : `${m.pairs_done} of ${m.deals_total} deals`;
+    const meta = `<span>${where}${!m.started ? 'waiting for a free seat' : count}</span>`
+      + (m.pairs_done ? `<b class="${cls(m.pair_net_a)}" title="${own(m, m.a)}'s net over both plays">${signedBB(m.pair_net_a, m.bb)}</b>` : '');
     return `<a href="${m.started ? matchLink(m.id) : ''}" class="${m === cur ? 'active' : ''} ${m.started ? '' : 'planned'}">
       <div class="row"><span class="duo">${monogram(m.a, 'sm')}${monogram(m.b, 'sm')}</span>
-        <span class="pair-names">${label(m.a)}<span class="vs">vs</span>${label(m.b)}</span>${m.live ? '<span class="live-dot"></span>' : ''}</div>
+        <span class="pair-names">${own(m, m.a)}<span class="vs">vs</span>${own(m, m.b)}</span>${m.live ? '<span class="live-dot"></span>' : ''}</div>
       <div class="meta">${meta}</div></a>`;
   }).join('')).join('');
 

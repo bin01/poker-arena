@@ -132,13 +132,17 @@ def bb100(deals, names):
 
 
 def ratings(root, boot=300, anchor: tuple[str, float] | None = None, seed=0, session=SESSION) -> dict:
-    deals = load_deals(root)
-    names = sorted({d['a'] for d in deals} | {d['b'] for d in deals})
+    """The leaderboard of every match under root, with each player's style stats."""
     from .stats import collect
-    style = collect(root)
+    return {**rate(load_deals(root), boot, anchor, seed, session), 'stats': collect(root)}
+
+
+def rate(deals, boot=300, anchor: tuple[str, float] | None = None, seed=0, session=SESSION) -> dict:
+    """The leaderboard from a list of duplicate deals (as `load_deals` gives them)."""
+    names = sorted({d['a'] for d in deals} | {d['b'] for d in deals})
     if not names:
         return {'players': [], 'matchups': [], 'deals': 0, 'sessions': 0, 'session_deals': session,
-                'min_sessions': MIN_SESSIONS, 'stats': style}
+                'min_sessions': MIN_SESSIONS}
     games = sessions(deals, session)
     w = fit(games, names)
 
@@ -193,15 +197,16 @@ def ratings(root, boot=300, anchor: tuple[str, float] | None = None, seed=0, ses
                          'a_session_wins': sum(outcome(g) == 1.0 for g in games_by[name]),
                          'b_session_wins': sum(outcome(g) == 0.0 for g in games_by[name])})
     return {'players': players, 'matchups': matchups, 'deals': len(deals), 'sessions': len(games),
-            'min_sessions': MIN_SESSIONS, 'tie_bb_per_deal': TIE_BB, 'stats': style,
+            'min_sessions': MIN_SESSIONS, 'tie_bb_per_deal': TIE_BB,
             'session_deals': session, 'anchor': list(anchor) if anchor else None, 'boot': boot}
 
 
-def table(r) -> str:
-    lines = [f'{"player":24} {"elo":>6} {"90% interval":>14} {"bb/100":>9} {"±se":>6} {"hands":>6} {"sessions W-T-L":>15}']
+def table(r, labels=None) -> str:
+    labels = labels or {}
+    lines = [f'{"player":28} {"elo":>6} {"90% interval":>14} {"bb/100":>9} {"±se":>6} {"hands":>6} {"sessions W-T-L":>15}']
     for p in r['players']:
         iv = f'{p["elo90"][0]}-{p["elo90"][1]}' if p['elo90'] else 'provisional'
         bb = f'{p["bb_per_100"]:+.1f}' if p['bb_per_100'] is not None else ''
-        lines.append(f'{p["player"]:24} {p["elo"]:>6} {iv:>14} {bb:>9} {p["bb_per_100_se"] or 0:>6.1f} '
+        lines.append(f'{labels.get(p["player"], p["player"]):28} {p["elo"]:>6} {iv:>14} {bb:>9} {p["bb_per_100_se"] or 0:>6.1f} '
                      f'{p["hands"]:>6} {p["session_wins"]:>7}-{p["session_ties"]}-{p["session_losses"]}')
     return '\n'.join(lines)

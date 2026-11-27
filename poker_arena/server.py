@@ -7,6 +7,8 @@ mixing a smoke test with a tournament makes neither readable.
     /api/index?run=RUN              the run's matchups (both duplicate matches, and planned ones not started)
     /api/match?id=RUN/MATCHUP/a-first   one match: config, finished hands, and every event by hand
     /api/ratings?run=RUN            the run's leaderboard and per-player stats (recomputed when a hand finishes)
+The run `*` is every run together: its leaderboard comes from the history database (history.py), one player
+per model and reasoning level, and keeps runs whose folders have since been deleted.
 Running matches are followed live: the app polls while a match is unfinished.
 
 `export(root, out)` writes the same JSON as files next to a copy of the app, so a run can be published as a
@@ -29,6 +31,7 @@ PACE_SECONDS = 1800   # the ETA uses the pace over the last half hour of finishe
 
 BOT_NAMES = {'random': 'Random bot', 'station': 'Calling station', 'rule': 'Rule bot'}
 LABELS: dict = {}   # labels from the current players.toml, which win over the ones recorded in old runs
+PLAYERS_FILE = ['players.toml']
 
 
 def pretty_model(model: str) -> str:
@@ -54,7 +57,9 @@ def display_name(pid: str, spec: dict) -> str:
         return BOT_NAMES.get(spec['bot'], f'{spec["bot"]} bot')
     if not spec.get('model'):
         return pid
-    return pretty_model(str(spec['model'])) + (f' · {spec["effort"]}' if spec.get('effort') else '')
+    from .runner import EFFORT_BACKENDS
+    effort = spec.get('effort') or ('default' if spec.get('backend') in EFFORT_BACKENDS else '')
+    return pretty_model(str(spec['model'])) + (f' · {effort}' if effort else '')
 
 
 def load_labels(players_file='players.toml') -> dict:
@@ -156,6 +161,8 @@ def _public(m):
 
 
 def index(root: Path, run: str | None = None):
+    from .history import ALL
+    run = None if run == ALL else run
     by = _runs_and_matchups(root)
     out = [m for r, ms in by.items() if run is None or r == run for m in ms]
     # playing first, then started, then planned; alphabetical within each
@@ -184,7 +191,39 @@ def runs(root: Path):
                     'started_at': times[0] if times else None,
                     'hands_per_hour': round(rate * 3600) if rate else None,
                     'eta_seconds': round((planned - done) / rate) if rate and planned > done else None})
-    return sorted(out, key=lambda r: -r['updated'])
+    out.sort(key=lambda r: -r['updated'])
+    if out and (len(out) > 1 or _history_runs(root) - {r['run'] for r in out}):
+        out.insert(0, _all_runs(out))
+    return out
+
+
+def _history_runs(root: Path) -> set:
+    """Runs the history database knows, including ones whose folders are gone."""
+    from .history import DB_NAME
+    import sqlite3
+    db = root / DB_NAME
+    if not db.exists():
+        return set()
+    try:
+        con = sqlite3.connect(str(db), timeout=5)
+        try:
+            return {r[0] for r in con.execute('SELECT DISTINCT run FROM matches')}
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return set()
+
+
+def _all_runs(rs):
+    """The `*` entry: every run on disk added up (its leaderboard also counts runs only the history has)."""
+    from .history import ALL
+    return {'run': ALL, 'title': 'All runs', 'all': True, 'runs': len(rs),
+            **{k: sum(r[k] for r in rs) for k in ('matchups', 'matchups_started', 'matchups_finished', 'hands', 'hands_planned')},
+            'players': sorted({p for r in rs for p in r['players']}),
+            'live': any(r['live'] for r in rs), 'finished': all(r['finished'] for r in rs),
+            'updated': max(r['updated'] for r in rs),
+            'started_at': min((r['started_at'] for r in rs if r['started_at']), default=None),
+            'hands_per_hour': None, 'eta_seconds': None}
 
 
 def match(root: Path, mid: str):
@@ -200,6 +239,10 @@ def match(root: Path, mid: str):
 
 def ratings_for(root: Path, run, boot=200):
     from .ratings import ratings
+    from . import history
+    if run == history.ALL:
+        history.sync(root)
+        return history.all_time(root / history.DB_NAME, boot=boot, players_file=PLAYERS_FILE[0])
     base = root if run in (None, '', '.') else (root / run).resolve()
     if root != base and root not in base.parents:
         return None
@@ -217,6 +260,7 @@ def export(root, out, players_file='players.toml') -> int:
     """A static copy of the viewer for the runs under root: the app plus every API answer as a file."""
     root, out = Path(root).resolve(), Path(out)
     LABELS.update(load_labels(players_file))
+    PLAYERS_FILE[0] = players_file
     data = out / 'data'
     data.mkdir(parents=True, exist_ok=True)
     for f in VIEWER.iterdir():
@@ -237,12 +281,16 @@ def export(root, out, players_file='players.toml') -> int:
         r['live'] = False
         r['eta_seconds'] = None
     put('runs.json', rs)
+    done = set()
     for r in rs:
         ms = index(root, r['run'])
         for m in ms:
             m['live'] = False
             for x in m['matches']:
                 x['live'] = False
+                if x['id'] in done:   # the same match again, in the all-runs list
+                    continue
+                done.add(x['id'])
                 data_ = match(root, x['id'])
                 specs = data_['config'].get('specs', {})  # only what the viewer shows: no commands, paths or URLs
                 data_['config']['specs'] = {p: {k: v for k, v in s.items() if k in ('label', 'model', 'bot', 'effort')}
@@ -254,16 +302,23 @@ def export(root, out, players_file='players.toml') -> int:
 
 
 def serve(root, port=8800, host='127.0.0.1', players_file='players.toml'):
+    import threading
+    from .history import ALL
     root = Path(root).resolve()  # match folders are resolved before use, so the root must be too
     LABELS.update(load_labels(players_file))
+    PLAYERS_FILE[0] = players_file
     cache = {}
+    lock = threading.Lock()   # one recompute at a time (and one writer to the history database)
 
     def ratings_json(run):
-        base = root if run in (None, '', '.') else (root / run).resolve()
+        base = root if run in (None, '', '.', ALL) else (root / run).resolve()
+        if base != root and root not in base.parents:
+            return None
         stamp = tuple(sorted((str(p), _mtime(p)) for p in base.rglob('*.jsonl')))
-        if cache.get(str(base), (None,))[0] != stamp:
-            cache[str(base)] = (stamp, ratings_for(root, run))
-        return cache[str(base)][1]
+        with lock:
+            if cache.get(run, (None,))[0] != stamp:
+                cache[run] = (stamp, ratings_for(root, run))
+            return cache[run][1]
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):

@@ -127,6 +127,83 @@ class TestViewerData(unittest.TestCase):
 
 
 
+class TestHistory(unittest.TestCase):
+    """The SQLite history: incremental sync, pooling by model and level, deleted and restarted folders,
+    other game settings left out, and the viewer's all-runs entry."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name).resolve()
+        self.players = self.root / 'players.toml'
+        self.players.write_text('[players.rule]\nbot = "rule"\nsims = 40\n[players.station]\nbot = "station"\n'
+                                '[players.station2]\nbot = "station"\nlabel = "Calling station"\n[players.random]\nbot = "random"\n')
+        self.runs = self.root / 'runs'
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def play(self, run, matchups, deals=10, **game):
+        plan = make_plan(sorted({p for m in matchups for p in m}), deals=deals, out=str(self.runs / run),
+                         players_file=str(self.players), matchups=matchups, game_config=game)
+        asyncio.run(run_plan(plan, log=lambda *a: None))
+
+    def test_pooling_and_survival(self):
+        from poker_arena import history
+        self.play('one', [['rule', 'station'], ['rule', 'random']])
+        self.play('two', [['station2', 'rule'], ['station', 'station2']])
+        self.assertEqual(history.sync(self.runs)['matches'], 8)
+        self.assertEqual(history.sync(self.runs)['matches'], 0)          # nothing changed: nothing read again
+        db = self.runs / history.DB_NAME
+        r = history.all_time(db, boot=10, players_file=str(self.players))
+        self.assertEqual({p['player'] for p in r['players']}, {'bot:rule:sims=40', 'bot:station', 'bot:random'})
+        self.assertEqual(sorted(r['ids']['bot:station']), ['station', 'station2'])  # one bot, two ids
+        self.assertEqual(r['deals'], 30)                                  # the station-vs-station2 deals don't count
+        self.assertEqual({x['run']: x['self_play'] for x in r['runs']}, {'one': 0, 'two': 10})
+        pair = next(m for m in r['matchups'] if {m['a'], m['b']} == {'bot:rule:sims=40', 'bot:station'})
+        self.assertEqual(pair['deals'], 20)                               # pooled across both runs
+        self.assertEqual(r['stats']['bot:station']['hands'], 40)          # as station, then as station2; no self-play
+        self.assertEqual(r['labels']['bot:rule:sims=40'], 'Rule bot')
+
+        import shutil
+        shutil.rmtree(self.runs / 'two')
+        history.sync(self.runs)
+        r = history.all_time(db, boot=10, players_file=str(self.players))
+        self.assertEqual(r['deals'], 30)                                  # the deleted run is still counted
+        rs = server.runs(self.runs)
+        self.assertEqual(rs[0]['run'], '*')                               # one run on disk, two in the history
+        self.assertEqual(server.ratings_for(self.runs, '*', boot=10)['deals'], 30)
+
+    def test_restarted_folder_and_other_settings(self):
+        from poker_arena import history
+        self.play('one', [['rule', 'station']])
+        self.play('short', [['rule', 'random']], deals=2, stack=40)       # other settings: not pooled
+        history.sync(self.runs)
+        r = history.all_time(self.runs / history.DB_NAME, boot=10)
+        self.assertEqual(r['left_out'], [{'run': 'short', 'reason': 'other game settings'}])
+        self.assertNotIn('bot:random', {p['player'] for p in r['players']})
+        import shutil
+        shutil.rmtree(self.runs / 'one')
+        self.play('one', [['rule', 'station']], deals=4)                  # the same folder, started over
+        history.sync(self.runs)
+        r = history.all_time(self.runs / history.DB_NAME, boot=10)
+        self.assertEqual(r['deals'], 4)
+
+    def test_identity(self):
+        from poker_arena.history import identity
+        self.assertEqual(identity('x', {'backend': 'claude', 'model': 'm', 'effort': 'high'}), 'claude:m:high')
+        self.assertEqual(identity('y', {'backend': 'claude', 'model': 'm'}), 'claude:m:default')
+        self.assertEqual(identity('z', {'bot': 'rule', 'sims': 200, 'label': 'R'}), 'bot:rule:sims=200')
+        self.assertEqual(identity('c', {'backend': 'command', 'command': ['x']}), 'command:c')
+
+    def test_same_name_told_apart(self):
+        from poker_arena.history import _disambiguate
+        labels = {'claude:m:high': 'M · high', 'api:m:high': 'M · high', 'bot:rule:sims=40': 'Rule bot',
+                  'bot:rule:sims=200': 'Rule bot'}
+        _disambiguate(labels)
+        self.assertEqual(labels['api:m:high'], 'M · high (api)')
+        self.assertEqual(labels['bot:rule:sims=200'], 'Rule bot (sims=200)')
+
+
 class TestNames(unittest.TestCase):
     def test_display_names(self):
         self.assertEqual(server.pretty_model('claude-opus-5-5'), 'Claude Opus 5.5')
@@ -135,6 +212,8 @@ class TestNames(unittest.TestCase):
         self.assertEqual(server.display_name('x', {'backend': 'codex', 'model': 'gpt-6-luna', 'effort': 'high'}), 'GPT-6 Luna · high')
         self.assertEqual(server.display_name('x', {'label': 'Mine', 'model': 'm'}), 'Mine')
         self.assertEqual(server.display_name('codex-gpt', {'backend': 'codex'}), 'codex-gpt')  # no model: the id
+        self.assertEqual(server.display_name('s', {'backend': 'claude', 'model': 'claude-sonnet-5-5'}),
+                         'Claude Sonnet 5.5 · default')   # a run from before levels were set
 
 
 

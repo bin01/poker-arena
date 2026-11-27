@@ -119,6 +119,25 @@ so 100 hands take 30–90 minutes per model seat. The pilot is about 6,000 model
 | `result.json` | totals and bb/100 when the match finishes |
 
 A tournament also writes its `plan.json` into `runs/<plan>/`, so the viewer can show matchups that haven't started.
+Each `config.json` records the arena's git commit (`code_version`) and when the match started.
+
+## History across runs
+
+`runs/arena.db` is a SQLite index of every match ever played under `runs/`: each match's settings and code
+version, every finished hand, every duplicate deal, and each player's style counts. It is filled from the
+folders (only the ones that changed since last time) and never deletes anything, so a run keeps its place in the
+history after its folder is removed. A folder that is started over replaces its own old rows.
+
+```sh
+python -m poker_arena history runs     # update arena.db and print the all-time leaderboard
+```
+
+The all-time leaderboard rates a player by **what it is: its model and reasoning level** (or a bot and its
+settings), not by its id in one run. Two ids with the same model and level pool their results, and the same model
+at another level is a different player. Sessions never span runs. Deals only pool when they were played under
+the same game settings (blinds and stacks change what bb/100 means); runs under other settings are listed as
+left out. Deals between two entries of the same model and level don't count. Runs from different code versions do
+pool, and the leaderboard says so. The viewer shows it as **All runs** in the run picker.
 
 ## The viewer
 
@@ -151,7 +170,7 @@ python -m http.server -d site 8000
 ```
 
 The export holds the viewer and every match's events (cards, actions, talk, reasoning, notes), but not the
-raw prompts and replies in `calls.jsonl`, and player settings are reduced to backend and model.
+raw prompts and replies in `calls.jsonl`, and player settings are reduced to label, model, reasoning level and bot.
 
 ## Extending it
 

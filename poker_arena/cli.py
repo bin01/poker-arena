@@ -65,7 +65,30 @@ def cmd_ratings(args):
 
 def cmd_view(args):
     from .server import serve
-    serve(args.root, args.port, args.host)
+    serve(args.root, args.port, args.host, players_file=args.players)
+
+
+def cmd_history(args):
+    """Update the history database from the runs under root, and print the all-time leaderboard."""
+    from . import history
+    root = Path(args.root).resolve()
+    db = Path(args.db) if args.db else root / history.DB_NAME
+    changed = history.sync(root, db)
+    r = history.all_time(db, boot=args.boot, players_file=args.players)
+    if args.json:
+        Path(args.json).write_text(json.dumps(r, indent=2))
+    print(f'{db}: {changed["matches"]} match folders updated\n')
+    if not r['players']:
+        print('No finished duplicate deals yet.')
+        return
+    print(history.table(r))
+    print(f'\n{r["deals"]:,} duplicate deals from {len(r["runs"])} runs, one player per model and reasoning level.')
+    for x in r['left_out']:
+        print(f'Left out: {x["run"]} (other game settings)')
+    if len(r['code_versions']) > 1:
+        print(f'Played on {len(r["code_versions"])} code versions: {", ".join(r["code_versions"])}')
+    if r['unversioned_runs']:
+        print(f'From before code versions were recorded: {", ".join(r["unversioned_runs"])}')
 
 
 def cmd_export(args):
@@ -80,7 +103,7 @@ def cmd_status(args):
     from .server import index, runs
     root = Path(args.root).resolve()
     for r in runs(root):
-        if args.run and r['run'] != args.run:
+        if r.get('all') or (args.run and r['run'] != args.run):
             continue
         state = 'finished' if r['finished'] else 'playing' if r['live'] else 'paused'
         line = f"{r['run']}: {state}, {r['hands']:,} of {r['hands_planned']:,} hands, " \
@@ -185,7 +208,16 @@ def main(argv=None):
     p.add_argument('root', nargs='?', default='runs')
     p.add_argument('--port', type=int, default=8800)
     p.add_argument('--host', default='127.0.0.1')
+    p.add_argument('--players', default='players.toml', help='for display names (default: players.toml here)')
     p.set_defaults(fn=cmd_view)
+
+    p = sub.add_parser('history', help='update the history database (runs/arena.db) and print the all-time leaderboard')
+    p.add_argument('root', nargs='?', default='runs')
+    p.add_argument('--db', help='database file (default: arena.db in root)')
+    p.add_argument('--boot', type=int, default=300)
+    p.add_argument('--players', default='players.toml', help='for display names (default: players.toml here)')
+    p.add_argument('--json', help='also write the leaderboard as JSON')
+    p.set_defaults(fn=cmd_history)
 
     p = sub.add_parser('export', help='write the viewer and a run\'s data as a static site you can host anywhere')
     p.add_argument('root', nargs='?', default='runs')

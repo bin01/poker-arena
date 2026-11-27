@@ -45,6 +45,20 @@ def load_players(path, effort: str | None = None) -> dict:
     return players
 
 
+def code_version() -> str | None:
+    """The git commit the arena is running from (with "+dirty" if it has local changes), or None."""
+    import subprocess
+    here = Path(__file__).resolve().parent
+    try:
+        sha = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'], cwd=here, capture_output=True, text=True,
+                             timeout=5).stdout.strip()
+        dirty = subprocess.run(['git', 'status', '--porcelain', '--untracked-files=no'], cwd=here, capture_output=True,
+                               text=True, timeout=5).stdout.strip()
+        return (sha + ('+dirty' if dirty else '')) or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def _append(path: Path, obj):
     with path.open('a') as f:
         f.write(json.dumps(obj, default=str) + '\n')
@@ -73,6 +87,7 @@ async def run_match(game, seat_players: list[tuple[str, dict]], seeds: list[int]
     names = NAMES[:n]
     ids = [p for p, _ in seat_players]
     config = {'game': game.describe(), 'players': ids, 'names': names, 'seeds': seeds,
+              'code_version': code_version(), 'started': round(time.time()),
               'specs': {p: {k: v for k, v in s.items() if 'key' not in k.lower()} for p, s in seat_players}}
     if not (out / 'config.json').exists():
         (out / 'config.json').write_text(json.dumps(config, indent=2))
