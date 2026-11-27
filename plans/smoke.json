@@ -1,0 +1,28 @@
+{
+  "game": "holdem",
+  "game_config": {},
+  "players_file": "players.toml",
+  "players": [
+    "claude-sonnet",
+    "rule",
+    "station"
+  ],
+  "matchups": [
+    [
+      "claude-sonnet",
+      "rule"
+    ],
+    [
+      "claude-sonnet",
+      "station"
+    ],
+    [
+      "rule",
+      "station"
+    ]
+  ],
+  "deals": 10,
+  "seed": 1000,
+  "out": "runs/smoke",
+  "concurrency": 2
+}

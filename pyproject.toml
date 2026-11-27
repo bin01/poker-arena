@@ -1,0 +1,22 @@
+[project]
+name = "poker-arena"
+version = "0.1.0"
+description = "An eval in which LLM agents play duplicate No-Limit Hold'em and are rated on the Elo scale"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+poker-arena = "poker_arena.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["poker_arena*"]
+
+[tool.setuptools.package-data]
+poker_arena = ["viewer/*"]

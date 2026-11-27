@@ -1,0 +1,58 @@
+# Who can play. Each entry is a model (a `backend`) or a baseline bot (`bot`).
+# Subscription backends use the official CLIs, signed in with your own plan:
+#   claude  -> Claude Code (`claude login`), Claude Pro/Max
+#   codex   -> Codex CLI (`codex login`), ChatGPT Plus/Pro
+#   agy     -> Google Antigravity CLI (Gemini models, Google account)
+#   gemini  -> Gemini CLI, where still installed
+#   command -> any CLI that reads a prompt on stdin, e.g. pi or ollama
+# A model player is a model at a reasoning level. Always set `model`: without it a CLI uses whatever default
+# your own settings have. `effort` is the reasoning level (claude, codex and agy); it defaults to "high", and
+# `--effort` on `tournament` or `play` sets it for everyone. The viewer names the player after both
+# (e.g. "Claude Opus 5.5 · high"); set `label` only to override that. The [players.ID] key names the
+# run folders, so give a new ID to a new model or effort rather than editing an old one.
+# Optional keys for any model: extra_args (list), timeout (seconds per call), rate_limit_wait (seconds
+# to wait when the plan's usage limit is hit), max_wait (total seconds to keep waiting).
+# Check them with: python -m poker_arena doctor
+
+[players.claude-opus]
+backend = "claude"
+model = "claude-opus-5-5"
+effort = "high"       # low, medium, high, xhigh, max (claude --effort)
+
+[players.claude-sonnet]
+backend = "claude"
+model = "claude-sonnet-5-5"
+effort = "high"
+
+[players.codex-gpt]
+backend = "codex"
+model = "gpt-6-luna"
+effort = "high"       # model_reasoning_effort
+
+[players.gemini-agy]
+backend = "agy"
+effort = "high"       # agy --effort; this model is also the "-high" variant (see `agy models`)
+# Always set a model: agy's default comes from your own settings and can be a non-Gemini model.
+model = "gemini-4-neon-high"   # see `agy models`
+
+# [players.pi-default]
+# backend = "command"
+# command = ["pi", "-p"]
+
+# [players.llama-local]
+# backend = "openai_compat"
+# base_url = "http://localhost:11434/v1"
+# model = "llama3.3"
+
+# Baseline bots: free, instant, and they anchor the scale.
+[players.random]
+label = "Random bot"
+bot = "random"
+
+[players.station]
+label = "Calling station"
+bot = "station"   # always checks or calls
+
+[players.rule]
+label = "Rule bot"
+bot = "rule"      # equity vs pot odds, value bets, never bluffs
