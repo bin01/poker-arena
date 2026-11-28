@@ -793,6 +793,7 @@ call, result or not: a mismatch anywhere counts.)
 - **The registration is a record, not a signature.** It proves the design was fixed before the first match
   started only as far as the files are honest: someone editing plan.json and every match config by hand could
   forge it.
-- **One game format.** Heads-up, stacks reset every hand, 100 big blinds deep by default (a plan may set other
+- **One game format.** Heads-up, stacks reset every hand, 100 big blinds deep by default (shown as a $10/$20 cash
+  game with $2,000 stacks; the models count the same game in chips, blinds 1/2) (a plan may set other
   stacks with `--stack`; the bound, and the conversations needed, scale with them). Strengths do not carry over
   to other formats.

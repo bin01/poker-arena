@@ -302,7 +302,7 @@ class Inventory:
                 'pair_net_a': sum(x[0] for x in deals.values()),
                 'kinds': {p: 'bot' if 'bot' in s else 'model' for p, s in specs.items()},
                 'labels': {p: LABELS.get(p) or display_name(p, s) for p, s in specs.items()},
-                'bb': game.get('big_unit') or game.get('bb') or 1,
+                'bb': game.get('big_unit') or game.get('bb') or 1, 'sb': game.get('sb'), 'stack': game.get('stack'),
                 'finished': len(matches) == 2 and all(x['finished'] for x in matches),
                 'failed': len(failures), '_failures': failures,
                 'times': [h['t'] for s in hands.values() for h in s if h.get('t')],

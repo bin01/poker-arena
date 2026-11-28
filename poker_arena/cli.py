@@ -337,6 +337,7 @@ def cmd_status(args):
     """Progress of every run under a folder: hands played, matchups playing, pace and time left, and the deals a
     model's CLI gave up on (who, how many, what the CLI said, and the call log to read)."""
     from .server import index, runs
+    from .stakes import money_signed, stakes
     root = Path(args.root).resolve()
     for r in runs(root):
         if r.get('all') or (args.run and r['run'] != args.run):
@@ -350,12 +351,16 @@ def cmd_status(args):
             line += f", about {r['eta_seconds'] / 3600:.1f} h left" if r['eta_seconds'] >= 3600 \
                 else f", about {max(1, round(r['eta_seconds'] / 60))} min left"
         print(line)
-        for m in index(root, r['run']):
+        ms = index(root, r['run'])
+        table = next((m for m in ms if m['started']), None)
+        if table:   # the table in dollars, as the viewer shows it (stakes.py); win rates elsewhere stay in bb/100
+            print(f"  stakes: {stakes(table)['line']}")
+        for m in ms:
             if m['finished'] and not args.all:
                 continue
             mark = 'playing' if m['live'] else 'not started' if not m['started'] else 'done' if m['finished'] \
                 else 'stopped on an error' if m.get('failed') else 'paused'
-            net = f", {m['a']} {m['pair_net_a'] / m['bb']:+.1f} bb" if m['pairs_done'] else ''
+            net = f", {m['a']} {money_signed(m['pair_net_a'] / m['bb'])}" if m['pairs_done'] else ''
             print(f"  {m['a']} vs {m['b']}: {m['pairs_done']}/{m['deals_total']} deals, {mark}{net}")
         for line in _failure_lines(r.get('failures'), root.name):
             print(line)
@@ -562,8 +567,10 @@ def forensics_text(fx: dict, labels: dict | None = None) -> str:
                    f'malformed {pf.get("malformed_json", 0)}, retries {pf.get("retries", 0)}, fallbacks {pf.get("fallbacks", 0)}')
         out.append(f'  covert intent   flagged turns {ci.get("flagged_turns", 0)}, under pressure {ci.get("under_pressure", 0)}, blocked {ci.get("blocked_attempts", 0)}')
         if d:
-            out.append(f'  EV decomposition  total {d.get("total_net_bb", 0):+.1f} bb = strategic {d.get("strategic_net_bb", 0):+.1f} bb '
-                       f'+ interface {-d.get("fallback_loss_bb", 0) + 0.0:+.1f} bb (fallbacks); {d.get("retry_decisions", 0)} retried, '
+            from .stakes import money_signed
+            out.append(f'  EV decomposition  total {money_signed(d.get("total_net_bb", 0))} = strategic '
+                       f'{money_signed(d.get("strategic_net_bb", 0))} + interface {money_signed(-d.get("fallback_loss_bb", 0) + 0.0)} '
+                       f'(fallbacks, at $10/$20 blinds); {d.get("retry_decisions", 0)} retried, '
                        f'{d.get("sizing_corrections", 0)} sizes corrected, clean decisions {d.get("clean_decision_rate", 0):.0%}')
         for ch in ('sandbox', 'prompt_injection', 'parser_fuzzing', 'covert_intent'):
             for inc in (p.get(ch) or {}).get('incidents', [])[:5]:
@@ -677,7 +684,8 @@ def main(argv=None):
     p.add_argument('--deals', type=int, default=1,
                    help='duplicate deals per conversation on the official track: must be 1 (fresh conversations every '
                         'deal); long conversations, where models adapt, are the adaptation track (--adaptation-deals)')
-    p.add_argument('--stack', type=int, help='chips per stack (default 200: 100 big blinds); the official test\'s bound, '
+    p.add_argument('--stack', type=int, help='chips per stack (default 200: 100 big blinds, shown as $2,000 at $10/$20 '
+                   'blinds); the official test\'s bound, '
                                              'and so the conversations it needs, scale with it')
     p.add_argument('--seed', type=int, default=1000)
     p.add_argument('--out', default='runs/pilot')
@@ -791,7 +799,7 @@ def main(argv=None):
                         'policy as a match design\'s allow_unattested)')
     p.set_defaults(fn=lambda a: __import__('poker_arena.quiz', fromlist=['main']).main(a))
 
-    p = sub.add_parser('scorecard', help='the six-axis character sheet of every player in a run (pip bars, 95% bands, reliability)')
+    p = sub.add_parser('scorecard', help='the six-axis character sheet of every player in a run (pip bars, 95%% bands, reliability)')
     p.add_argument('run')
     p.add_argument('--json', help='also write the full scorecard as JSON')
     p.add_argument('--solver', default='dcfr', choices=['dcfr', 'heuristic', 'texassolver'],

@@ -48,8 +48,12 @@ function ratingsLater(run, delay = 0) {
 // ---- formatting ---------------------------------------------------------------------------------
 const cls = x => x > 0 ? 'pos' : x < 0 ? 'neg' : '';
 const pct = x => x == null ? '<span class="dim">–</span>' : `${Math.round(x * 100)}%`;
-const bbs = (chips, bb) => `${trim(chips / bb)} bb`;
-const signedBB = (chips, bb) => chips === 0 ? '0 bb' : `${chips > 0 ? '+' : '−'}${trim(Math.abs(chips) / bb)} bb`;
+// Chips as dollars at the $10/$20 table (Core.money): every pot, bet, stack and result goes through these.
+const cash = (chips, bb) => Core.chipMoney(chips, bb);
+const signedCash = (chips, bb) => Core.chipMoneySigned(chips, bb);
+const money = Core.money, moneySigned = Core.moneySigned;
+// "50 bb/100" explained where it is shown: what it measures, and what it is worth at these stakes.
+const rateTip = rate => `Big blinds won per 100 hands: the win rate, whatever the stakes.${rate != null && isFinite(rate) ? ` At $10/$20 this is ${Core.perHundred(rate)}.` : ''}`;
 function duration(s) {
   if (s < 60) return 'under a minute';
   const m = Math.round(s / 60);
@@ -301,6 +305,13 @@ function whoText(ids) {
 }
 
 // The slim run header: title, one summary line, the status and integrity pills, and where to go next.
+// The table every hand is played at, for a header: "$10/$20 No-Limit Hold'em · $2,000 stacks".
+function stakesBit(game) {
+  const m = game ? null : state.index.find(x => x.started && x.stack) || state.index.find(x => x.started);
+  const k = Core.stakesOf(game || (m ? { bb: m.bb, sb: m.sb, stack: m.stack } : null));
+  const deep = k.stack ? ` Both players start every hand with ${k.stack} (${k.stackBB} big blinds).` : '';
+  return `<span class="stakes" title="${esc(`A ${k.blinds} no-limit cash game: the small blind is ${k.sb}, the big blind ${k.bb}.${deep} ${Core.chipNote(game ? game.big_unit || game.bb : m && m.bb)}`)}">${esc(k.line)}</span>`;
+}
 function runHeader(r, rt, raw) {
   const st = runStatus(rt);
   const open = store.get('plan-open', false);
@@ -329,7 +340,7 @@ function runHeader(r, rt, raw) {
   const rawSlug = !r.all && state.run && state.run !== '.' ? state.run.split('/').pop() : '';
   const slugTip = rawSlug && rawSlug !== runLabel(state.run) ? ` title="Run folder: runs/${esc(state.run)}"` : '';
   return `<header class="run-head">
-    <div class="rh-main"><h1${slugTip}>${title}</h1><div class="rh-sub">${bits.filter(Boolean).join(' · ')}</div>${meter}</div>
+    <div class="rh-main"><h1${slugTip}>${title}</h1><div class="rh-sub">${bits.filter(Boolean).join(' · ')}</div><div class="rh-stakes">${stakesBit(r.all ? {} : null)}</div>${meter}</div>
     <div class="rh-actions">
       <button class="pill ${st.tone}" id="judged-toggle" aria-expanded="${open}" aria-controls="judged" title="${esc(st.tip || 'How this run is judged')}">${esc(st.text)}<i class="caret" aria-hidden="true"></i></button>
       ${fxPill}
@@ -355,7 +366,7 @@ function aboutText(rt) {
   const ids = rt && rt.players.length ? rt.players.map(p => p.player) : state.index.flatMap(m => [m.a, m.b]);
   const models = ids.filter(p => !isBot(p));
   return `<p><b>${ids.length && !models.length ? 'Baseline bots play heads-up No-Limit Hold\'em to serve as fixed benchmarks.' : 'AI models play heads-up No-Limit Hold\'em against each other.'}</b>
-    Every deal is played twice with the seats swapped, so both models play the exact same cards and card luck mostly cancels out. Scores are in <b>bb/100</b> (big blinds won per 100 hands, above 0 = winning).
+    Every deal is played twice with the seats swapped, so both models play the exact same cards and card luck mostly cancels out. The table is a ${Core.stakesOf().blinds} no-limit cash game with ${money(100)} stacks, reset every hand. Win rates are in <b>bb/100</b> (big blinds won per 100 hands, above 0 = winning): at these stakes 50 bb/100 is ${money(50)} per 100 hands.
     A <span class="decided-badge">Decided</span> badge means a pre-planned statistical test proved the winner; everything else shows who is leading so far.</p>`;
 }
 
@@ -474,7 +485,7 @@ function leaderStrip(rt, g, multi, first = true) {
   if (wrong) warn.push(chip(`wrong model on ${plural(wrong, 'call')}`, 'bad', 'A provider returned a different model than requested: see Audit & call logs.'));
   if (misfit) warn.push(chip('check Matchups directly', 'quiet', 'Some head-to-head results differ from what the overall leaderboard predicts: read the Matchups list directly.'));
   const lead = p ? `${monogram(who, 'lg')}<span class="ls-text"><span class="ls-name">${name(who)}</span>
-      <span class="ls-what">${g.leader ? 'leads' : tone === 'drift' ? 'was ahead' : 'leads'} at <b class="${cls(p.strength)}" title="${esc(STRENGTH_TIP)}">${fmtStrength(p.strength)} bb/100</b>${p.net_bb != null ? `<span class="ls-net"> · <b class="${cls(p.net_bb)}">${signed(p.net_bb, 0)} bb</b> net</span>` : ''}</span></span>`
+      <span class="ls-what">${g.leader ? 'leads' : tone === 'drift' ? 'was ahead' : 'leads'} at <b class="${cls(p.strength)}" title="${esc(STRENGTH_TIP)}">${fmtStrength(p.strength)} bb/100</b>${p.net_bb != null ? `<span class="ls-net"> · <b class="${cls(p.net_bb)}">${moneySigned(p.net_bb)}</b> net</span>` : ''}</span></span>`
     : `<span class="ls-text"><span class="ls-what">${n < 2 ? 'Waiting for a second player\'s results' : 'Too close to call so far'}</span></span>`;
   return `<div class="leader-strip ${tone}">
     ${multi ? `<span class="ls-group">${esc(groupName(g))}</span>` : ''}
@@ -553,7 +564,7 @@ function planPanel(rt, extras = []) {
       ${notes ? `<details class="pp-notes"><summary><b>Technical notes from the rating engine</b></summary><ul>${notes}</ul></details>` : ''}</div>
       <dl class="jd-gloss">
         <dt>Decided</dt><dd>A winner confirmed by a pre-planned statistical test, not just short-term luck. Valid as long as each model stayed unchanged throughout the run.</dd>
-        <dt>Leading so far</dt><dd>Who won more chips in the hands played so far, before a formal test settles it.</dd>
+        <dt>Leading so far</dt><dd>Who won more money in the hands played so far, before a formal test settles it.</dd>
         <dt>Win rate (bb/100)</dt><dd>Big blinds won per 100 hands, balanced so the group averages 0. Compare any two models by the gap between their numbers. If a head-to-head matchup disagrees, trust the direct matchup.</dd>
         <dt>Direct avg</dt><dd>Simple average of a model's head-to-head margins, weighing every opponent equally.</dd>
         <dt>Error bars</dt><dd>The shaded bar shows rough uncertainty. In official tests it stays valid whenever play stops; in practice runs it simply shows how spread out the hands were.</dd>
@@ -993,7 +1004,7 @@ function standings(rt, waiting) {
          <span class="r col-more" title="${esc(OBSERVED_TIP)}">Direct avg</span><span class="r col-more" title="Secondary rating from mini-sessions won (${esc(sessionText(rt))}); not used for official ranks">Session rating</span>
          <span class="r go-h"><span class="sr">Scorecard</span></span></div>
        ${rows}${extra}</div>`,
-      `${ranked ? 'A number in the first column is a statistically confirmed rank. ' : ''}Big blinds won per 100 hands (above 0 = winning). The gap between two models estimates their head-to-head edge; wider bars mean less certainty.`);
+      `${ranked ? 'A number in the first column is a statistically confirmed rank. ' : ''}Win rate: big blinds won per 100 hands (above 0 = winning); a big blind is $20, so +50 is $1,000 per 100 hands. Net is the money won or lost in total. The gap between two models estimates their head-to-head edge; wider bars mean less certainty.`);
   });
   if (!out && waiting.length) out = section('Standings', '', `<div class="board-list unranked">${waitingRows(waiting, false)}</div>`);
   const out_ = rt.players.filter(p => !p.in_fit);
@@ -1001,7 +1012,7 @@ function standings(rt, waiting) {
     out += section(rt.cohort?.kind === 'history' ? 'Older unrated entries' : 'Not on leaderboard', 'played, but excluded from rankings', `<div class="board-list unranked left-out ${store.get('more-cols', false) ? 'more' : ''}">${out_.map(p => `<div class="brow quarantined">
       ${player(p.player, `<div class="small soft why-out">${esc(p.unrated_reason || p.quarantine_reason || 'did not play any ranked opponent')}</div>`)}
       <span class="r strength soft">${p.hands ? `<small>${plural(p.hands, 'hand')}</small>` : ''}</span><span class="axis"></span>
-      <span class="r hide-sm soft">${p.net_bb != null ? signed(p.net_bb, 0) + ' bb' : ''}</span><span class="col-more"></span><span class="col-more"></span><span></span></div>`).join('')}</div>`,
+      <span class="r hide-sm soft">${p.net_bb != null ? moneySigned(p.net_bb) : ''}</span><span class="col-more"></span><span class="col-more"></span><span></span></div>`).join('')}</div>`,
       'Excluded when the exact model or reasoning level was not recorded, or when it only played other excluded entries.');
   }
   return out;
@@ -1038,7 +1049,7 @@ function standingRow(rt, g, p, ax, ranked, inBlock = false) {
   if (idf) notes.push(idf);
   if (!inBlock && tied.length && tied.length < g.members.length - 1) notes.push(`<span class="small soft">still too close with ${tied.map(plain).join(', ')}</span>`);
   const obs = p.observed_edge != null ? signed(p.observed_edge, 0) : null;
-  const mob = `<div class="mob-line small soft">${obs != null ? `<span class="${cls(p.observed_edge)}" title="${esc(OBSERVED_TIP)}">${obs} direct avg</span> · ` : ''}${p.net_bb != null ? `<span class="${cls(p.net_bb)}">${signed(p.net_bb, 0)} bb</span> · ` : ''}${plural(p.hands || 0, 'hand')}</div>`;
+  const mob = `<div class="mob-line small soft">${obs != null ? `<span class="${cls(p.observed_edge)}" title="${esc(OBSERVED_TIP)}">${obs} direct avg</span> · ` : ''}${p.net_bb != null ? `<span class="${cls(p.net_bb)}">${moneySigned(p.net_bb)}</span> · ` : ''}${plural(p.hands || 0, 'hand')}</div>`;
   const leader = g.leader === p.player;
   const b = Core.basisOf(p);
   const whisker = `<div class="whisker ${b ? b.key : ''}" title="${ci ? `Rough range: ${ciText(ci)} bb/100` : 'No range yet: too few deals'}">
@@ -1053,7 +1064,7 @@ function standingRow(rt, g, p, ax, ranked, inBlock = false) {
     ${player(p.player, `${notes.length ? `<div class="row-notes">${notes.join(' ')}</div>` : ''}${mob}`)}
     <span class="r strength"><b class="${cls(p.strength)}" title="${esc(STRENGTH_TIP)}">${fmtStrength(p.strength)}</b>${ci ? `<small title="${esc(Core.DESCRIPTIVE_TIP)}${b ? ' ' + esc(b.long) : ''}">±${half}</small>` : '<small>not enough hands</small>'}</span>
     <span class="axis">${whisker}</span>
-    <span class="r hide-sm net"><span class="${cls(p.net_bb)}">${p.net_bb != null ? signed(p.net_bb, 0) + ' bb' : '–'}</span><small>${plural(p.hands || 0, 'hand')}</small></span>
+    <span class="r hide-sm net"><span class="${cls(p.net_bb)}">${p.net_bb != null ? moneySigned(p.net_bb) : '–'}</span><small>${plural(p.hands || 0, 'hand')}</small></span>
     <span class="r col-more obs" title="${esc(OBSERVED_TIP)}">${obs != null ? `<span class="${cls(p.observed_edge)}">${obs}</span><small>vs ${plural(p.observed_opponents || 0, 'opponent')}</small>` : '<small>–</small>'}</span>
     <span class="r col-more sess">${elo}</span>
     <span class="r go">${sc}</span></div>`;
@@ -1244,7 +1255,7 @@ const answerText = (a, bb) => {
   if (a == null) return '–';
   const x = typeof a === 'string' ? { action: a } : a;
   const word = ACTION_WORD[x.action] || x.action || '–';
-  return x.amount != null && !['fold', 'check'].includes(x.action) ? `${word} ${bbs(x.amount, bb)}` : word;
+  return x.amount != null && !['fold', 'check'].includes(x.action) ? `${word} ${cash(x.amount, bb)}` : word;
 };
 const answerKey = a => (typeof a === 'string' ? a : a && a.action) || null;
 const lostOf = a => a ? a.ev_lost_bb ?? a.ev_loss_bb ?? a.regret_bb ?? null : null;
@@ -1335,16 +1346,16 @@ function quizScores(q) {
     return `<div class="qrow ${x.reference ? 'ref' : ''}">${player(x.player, `<div class="q-prov">${provChip(x)}</div>`, { details: false })}
       <span class="q-score"><b>${x.correct ?? '–'}</b><small>/${x.total ?? '–'} right</small>${valid}</span>
       <span class="q-bar" title="${Math.round(share * 100)}% right"><span style="width:${(share * 100).toFixed(1)}%"></span></span>
-      <span class="q-lost" title="Expected big blinds lost compared with the best answer, totaled over ${sc ? `the ${esc(catTitle(q, sc).toLowerCase())} spots` : 'every spot'}">${x.ev_lost_bb != null
-        ? `<b class="${x.ev_lost_bb > 0 ? 'neg' : ''}">${trim(Math.round(x.ev_lost_bb * 10) / 10)}</b><small> bb lost</small><span class="q-lostbar"><span style="width:${(100 * (x.ev_lost_bb || 0) / maxLost).toFixed(1)}%"></span></span>` : '<span class="dim">–</span>'}</span></div>`;
+      <span class="q-lost" title="Expected amount lost compared with the best answer, totaled over ${sc ? `the ${esc(catTitle(q, sc).toLowerCase())} spots` : 'every spot'}">${x.ev_lost_bb != null
+        ? `<b class="${x.ev_lost_bb > 0 ? 'neg' : ''}">${money(x.ev_lost_bb)}</b><small> lost</small><span class="q-lostbar"><span style="width:${(100 * (x.ev_lost_bb || 0) / maxLost).toFixed(1)}%"></span></span>` : '<span class="dim">–</span>'}</span></div>`;
   }).join('');
   const ref = q.players.filter(x => x.reference);
   const info = sc && q.category_info[sc];
   const caption = `${sc ? `Scores above cover the <b>${esc(catTitle(q, sc).toLowerCase())}</b> category only${info && info.about ? ` (${esc(info.about)})` : ''}. Harder categories are shown separately below.` : 'Right: spots answered with the mathematically best move.'}
     Auto-folds (no legal answer after retrying) never count as right.
-    "bb lost" is the total expected chips given up vs. the best move.${ref.length ? ` <b>${ref.map(x => plain(x.player)).join(', ')}</b> is a simple baseline bot.` : ''}
+    "Lost" is the total expected amount given up vs. the best move, at $10/$20 blinds.${ref.length ? ` <b>${ref.map(x => plain(x.player)).join(', ')}</b> is a simple baseline bot.` : ''}
     ${q.population || q.estimand ? ` Scope: ${esc(q.population || q.estimand)}.` : ' Scores reflect this fixed set of textbook spots only.'}`;
-  return section(sc ? `Scores · ${esc(catTitle(q, sc))}` : 'Scores', sc ? 'main category · fewer bb lost is better' : 'fewer bb lost is better', `<div class="qlist">${rows}</div>`, caption) + quizCategories(q);
+  return section(sc ? `Scores · ${esc(catTitle(q, sc))}` : 'Scores', sc ? 'main category · less lost is better' : 'less lost is better', `<div class="qlist">${rows}</div>`, caption) + quizCategories(q);
 }
 
 // Per category: each player's right answers out of the category's own spots, fallbacks and loss beside them.
@@ -1358,7 +1369,7 @@ function quizCategories(q) {
     if (!k || !k.total) return { cls: '', html: '<span class="dim">–</span>' };
     const r = (k.correct ?? 0) / k.total;
     const lost = num(k.ev_lost_bb, k.ev_loss_bb);
-    return { cls: `qcat ${r === 1 ? 'full' : r < 0.5 ? 'low' : ''}`, html: `${k.correct ?? 0}<small class="nof">/${k.total}${k.fallbacks ? ` · ${k.fallbacks} auto-fold` : ''}${lost != null ? ` · ${trim(Math.round(lost * 10) / 10)} bb lost` : ''}</small>` };
+    return { cls: `qcat ${r === 1 ? 'full' : r < 0.5 ? 'low' : ''}`, html: `${k.correct ?? 0}<small class="nof">/${k.total}${k.fallbacks ? ` · ${k.fallbacks} auto-fold` : ''}${lost != null ? ` · ${money(lost)} lost` : ''}</small>` };
   };
   const rows = q.players.map(x => `<tr><td class="who-cell">${player(x.player, '', { details: false })}</td>${cats.map(c => {
     const v = cell(x, c);
@@ -1443,12 +1454,12 @@ function spotView(q, s) {
   const closes = toCall && (['call', 'inference'].includes(s.kind) || PokerTable.callCloses({ street: s.street, toCall, stack: s.stack, opponentAllIn: s.villain_stack === 0 }));
   const ev = s.ev || {};
   const facts = [
-    ['Pot', bbs(pot, bb)], toCall ? ['To call', bbs(toCall, bb)] : null,
+    ['Pot', cash(pot, bb)], toCall ? ['To call', cash(toCall, bb)] : null,
     need != null ? (closes ? ['Break-even', `${Math.round(need * 100)}% <small>calling ends the betting, so it must win this often to profit</small>`]
       : ['Call price', `${Math.round(need * 100)}% <small>immediate pot odds before future betting</small>`]) : null,
     s.equity != null ? ['Win chance', `${Math.round(s.equity * 100)}% <small>${esc(s.equity_note || 'against the opponent\'s stated hands')}</small>`] : null,
     ['Best move', `<b class="gold">${esc(answerText(s.best, bb))}</b>`],
-    Object.keys(ev).length ? ['Expected value', Object.entries(ev).map(([k, v]) => `${esc(ACTION_WORD[k] || k)} ${signed(v, 1)} bb`).join(' · ')] : null,
+    Object.keys(ev).length ? ['Expected value', Object.entries(ev).map(([k, v]) => `${esc(ACTION_WORD[k] || k)} ${moneySigned(v)}`).join(' · ')] : null,
   ].filter(Boolean).map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
   const answers = q.players.map(x => {
     const a = x.answers[s.id];
@@ -1459,15 +1470,15 @@ function spotView(q, s) {
     return `<div class="qans ${ok == null ? '' : ok ? 'ok' : 'bad'} ${x.reference ? 'ref' : ''}">${player(x.player, '', { details: false })}
       <span class="qa-act">${a ? esc(answerText(a, bb)) : '<span class="dim">no answer</span>'}</span>
       <span class="qa-ok">${ok == null ? '' : fb ? `<span title="No legal answer after retrying, so the game auto-folded/checked (no credit)">! auto-fold, no credit</span>` : ok ? '✓ best' : '✗ not best'}</span>
-      <span class="qa-lost">${lost != null ? (lost > 0 ? `<b class="neg">${trim(Math.round(lost * 10) / 10)}</b> bb lost` : '0 bb lost') : ''}</span>${why}</div>`;
+      <span class="qa-lost">${lost != null ? (lost > 0 ? `<b class="neg">${money(lost)}</b> lost` : '$0 lost') : ''}</span>${why}</div>`;
   }).join('');
   return `<div class="spot-nav"><a href="${quizLink()}">‹ All spots</a><span>Spot ${i + 1} of ${q.spots.length} · ${esc(catTitle(q, s.category || s.kind || 'other'))}</span>
       <span class="nav">${prev ? `<a href="${quizLink(prev.id)}" aria-label="Previous spot">←</a>` : '<span class="dim">←</span>'}${next ? `<a href="${quizLink(next.id)}" aria-label="Next spot">→</a>` : '<span class="dim">→</span>'}</span></div>
-    <div class="spot-grid"><div class="spot-main"><div class="card-box play spot-table"><div class="play-head"><h3>${esc(Core.spotTitle(s))}</h3><span class="small soft">${esc(s.situation || s.history || '')}</span></div>
+    <div class="spot-grid"><div class="spot-main"><div class="card-box play spot-table"><div class="play-head"><h3>${esc(Core.spotTitle(s))}</h3><span class="small soft">${esc(Core.bbProse(s.situation || s.history || ''))}</span></div>
       <div class="table-slot">${PokerTable.html([{ name: '<span class="nm">Player</span>', badge: '<span class="mono lg" style="--c:#a97a2a">?</span>' },
         { name: '<span class="nm">Opponent</span>', badge: '<span class="mono lg" style="--c:#55605a">Op</span>' }])}</div></div>
       ${spotQuestion(q, s)}</div>
-      <div class="spot-side"><div class="card-box spot-facts"><dl>${facts}</dl>${s.explain || s.explanation ? `<p class="spot-explain">${esc(s.explain || s.explanation)}</p>` : ''}</div>
+      <div class="spot-side"><div class="card-box spot-facts"><dl>${facts}</dl>${s.explain || s.explanation ? `<p class="spot-explain">${esc(Core.bbProse(s.explain || s.explanation))}</p>` : ''}</div>
         <div class="card-box spot-answers"><div class="sa-head">Each player's answer</div>${answers}</div></div></div>`;
 }
 
@@ -1509,7 +1520,7 @@ function drawSpot(s) {
     seats: [seat(s.hole || [], s.stack ?? s.hero_stack ?? 0, heroBet, ''), seat(['??', '??'], s.villain_stack ?? s.stack ?? 0, villainBet, s.villain_action || (toCall ? 'bet' : ''))],
     done: false, toAct: 0, toCall, potOdds: toCall ? toCall / (pot + toCall) : null,
     callCloses: toCall ? ['call', 'inference'].includes(s.kind) || PokerTable.callCloses({ street: snapStreet(s, board), toCall, stack: s.stack, opponentAllIn: s.villain_stack === 0 }) : null };
-  PokerTable.show(el, snap, { fmt: c => bbs(c, bb), hidden: [1], names: ['Player', 'Opponent'] });
+  PokerTable.show(el, snap, { fmt: c => cash(c, bb), hidden: [1], names: ['Player', 'Opponent'] });
 }
 
 // ---- games ----------------------------------------------------------------------------------------
@@ -1716,7 +1727,7 @@ function dealNav(seq, pos, L, R, swings) {
   const label = x => longConv ? (rounds > 1 ? `R${x.round} · S${x.replicate}` : `Session ${x.replicate}`) : `Round ${x.round}`;
   const cell = ([x, i]) => {
     const who = x.net > 0 ? short3(L) : short3(R);
-    const what = x.net == null ? STATUS_WORD[x.status] || x.status : x.net === 0 ? 'even over both plays' : `${who} won ${trim(Math.abs(x.net))} bb over both plays`;
+    const what = x.net == null ? STATUS_WORD[x.status] || x.status : x.net === 0 ? 'even over both plays' : `${who} won ${money(Math.abs(x.net))} over both plays`;
     const tip = `Deal ${i + 1}${groups.size > 1 ? ` (${label(x)}${x.deals_total > 1 ? `, deal ${x.deal + 1}` : ''})` : ''}: ${what}${x.net != null && x.status !== 'verified' ? ` · ${STATUS_WORD[x.status]}` : ''}`;
     return `<button class="dn-cell s-${x.status} ${i === pos ? 'on' : ''} ${swing.has(`${x.id}#${x.deal}`) ? 'swing' : ''} ${x.reach === 'showdown' ? 'sd' : ''}"
       data-seq="${i}" style="--c:${x.net == null ? '' : chipColor(x.net, max)}" title="${esc(tip)}" aria-label="${esc(tip)}"></button>`;
@@ -1762,7 +1773,7 @@ async function matchBody(cur, params, rt, P) {
   // the scoreboard: the whole pairing, checked deals only
   const v = pairing ? verdict(pairing, plain) : null;
   const lead = tot.net > 0 ? L : tot.net < 0 ? R : null;
-  const amount = trim(Math.abs(Math.round(tot.net * 10) / 10));
+  const amount = money(Math.abs(tot.net));
   const rate = tot.counted ? Math.abs(tot.net) / (2 * tot.counted) * 100 : 0;
   const face = (p, side) => `<div class="sb-face ${side} ${lead === p ? 'ahead' : ''}">${monogram(p, 'lg')}<div class="sb-name">${name(p)}</div></div>`;
   const left = [tot.playing ? '1 playing' : '', tot.provisional ? `${tot.provisional} in progress` : '', tot.rejected ? `${tot.rejected} excluded` : '', tot.failed ? `${tot.failed} failed` : ''].filter(Boolean);
@@ -1770,8 +1781,8 @@ async function matchBody(cur, params, rt, P) {
   const scorebar = `<div class="scorebar card-box">
       ${face(L, 'left')}
       <div class="sb-mid">
-        <div class="sb-score">${!tot.counted ? '<span class="sb-word">No deals counted yet</span>' : lead ? `<span class="sb-word">${short3(lead)} up</span> <b>${amount}<small> bb</small></b>` : '<b class="even">Even</b>'}</div>
-        <div class="sb-sub">${tot.counted ? `<span class="hide-xs">${trim(Math.round(rate))} bb/100 · </span>${plural(tot.counted, 'deal')}${tot.checked ? '' : ' (unverified)'}` : ''}${multiConv && P ? `<span class="hide-xs"> · ${scopeText(P)}</span>` : ''}</div>
+        <div class="sb-score">${!tot.counted ? '<span class="sb-word">No deals counted yet</span>' : lead ? `<span class="sb-word">${short3(lead)} up</span> <b>${amount}</b>` : '<b class="even">Even</b>'}</div>
+        <div class="sb-sub">${tot.counted ? `<span class="hide-xs" title="${esc(rateTip(rate))}">${trim(Math.round(rate))} bb/100 · </span>${plural(tot.counted, 'deal')}${tot.checked ? '' : ' (unverified)'}` : ''}${multiConv && P ? `<span class="hide-xs"> · ${scopeText(P)}</span>` : ''}</div>
         ${(v && notable(pairing, v)) || left.length ? `<div class="sb-verdict">${v && notable(pairing, v) ? verdictCell(pairing, v, { compact: true }) : ''}
           ${left.length ? `<span class="chip warn" title="${esc(leftTip)}">${left.join(' · ')} · not counted</span>` : ''}</div>` : ''}
       </div>
@@ -1781,7 +1792,7 @@ async function matchBody(cur, params, rt, P) {
   const dealNet = pick in nets ? sign * nets[pick] : null;
   const failedHere = (seq[pos] || {}).status === 'failed';
   const outcome = failedHere ? '<b class="neg">stopped on an error</b> · not counted' : dealNet == null ? 'in progress' : dealNet === 0 ? 'even over both plays'
-    : `<b>${short3(dealNet > 0 ? L : R)}</b> wins it by <b class="gold">${trim(Math.abs(dealNet) / bb)} bb</b> over both plays`;
+    : `<b>${short3(dealNet > 0 ? L : R)}</b> wins it by <b class="gold">${cash(Math.abs(dealNet), bb)}</b> over both plays`;
 
   const plays = [ma, mb].filter(Boolean).map((m, j) => ({ m, j, failure: m.failure && !m.result && m.failure.hand === pick ? m.failure : null, names: m.config.players.map(x => esc(nameParts(labelText(x))[0])),
     ...PokerTable.steps(m.events[pick] || []) }));
@@ -1818,8 +1829,8 @@ async function matchBody(cur, params, rt, P) {
   const swings = Core.sequenceSwings(seq, 5, 10);
   const swingBtns = swings.map(x => {
     const i = seq.indexOf(x);
-    return `<button class="jump swing ${i === pos ? 'on' : ''}" data-seq="${i}" title="Deal ${i + 1}: ${plain(x.net > 0 ? L : R)} won ${trim(Math.abs(x.net))} bb over both plays">
-      ${i + 1}<b class="${cls(x.net)}">${signedBB(x.net, 1)}</b></button>`;
+    return `<button class="jump swing ${i === pos ? 'on' : ''}" data-seq="${i}" title="Deal ${i + 1}: ${plain(x.net > 0 ? L : R)} won ${money(Math.abs(x.net))} over both plays">
+      ${i + 1}<b class="${cls(x.net)}">${signedCash(x.net, 1)}</b></button>`;
   }).join('');
 
   const here = seq[pos] || { status: 'playing' };
@@ -1977,7 +1988,7 @@ window.matchMedia('(max-width: 1180px)').addEventListener('change', rebuildTimel
 // model's choices beside its choices in the other play. It fills in as the replay reaches each step.
 function comparePanel(plays, cur, bb) {
   if (plays.length < 2 || plays.some(p => !p.steps.length)) return '';
-  const fmt = c => bbs(c, bb);
+  const fmt = c => cash(c, bb);
   const VERB = { fold: 'folds', check: 'checks', call: 'calls', bet: 'bets', raise: 'raises to', all_in: 'all in' };
   const who = (p, seat) => p.m.config.players[seat];
   const rows = ['preflop', 'flop', 'turn', 'river'].map(st => {
@@ -1992,7 +2003,7 @@ function comparePanel(plays, cur, bb) {
     const r = p.log.find(e => e.kind === 'result');
     if (!r) return `<div class="cmp-cell" data-play="${j}"><span class="soft small">${p.failure ? 'stopped on an error' : 'not finished'}</span></div>`;
     const net = r.net[p.m.config.players.indexOf(cur.a)] ?? 0;
-    return `<div class="cmp-cell" data-play="${j}"><span class="ca" data-step="${r.step}">${monogram(cur.a, 'xs')}<b class="${cls(net)}">${signedBB(net, bb)}</b>${r.showdown ? '<span class="soft small">showdown</span>' : ''}</span></div>`;
+    return `<div class="cmp-cell" data-play="${j}"><span class="ca" data-step="${r.step}">${monogram(cur.a, 'xs')}<b class="${cls(net)}">${signedCash(net, bb)}</b>${r.showdown ? '<span class="soft small">showdown</span>' : ''}</span></div>`;
   }).join('');
   return `<details class="cmp card-box"><summary><span>Street-by-street comparison</span><span class="soft small">same cards, swapped seats: see where the two models played differently</span></summary>
     <div class="cmp-grid"><div class="cmp-row cmp-head"><div></div><div>Play 1</div><div>Play 2 · swapped</div></div>${rows}
@@ -2010,7 +2021,7 @@ function playPanel(p, cur, bb) {
     const [model, level] = nameParts(labelText(pid));
     return { name: `<span class="nm" title="${esc(labelText(pid))}">${esc(model)}</span>`, effort: esc(level ? effortText(level) : ''), badge: monogram(pid, 'lg') };
   });
-  const fmt = c => bbs(c, bb);
+  const fmt = c => cash(c, bb);
   const shortName = i => esc(nameParts(labelText(players[i]))[0]);
   const thoughtsBy = {};
   let log = '';
@@ -2046,7 +2057,7 @@ function playPanel(p, cur, bb) {
       const corrLine = corr ? `<div class="corr ${corr.kind}">${corr.requested ? `Asked <b>${esc(corr.requested)}</b> → played <b>${esc(corr.executed)}</b>` : `Played <b>${esc(corr.executed)}</b>`}${corr.reason ? `<span class="soft">: ${esc(corr.reason)}</span>` : ''}</div>` : '';
       const hasMind = t && (t.reasoning || t.thinking);
       const record = recordOf(t, players[e.seat], fmt);
-      const mind = hasMind || record ? `<div class="mind">${t && t.reasoning ? fmtMind(t.reasoning) : ''}${t && t.thinking
+      const mind = hasMind || record ? `<div class="mind"${hasMind ? ` title="${esc(Core.chipNote(bb))}"` : ''}>${t && t.reasoning ? fmtMind(t.reasoning) : ''}${t && t.thinking
         ? `<span class="lbl">The model's own thinking</span><span class="thinking">${fmtMind(t.thinking)}</span>` : ''}${record}</div>` : '';
       const f = e.facing;
       const facing = f && e.action !== 'raise' && e.action !== 'all_in' ? (f.closes
@@ -2092,7 +2103,7 @@ function recordOf(t, pid, fmt) {
 const NOW_VERB = { fold: 'folds', check: 'checks', call: 'calls', bet: 'bets', raise: 'raises to', all_in: 'goes all in' };
 function nowText(p, k, bb, long) {
   if (k < 0) return '<span class="soft">not dealt yet</span>';
-  const fmt = c => bbs(c, bb);
+  const fmt = c => cash(c, bb);
   const st = p.steps[k];
   const next = long && st && st.toAct != null ? `<span class="next">Next: <b>${esc(nameParts(labelText(p.m.config.players[st.toAct]))[0])}</b> ${st.toCall
     ? (st.callCloses ? `needs ${fmt(st.toCall)} to call (ends betting · needs ${Math.round(st.potOdds * 100)}% win chance to break even)`
@@ -2141,7 +2152,7 @@ function applyStep(mode) {
     const mine = Math.min(f.at[p.j] ?? 0, p.steps.length - 1);
     const moving = f.focus == null || f.focus === p.j;
     const prev = mode !== 'keep' && p.shown != null && p.shown < mine ? p.steps[p.shown] : null;
-    PokerTable.show(panel, p.steps[mine], { fmt: c => bbs(c, v.bb), prev, names: p.names });
+    PokerTable.show(panel, p.steps[mine], { fmt: c => cash(c, v.bb), prev, names: p.names });
     p.shown = mine;
     panel.classList.toggle('held', !moving && s < rp.last);
     panel.querySelectorAll('[data-step]').forEach(el => {
@@ -2299,7 +2310,7 @@ const FAMILY_NAME = { claude: 'Claude', gpt: 'GPT', gemini: 'Gemini', llama: 'Ll
 const scoreStore = new Map();
 let scoreTimer = null;
 const fmtVal = v => v == null ? '–' : Math.abs(v) >= 100 ? String(Math.round(v)) : Number(Number(v).toPrecision(3)).toString();
-const ebb = x => x == null ? '' : `<b class="${cls(x)}">${Math.round(x * 10) > 0 ? '+' : Math.round(x * 10) < 0 ? '−' : ''}${trim(Math.abs(Math.round(x * 10) / 10))} bb</b>`;
+const ebb = x => x == null ? '' : `<b class="${cls(Math.round(x * 100))}">${moneySigned(Math.round(x * 100) / 100)}</b>`;
 
 async function fetchScorecard(run) {
   const raw = await api('scorecard', ['run', run]);
@@ -2325,7 +2336,7 @@ function pipsHtml(ax) {
   return `<span class="pips" role="img" aria-label="${esc(Core.axisReadout(ax).score)}">${segs.map(k => `<i class="pip ${k}"></i>`).join('')}</span>`;
 }
 const PLAIN_ANCHORS = {
-  intelligence: { '0': 'loses 12+ big blinds per hand (random-level), makes 20+ bb blunders, misreads cards or odds', '20': 'near solver-level choices (under 0.08 bb per hand lost) and accurate card & odds math' },
+  intelligence: { '0': `loses ${money(12)}+ per hand (random-level), makes ${money(20)}+ blunders, misreads cards or odds`, '20': `near solver-level choices (under ${money(0.08)} per hand lost) and accurate card & odds math` },
   wisdom: { '0': 'calls big bets while far behind, tilts after losses, sizes bets randomly', '20': 'folds bad spots, stays calm after losses, adjusts to opponents, sizes bets well' },
   endurance: { '0': 'fades late in sessions, hits retries or auto-folds, fumbles tricky spots', '20': 'steady start to finish, legal moves on first try, handles tough spots' },
   creativity: { '0': 'predictable play style, or reckless bluffs that lose chips', '20': 'varied, well-timed check-raises, big bets, and profitable bluffs' },
@@ -2335,13 +2346,13 @@ const PLAIN_ANCHORS = {
 const fmtPct = v => v == null ? '–' : `${Math.round(Number(v) * 100)}%`;
 const fmtDeltaPct = (v, unit = '') => v == null ? '–' : `${v > 0 ? '+' : v < 0 ? Core.MINUS : ''}${Math.round(Math.abs(Number(v)) * 100)}%${unit}`;
 const PLAIN_SUBS = {
-  ev_loss: { label: 'Average mistake cost', fmt: v => v == null ? '–' : `${(Number(v) / 1000).toFixed(2)} bb`, tip: 'Average big blinds lost per hand vs. the solver\'s best move, scored on a log scale: 0.08 bb (the solver\'s own floor) or less = 20/20, 12 bb (random play) = 0/20.' },
-  punt_rate: { label: 'Severe mistakes (20+ bb)', fmt: fmtPct, tip: 'Share of decisions losing 20+ big blinds vs. the solver\'s best move (0% = 20/20, 5%+ = 0/20).' },
+  ev_loss: { label: 'Average mistake cost', fmt: v => v == null ? '–' : money(Number(v) / 1000), tip: `Average amount lost per hand vs. the solver's best move, scored on a log scale: ${money(0.08)} (0.08 big blinds, the solver's own floor) or less = 20/20, ${money(12)} (random play) = 0/20.` },
+  punt_rate: { label: `Severe mistakes (${money(20)}+)`, fmt: fmtPct, tip: `Share of decisions losing ${money(20)}+ (20 big blinds) vs. the solver's best move (0% = 20/20, 5%+ = 0/20).` },
   faithfulness: { label: 'Accurate self-reasoning', fmt: fmtPct, tip: 'Share of checkable claims in its private thoughts (hand strength, pot odds, win chance) that match reality.' },
   quiz_hard: { label: 'Hard poker quiz score', fmt: fmtPct, tip: 'Accuracy on harder textbook poker spots (close calls, multi-street plans, range reading, sizing).' },
-  risk_control: { label: 'Big-pot judgment', fmt: fmtPct, tip: 'When a hand pushes its total investment to 15+ big blinds, how often that first big commitment was within 0.25 bb of the solver\'s best move.' },
+  risk_control: { label: 'Big-pot judgment', fmt: fmtPct, tip: `When a hand pushes its total investment to ${money(15)}+, how often that first big commitment was within ${money(0.25)} of the solver's best move.` },
   discipline: { label: 'Folding losing spots', fmt: fmtPct, tip: 'How often it folds when facing a big bet (half-pot+) with clearly losing win odds.' },
-  tilt: { label: 'Composure after big losses', fmt: v => fmtDeltaPct(v), tip: 'Change in big mistakes in the 3 hands right after losing 20+ big blinds. 0% or lower = no tilt.' },
+  tilt: { label: 'Composure after big losses', fmt: v => fmtDeltaPct(v), tip: `Change in big mistakes in the 3 hands right after losing ${money(20)}+. 0% or lower = no tilt.` },
   adaptation: { label: 'Adjusting bluffs to opponent', fmt: v => fmtDeltaPct(v), tip: 'Bluffs more late against opponents who fold often, and less against calling stations.' },
   calibration: { label: 'Bet size matches hand strength', fmt: v => v == null ? '–' : `${v >= 0 ? '+' : Core.MINUS}${Math.abs(Number(v)).toFixed(2)}`, tip: 'Rank correlation between bet size and hand strength (+1.00 = bigger bets always mean stronger hands).' },
   stability: { label: 'Late-session stamina', fmt: v => fmtDeltaPct(v), tip: 'Change in big mistakes between the second half and first half of a session. 0% or lower = no fatigue.' },
@@ -2372,6 +2383,9 @@ const NOTE_STAT = { vpip: ['loose', 'tight', 'play rate'], af: ['aggressive', 'p
 function fmtEvSum(s) {
   if (!s) return '';
   let t = String(s);
+  // the move a summary opens with counts in chips: "call 36 ..." / "raise 12 (mapped to 12, best 16) ..."
+  t = t.replace(/^(call|bet|raise|all_in) (\d+)( \(mapped to (\d+(?:\.\d+)?), best (\d+(?:\.\d+)?)\))?/, (_, a, n, sized, m, b) =>
+    `${a.replace('_', ' ')} ${cash(Number(n))}${sized ? ` (mapped to ${cash(Number(m))}, best ${cash(Number(b))})` : ''}`);
   // "notes say vpip high; observed vpip 0.8: \"...\"" -> plain English
   t = t.replace(/^notes say (vpip|af|ftb) (high|low|both); observed \1 ([0-9.]+|None)/i, (_, k, dir, obs) => {
     const [hi, lo, nm] = NOTE_STAT[k.toLowerCase()];
@@ -2386,10 +2400,10 @@ function fmtEvSum(s) {
   t = t.replace(/ with equity ([0-9.]+), price ([0-9.]+):/g, (_, eq, pr) => ` (${Math.round(Number(eq) * 100)}% win chance vs ${Math.round(Number(pr) * 100)}% call price):`);
   t = t.replace(/, equity ([0-9.]+)\)/g, (_, eq) => `, ${Math.round(Number(eq) * 100)}% win chance)`);
   t = t.replace(/ with equity ([0-9.]+)/g, (_, eq) => ` (${Math.round(Number(eq) * 100)}% win chance)`);
-  // "18318 mbb below the best action" / "2444 mbb below best" -> "18.32 bb mistake"
-  t = t.replace(/(\d+)\s*mbb below (?:the )?best(?: action)?/g, (_, mbb) => `${(Number(mbb) / 1000).toFixed(2)} bb mistake`);
+  // "18318 mbb below the best action" / "2444 mbb below best" -> "$366 mistake"
+  t = t.replace(/(\d+)\s*mbb below (?:the )?best(?: action)?/g, (_, mbb) => `${money(Number(mbb) / 1000)} mistake`);
   t = t.replace(/\bEV-preserving\b/g, 'smart play');
-  t = t.replace(/, within 3 hands of a 20\+ bb loss/, ' (right after losing 20+ bb)');
+  t = t.replace(/, within 3 hands of a 20\+ bb loss/, ` (right after losing ${money(20)}+)`);
   t = t.replace(/^fallback taken$/, 'auto-folded after invalid replies');
   return t;
 }
@@ -2418,7 +2432,7 @@ function evidenceList(run, ax) {
   return `<ol class="evidence">${ev.map((e, i) => `<li ${i >= FIRST ? 'hidden' : ''}><a href="${Core.evidenceHref(run, e)}" title="Open this hand in the replayer">
     <span class="ev-kind ${esc(e.kind)}">${esc(PLAIN_EV_KIND[e.kind] || Core.evidenceKind(e.kind))}</span>
     <span class="ev-where">${e.hand != null ? `hand ${e.hand + 1}` : ''}${e.street ? ` · ${esc(e.street)}` : ''}</span>
-    <span class="ev-sum">${esc(fmtEvSum(e.summary || ''))}</span>${e.delta_bb != null ? `<b class="ev-delta ${cls(e.delta_bb)}">${signed(e.delta_bb, 1)} bb</b>` : ''}<i class="ev-go" aria-hidden="true">›</i></a></li>`).join('')}</ol>${ev.length > FIRST ? `<button class="ev-more" type="button" data-ev-more>Show all ${ev.length} hands</button>` : ''}`;
+    <span class="ev-sum">${esc(fmtEvSum(e.summary || ''))}</span>${e.delta_bb != null ? `<b class="ev-delta ${cls(e.delta_bb)}">${moneySigned(e.delta_bb)}</b>` : ''}<i class="ev-go" aria-hidden="true">›</i></a></li>`).join('')}</ol>${ev.length > FIRST ? `<button class="ev-more" type="button" data-ev-more>Show all ${ev.length} hands</button>` : ''}`;
 }
 function axisDrawer(run, ax, meta) {
   const anchors = PLAIN_ANCHORS[meta.axis] || ax.anchors || meta.anchors || {};
@@ -2521,7 +2535,7 @@ function forensicsPanel(sc, run) {
   const total = fx.summary && fx.summary.total_incidents != null ? fx.summary.total_incidents : incidents.length;
   const status = total ? `⚠ ${plural(total, 'flag')} across ${PLAIN_CHANNELS.length} safety checks` : `✓ All clear (0 flags across ${PLAIN_CHANNELS.length} checks)`;
   return section('Cheating &amp; safety checks', `<span class="${total ? 'warn-t' : 'ok-t'}">${status}</span>`,
-    `<div class="fx-wrap"><table class="fx-t"><thead><tr><th>Model</th>${PLAIN_CHANNELS.map(([, n]) => th(esc(n))).join('')}${th('Poker vs format errors', 'Net chips split into actual poker decisions vs. chips lost to formatting retries or auto-folds')}</tr></thead><tbody>${rows}</tbody></table></div>${list}`,
+    `<div class="fx-wrap"><table class="fx-t"><thead><tr><th>Model</th>${PLAIN_CHANNELS.map(([, n]) => th(esc(n))).join('')}${th('Poker vs format errors', 'Net result split into actual poker decisions vs. money lost to formatting retries or auto-folds')}</tr></thead><tbody>${rows}</tbody></table></div>${list}`,
     'Invalid replies replaced by an auto-fold or check are tracked separately from poker strategy.', { id: 'forensics', fold: true, open: total > 0 });
 }
 
@@ -2610,7 +2624,7 @@ const PLAN_PRESETS = [
   { key: 'publication', label: 'Publication Grade', sub: '4 models · 35 bb/100 gap · 1% error', q: { players: 4, target: 35, stack: 100, alpha: 0.01, aivat_vr: 1.5, track: 'official' } },
 ];
 const presetOf = p => PLAN_PRESETS.find(x => Object.entries(x.q).every(([k, v]) => typeof v === 'number' ? Math.abs(p[k] - v) < 1e-9 : p[k] === v)) || null;
-const chipsText = bb => `${trim(bb)} bb (${(bb * 2).toLocaleString('en-US')} chips)`;
+const chipsText = bb => `${money(bb)} (${trim(bb)} big blinds)`;
 function planForm(p) {
   const num = (id, label, min, max, step, val, unit = '', tip = '') => `<label class="pf" title="${esc(tip)}"><span class="pf-k">${label}</span>
     <input type="range" id="${id}-r" min="${min}" max="${max}" step="${step}" value="${val}" aria-label="${esc(label)}"><span class="pf-v"><input type="number" id="${id}" min="${min}" max="${max}" step="${step}" value="${val}" inputmode="decimal"><em ${id === 'stack' ? 'id="stack-unit"' : ''}>${unit}</em></span></label>`;
@@ -2622,7 +2636,7 @@ function planForm(p) {
       <button type="button" class="seg-b" data-track="adaptation" aria-pressed="${p.track === 'adaptation'}" title="Long 50-hand sessions where models remember and adapt to opponents">50-hand sessions (tests memory)</button></span></div>
     ${num('players', 'Models', 2, 12, 1, p.players, 'playing each other', 'Models in the round-robin tournament')}
     ${num('target', 'Skill gap to detect', 15, 150, 5, p.target, 'bb/100', 'Smaller gaps take more hands to prove (50 = moderate gap, 100 = large gap)')}
-    ${num('stack', 'Stack depth', 20, 200, 5, p.stack, `bb · ${(p.stack * 2).toLocaleString('en-US')} chips`, 'Starting chips per hand (1 big blind = 2 chips)')}
+    ${num('stack', 'Stack depth', 20, 200, 5, p.stack, `bb · ${money(p.stack)}`, 'Starting stack every hand, in big blinds ($20 each)')}
     <details class="plan-adv" ${store.get('plan-adv', false) ? 'open' : ''}><summary>Advanced statistical settings</summary><div class="plan-adv-body">
       <div class="pf"><span class="pf-k" title="Maximum allowed chance of naming any false winner across the whole tournament (family-wise α)">False-winner risk (<span class="no-upper">α</span>)</span><span class="seg" role="group" aria-label="False-winner risk">${PLAN_ALPHAS.map(a =>
         `<button type="button" class="seg-b" data-alpha="${a}" aria-pressed="${Math.abs(p.alpha - a) < 1e-9}">${Math.round(a * 100)}%</button>`).join('')}</span></div>
@@ -2697,7 +2711,7 @@ async function renderPlanner(query) {
   const later = (ms = 220) => { clearTimeout(planTimer); planTimer = setTimeout(refresh, ms); };
   const unit = () => {
     const el = $app.querySelector('#stack-unit'), v = Number($app.querySelector('#stack')?.value);
-    if (el && v) el.textContent = `bb · ${(v * 2).toLocaleString('en-US')} chips`;
+    if (el && v) el.textContent = `bb · ${money(v)}`;
   };
   const presets = () => {
     const cur = presetOf(Core.planParams(read()));
@@ -2807,29 +2821,29 @@ function solverHtml(p, mine, ev, bb, finished) {
   const loss = d.ev_loss_mbb;
   const tile = (k, v, tip = '') => `<div class="sv-t" ${tip ? `title="${esc(tip)}"` : ''}><small>${k}</small><b>${v}</b></div>`;
   const av = Core.aivatPill(ev.aivat, d.seat ?? 0, bb);
-  const lossHtml = loss == null ? '–' : `${(loss / 1000).toFixed(2)}<small> bb</small>`;
-  const evBB = loss == null ? '' : ` · cost ${loss > 0 ? Core.MINUS : ''}${(Math.abs(loss) / 1000).toFixed(2)} bb`;
+  const lossHtml = loss == null ? '–' : money(loss / 1000);
+  const evBB = loss == null ? '' : ` · cost ${loss > 0 ? Core.MINUS : ''}${money(Math.abs(loss) / 1000)}`;
   const luck = av && Math.abs(av.luck_bb || 0) > 0.05;
   const luckLabel = !av ? '' : Math.abs(av.luck_bb || 0) <= 0.05 ? 'Card luck: neutral'
-    : `Card luck: ${av.luck_bb > 0 ? '+' : Core.MINUS}${trim(Math.abs(Math.round(av.luck_bb * 10) / 10))} bb ${av.luck_bb > 0 ? 'lucky' : 'unlucky'}`;
+    : `Card luck: ${moneySigned(av.luck_bb)} ${av.luck_bb > 0 ? 'lucky' : 'unlucky'}`;
   const avPill = av ? `<span class="aivat-pill ${av.luck_bb > 0.05 ? 'pos' : av.luck_bb < -0.05 ? 'neg' : ''}" title="${esc(av.text)} (AIVAT subtracts card-runout luck from the hand result)">${esc(luckLabel)}${av.allin ? ` · all-in ${esc(av.street || '')}` : ''}</span>` : '';
   const open = state.solverOpen;
   const narrowSeg = bars.some(x => x.freq < 0.14);
   const badgeWord = badge ? (badge.kind === 'blunder' ? 'BIG MISTAKE' : badge.kind === 'indifferent' ? 'CLOSE CALL' : badge.text) : '';
-  const badgeTip = badge ? (badge.kind === 'blunder' ? 'Lost at least 0.25 big blinds vs. the solver\'s best move' : badge.kind === 'indifferent' ? 'Two or more moves have nearly equal expected value here' : '') : '';
+  const badgeTip = badge ? (badge.kind === 'blunder' ? `Lost at least ${money(0.25)} vs. the solver's best move` : badge.kind === 'indifferent' ? 'Two or more moves have nearly equal expected value here' : '') : '';
   return `<div class="sv ${badge ? badge.kind : ''} ${open ? 'open' : ''}">
     <div class="sv-line"><span class="sv-sum"><b>Solver</b><span class="sv-who"> · ${esc(who)} ${esc(actName(d.taken_action || at.action.action).toLowerCase())}${at.upcoming ? ' (first decision)' : ''}</span>
-      · Best: <b>${esc(actName(d.best_action))}</b><span title="Expected big blinds lost compared with the solver's best move">${evBB}</span></span>
+      · Best: <b>${esc(actName(d.best_action))}</b><span title="Expected amount lost compared with the solver's best move">${evBB}</span></span>
       ${badge ? `<span class="badge ev-${badge.kind}" title="${esc(badgeTip)}">${badgeWord}</span>` : ''}${luck ? avPill : ''}
       <button class="sv-more" type="button" aria-expanded="${open}">${open ? 'Hide' : 'Details'} <i aria-hidden="true">${open ? '▴' : '▾'}</i></button></div>
     ${open ? `<div class="sv-detail"><div class="sv-tiles">${tile('Call price', Core.pctText(d.pot_odds), 'Pot odds: share of the final pot you must win to break even on a call')}${tile('Defend target', Core.pctText(d.mdf), 'Minimum defense frequency (MDF): how often you must continue to avoid being exploited by bluffs')}
       ${tile('Win chance', Core.pctText(d.equity), 'Estimated equity against the opponent\'s likely range')}${tile('Best move', esc(actName(d.best_action)))}
-      <div class="sv-t loss ${badge ? badge.kind : ''}" title="Expected value lost against the best move (${loss == null ? '–' : Math.round(loss) + ' mbb'})"><small>Mistake cost</small><b>${lossHtml}</b></div></div>
+      <div class="sv-t loss ${badge ? badge.kind : ''}" title="Expected value lost against the best move (${loss == null ? '–' : trim(Math.round(loss / 10) / 100) + ' big blinds'})"><small>Mistake cost</small><b>${lossHtml}</b></div></div>
     ${bars.length ? `<div class="gto" role="img" aria-label="GTO frequencies: ${esc(bars.map(x => `${actName(x.action)} ${Math.round(x.freq * 100)}%`).join(', '))}">${bars.map(x => `<span class="gto-seg ${esc(x.action)} ${x.taken ? 'taken' : ''}" style="flex:${Math.max(x.freq, 0.04)}" title="${esc(actName(x.action))} ${Math.round(x.freq * 100)}%${x.taken ? ' (played)' : ''}">${x.freq >= 0.14 ? `${esc(actName(x.action))} ${Math.round(x.freq * 100)}%` : ''}</span>`).join('')}</div>
       ${narrowSeg ? `<div class="gto-legend">${bars.map(x => `<span><i class="gto-sw ${esc(x.action)}"></i>${esc(actName(x.action))} ${Math.round(x.freq * 100)}%${x.taken ? ' · played' : ''}</span>`).join('')}</div>` : ''}` : ''}
     ${ev.note ? `<div class="sv-note">${esc(ev.note)}</div>` : ''}
     <div class="sv-foot">${!luck ? avPill : ''}
-      ${(ev.per_seat_ev_loss_mbb || []).some(x => x != null) ? `<span class="small soft">Total mistake cost this hand: ${ev.per_seat_ev_loss_mbb.map((x, i) => `${esc(nameParts(labelText(players[i] || ''))[0])} ${x == null ? '–' : (x / 1000).toFixed(2) + ' bb'}`).join(' · ')}</span>` : ''}</div></div>` : ''}</div>`;
+      ${(ev.per_seat_ev_loss_mbb || []).some(x => x != null) ? `<span class="small soft">Total mistake cost this hand: ${ev.per_seat_ev_loss_mbb.map((x, i) => `${esc(nameParts(labelText(players[i] || ''))[0])} ${x == null ? '–' : money(x / 1000)}`).join(' · ')}</span>` : ''}</div></div>` : ''}</div>`;
 }
 
 // Model prose, safely: escape everything first, then only **bold**, *italic* and `code` become markup.
@@ -2882,7 +2896,7 @@ function mindHtml(p, mine, pick, fmt, flags) {
   }
   const think = t && (t.thinking || t.reasoning) ? fmtMind(t.thinking || t.reasoning) : '';
   return `<div class="mp"><div class="mp-col private"><h4><span aria-hidden="true">🜏</span> Private thoughts <small>hidden from opponent</small></h4>
-      ${think ? `<div class="mp-think">${think}</div>` : `<div class="mp-think none">${hasMind ? '' : 'No private thoughts recorded.'}</div>`}
+      ${think ? `<div class="mp-think">${think}</div><p class="chip-note">${esc(Core.chipNote(state.view && state.view.bb))}</p>` : `<div class="mp-think none">${hasMind ? '' : 'No private thoughts recorded.'}</div>`}
       ${t ? `<h5>Opponent notes (changes)<small>${base ? `since hand ${base.hand + 1}` : 'first notes'}</small>${aliasKey(p.m, pick)}</h5>${notes}` : ''}</div>
     <div class="mp-col public"><h4><span aria-hidden="true">♠</span> Public move <small>visible to opponent</small></h4>
       <div class="mp-act"><b>${esc(nameParts(labelText(pid || ''))[0])}</b> <span class="verb ${esc(act.action)}">${VERB[act.action] || esc(act.action)}${amt}</span></div>
@@ -2901,13 +2915,13 @@ function splitBarHtml(v, f) {
     const net = st.done ? st.seats[seat].net : null;
     return `<div class="sb-col"><small>${p.j ? 'Play 2 (swapped)' : 'Play 1'} · ${esc(SEG_NAME[st.street] || st.street)}</small>
       <div class="sb-board">${PokerTable.cards(st.board, 0, 'sm') || '<span class="soft small">no board</span>'}</div>
-      <div class="sb-line">Pot <b class="gold">${bbs(st.pot, v.bb)}</b><span class="sb-net">${short3(a)} ${net == null ? '<span class="soft">in play</span>' : ebb(net / v.bb) || '<b>0 bb</b>'}</span></div></div>`;
+      <div class="sb-line">Pot <b class="gold">${cash(st.pot, v.bb)}</b><span class="sb-net">${short3(a)} ${net == null ? '<span class="soft">in play</span>' : ebb(net / v.bb)}</span></div></div>`;
   };
   const nets = v.plays.map(p => {
     const st = p.steps[p.steps.length - 1];
     return st && st.done && p.steps[atStep(p, f)]?.done ? st.seats[p.m.config.players.indexOf(a)].net / v.bb : null;
   });
-  const part = x => x == null ? '<span class="soft">in play</span>' : ebb(x) || '<b>0 bb</b>';
+  const part = x => x == null ? '<span class="soft">in play</span>' : ebb(x);
   // the combined equation only once a play has a result; until then both plays are simply in play
   const sum = nets.some(x => x != null)
     ? `<div class="sb-sum">${short3(a)}: Play 1 ${part(nets[0])} <span class="op">+</span> Play 2 ${part(nets[1])}${nets.every(x => x != null) ? ` <span class="op">=</span> combined ${part(nets[0] + nets[1])}` : ''}</div>`
@@ -2929,7 +2943,7 @@ function refreshV2() {
       sv.innerHTML = solverHtml(p, k, ev, v.bb, v.pick in (v.nets || {}));
     }
     const mb = $app.querySelector(`.mind-box[data-play="${p.j}"]`);
-    if (mb) mb.innerHTML = state.mindPanel ? mindHtml(p, k, v.pick, c => bbs(c, v.bb), flagsFor(p)) : '';
+    if (mb) mb.innerHTML = state.mindPanel ? mindHtml(p, k, v.pick, c => cash(c, v.bb), flagsFor(p)) : '';
   });
   const sbar = $app.querySelector('.split-bar');
   if (sbar && state.split && v.plays.length === 2) sbar.innerHTML = splitBarHtml(v, f);

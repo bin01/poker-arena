@@ -1907,3 +1907,8 @@ details.fold > summary .aside .warn-t { color: #f5c36b; }
   .rh-actions .pill { padding: 7px 10px; font-size: 12px; }
   .rh-actions .sec-link { display: none; }
 }
+
+/* Stakes: chips shown as dollars (Core.money) */
+.rh-stakes { margin-top: 3px; color: var(--ink-3); font-size: 12.5px; }
+.stakes { cursor: help; }
+.chip-note { margin: 6px 0 0; font-size: 11px; line-height: 1.4; color: var(--ink-3); }

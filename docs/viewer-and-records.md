@@ -69,6 +69,27 @@ Each seat is one conversation for the duration of a match (`1` deal on the `offi
 
 ---
 
+## Stakes: chips shown as dollars
+
+The engine, the records and the prompts count chips: blinds 1/2 and 200-chip (100 big blind) stacks that reset
+every hand. People read the same game as a **$10/$20 no-limit cash game with $2,000 stacks**, so the viewer and
+`status` show every pot, bet, stack, result and mistake cost in dollars.
+
+- **One rule.** A big blind is always $20 (`BB_DOLLARS` in `poker_arena/stakes.py` and `viewer/core.js`), so 1 chip
+  is $10 at the default blinds. A plan with deeper stacks (`--stack 400`) reads as $4,000 stacks at the same blinds.
+- **Format.** Whole dollars with thousands separators (`$1,240`, `+$60`, `−$1,980`, `$0`). Amounts at the table
+  are always multiples of $10. Only an average under $10 keeps cents (`$1.60`), never more than two places.
+- **Win rates stay in bb/100.** Big blinds won per 100 hands is the stake-free measure of how well a model plays;
+  the pages say what it is worth here (50 bb/100 = $1,000 per 100 hands).
+- **Display only.** Nothing recorded, rated or sent to a model changes: no file in the implementation
+  fingerprint (`runner.IMPLEMENTATION_FILES`) and no prompt template is touched, so a pinned run resumes without
+  `--allow-code-change`. The runner's own live log line still prints chips.
+- **A model's own words** (private thoughts, table talk, notes) count in chips and are shown exactly as written,
+  with a note beside them giving the chip value.
+- **Why a cash game and not a tournament.** In a tournament the blinds rise and players are knocked out, so chips
+  change value and survival matters. Here stacks reset every hand at fixed blinds, so every hand is the same
+  decision problem and results add up in plain dollars.
+
 ## Deals that stop on a model error
 
 When a model's CLI fails a decision and every retry fails too (a provider refusal, a usage limit, a timeout, a signed-out or missing CLI), the runner logs the call with `backend_failed: true` as the last line of that play's `calls.jsonl`, stops both plays of the deal, and moves on to the other deals. The play has no `result.json`.

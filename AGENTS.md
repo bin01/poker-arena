@@ -25,6 +25,7 @@ poker_arena/
 ├── forensics.py          # 4-channel adversarial audit (sandbox, prompt injection, parser fuzzing, covert intent) + EV split
 ├── invariance.py         # Suit- and seat-relabeling invariance test harness
 ├── scorecard.py          # 6-axis character sheet (20-pip bars, bootstrap CIs, split-half reliability, ablation bots)
+├── stakes.py             # Chips shown as dollars ($10/$20 table): display only, mirrored by viewer/core.js `money`
 ├── server.py             # HTTP server, off-path background caching (runs/.viewer-cache/), static export()
 ├── cli.py                # CLI entry point (python -m poker_arena <cmd>)
 └── viewer/               # Zero-build vanilla JS/CSS web UI (index.html, app.js, core.js, table.js, style.css)
@@ -100,4 +101,5 @@ verification/run_tlc.sh --check-each
 - **In-memory verification cache:** `ratings._VERIFIED` caches `verify_play` by `(path, _stamp(d), cfg_sig)` and per-hand payload signature; tests mutating files within the same filesystem mtime tick should call `ratings._VERIFIED.clear()`.
 - **Gitignored local tools:** `.tools/` holds optional local binaries (Eclipse Temurin JRE, `tla2tools.jar`, `TexasSolver`); never commit `.tools/` or `runs/`.
 - **Failed plays are read from the raw log:** a play with no `result.json` whose last `calls.jsonl` line is `backend_failed` gave up on a model error (`server.play_failure`). The viewer, `status` and exports all report it from there; such a deal is `failed`, never `provisional`, and a static export must not carry raw CLI output (`server._exportable`). See `tests/test_failures.py`.
+- **Dollars are display only:** people see a $10/$20 game (`stakes.py`, `viewer/core.js` `money`/`stakesOf`); the engine, records and prompts stay in chips. Never format money by hand in the viewer or CLI, and never put dollars into a prompt or a fingerprinted file (`runner.IMPLEMENTATION_FILES`). See `tests/test_stakes.py`.
 - **Doc wording assertions:** `tests/test_review_r9.py` asserts exact strings in `README.md` (`"stable model"`) and `docs/methodology.md` (`"no drift detected"`). Run it after doc edits.
