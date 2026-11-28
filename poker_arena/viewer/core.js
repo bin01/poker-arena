@@ -758,6 +758,7 @@
     return { counted: c.length, net: Math.round(net * 100) / 100, won: c.filter(x => x.net > 0).length, lost: c.filter(x => x.net < 0).length,
       even: c.filter(x => x.net === 0).length, provisional: seq.filter(x => x.status === 'provisional').length,
       playing: seq.filter(x => x.status === 'playing').length, rejected: seq.filter(x => x.status === 'rejected').length,
+      failed: seq.filter(x => x.status === 'failed').length,
       checked: !c.length || c.some(x => x.status === 'verified') };
   }
 

@@ -138,6 +138,72 @@ def match_summary(root: Path, d: Path, hands=None):
             'live': res is None and time.time() - _mtime(d / 'events.jsonl') < LIVE_SECONDS}
 
 
+def _error_text(err: str) -> str:
+    """The readable part of a backend error: the CLI's own final message when its JSON output carries one
+    (`"result": "API Error: ..."`), else the tail of whatever it printed."""
+    return _error_parts(err)[0]
+
+
+def _error_parts(err: str) -> tuple[str, bool]:
+    """(`_error_text`, whether it is the CLI's own message rather than a tail of raw output)."""
+    err = str(err or '')
+    found = re.findall(r'"result"\s*:\s*("(?:[^"\\]|\\.)*")', err)
+    for raw in reversed(found):
+        try:
+            text = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(text, str) and text.strip():
+            return text.strip(), True
+    return err.strip()[-600:], False
+
+
+# What stopped a play, told apart from the error text alone (so records written before this existed read the
+# same): (kind, what it is in a few words, the regex that recognises it). The first match wins.
+FAILURE_KINDS = (
+    ('refused', "blocked by the provider's safeguards", r"safeguards? flagged|usage polic|content polic|/legal/aup|refus(?:ed|al) (?:by|from) the (?:provider|api)"),
+    ('rate_limit', 'rate or usage limit reached', r'rate.?limit|\b429\b|quota|usage limit|limit reached|overloaded|\b529\b|at capacity'),
+    ('timeout', 'no reply before the time limit', r'timed out after'),
+    ('auth', 'the CLI is not signed in', r'\b401\b|\b403\b|unauthori[sz]ed|not logged in|please (?:run )?/?log ?in|invalid api key|credential|oauth'),
+    ('missing_cli', 'the CLI is not installed', r'is not installed or not on PATH'),
+    ('unaudited', "the model's turns could not be audited", r'turns could be audited'),
+)
+OTHER_FAILURE = ('error', 'the CLI returned an error')
+
+
+def failure_kind(error: str, text: str = '') -> tuple[str, str]:
+    """(kind, title) of a backend error, from the runner's own prefix first (a timeout, a missing CLI), then from
+    what the CLI said."""
+    for where in (str(error or '')[:200], text or '', str(error or '')):
+        for kind, title, pattern in FAILURE_KINDS:
+            if re.search(pattern, where, re.I):
+                return kind, title
+    return OTHER_FAILURE
+
+
+def play_failure(d: Path) -> dict | None:
+    """Why a play stopped before its last hand, when a model's backend gave up on a decision: {'hand', 'seat',
+    'player', 'decision', 'tries', 'at', 'kind', 'title', 'from_cli', 'message', 'detail'} ('kind' and
+    'title' from `failure_kind`; 'message' the CLI's own first paragraph and 'detail' all it said, or with
+    'from_cli' false the tail of its raw output); None for a finished play, one still being played,
+    or one that simply has not got further yet. The runner writes a `backend_failed` call as the last line of
+    calls.jsonl when every try of a decision failed, then abandons the play; a later resume appends past it."""
+    if (d / 'result.json').exists():
+        return None
+    calls = _lines(d / 'calls.jsonl')
+    last = calls[-1] if calls else None
+    if not isinstance(last, dict) or not last.get('backend_failed') or not isinstance(last.get('hand'), int):
+        return None
+    tries = last.get('failed_attempts') if isinstance(last.get('failed_attempts'), list) else []
+    text, from_cli = _error_parts(last.get('error'))
+    stamps = [x.get('t') for x in tries if isinstance(x, dict) and isinstance(x.get('t'), (int, float))]
+    kind, title = failure_kind(last.get('error'), text)
+    return {'hand': last['hand'], 'seat': last.get('seat'), 'player': last.get('player'),
+            'decision': last.get('decision_id'), 'tries': len(tries) or 1, 'at': max(stamps, default=None),
+            'kind': kind, 'title': title, 'from_cli': from_cli,
+            'message': re.split(r'\n\s*\n', text)[0][:400], 'detail': text[:2000]}
+
+
 def run_of(root: Path, m: Path) -> str:
     rel = m.parent.relative_to(root)
     return str(rel) if str(rel) != '.' else '.'
@@ -201,7 +267,8 @@ class Inventory:
         x = hit[1]
         now = time.time()
         ages = {s: _mtime(m / s / 'events.jsonl') for s in SIDES}
-        matches = [{**y, 'live': not y['finished'] and now - ages[y['side']] < LIVE_SECONDS} for y in x['matches']]
+        matches = [{**y, 'live': not y['finished'] and not x['failed'] and now - ages[y['side']] < LIVE_SECONDS}
+                   for y in x['matches']]
         return {**x, 'matches': matches, 'live': any(y['live'] for y in matches),
                 'updated': max(ages.values(), default=0)}
 
@@ -215,6 +282,7 @@ class Inventory:
                 y = match_summary(root, m / s, hands[s])
                 matches.append({**y, 'side': s})
         a, b = (cfg.get('players') or ['?', '?'])[:2]
+        failures = {s: f for s in SIDES for f in [play_failure(m / s)] if f}
         ha = {h['hand']: h for h in hands['a-first'] if isinstance(h.get('hand'), int)}
         hb = {h['hand']: h for h in hands['b-first'] if isinstance(h.get('hand'), int)}
         both = sorted(set(ha) & set(hb))
@@ -236,6 +304,7 @@ class Inventory:
                 'labels': {p: LABELS.get(p) or display_name(p, s) for p, s in specs.items()},
                 'bb': game.get('big_unit') or game.get('bb') or 1,
                 'finished': len(matches) == 2 and all(x['finished'] for x in matches),
+                'failed': len(failures), '_failures': failures,
                 'times': [h['t'] for s in hands.values() for h in s if h.get('t')],
                 '_specs': specs, '_deals': deals,
                 '_written': {s: sorted({h['hand'] for h in hands[s] if isinstance(h.get('hand'), int)}) for s in SIDES}}
@@ -318,13 +387,13 @@ def _runs_and_matchups(root: Path, only: str | None = None):
                 'id': str(rel / f'{a}__vs__{b}') if run != '.' else f'{a}__vs__{b}', 'run': run, 'a': a, 'b': b,
                 'started': False, 'round': 1, 'replicate': 1, 'matches': [], 'deals_total': plan.get('deals', 0), 'pairs_done': 0,
                 'pair_net_a': 0, 'kinds': {p: k for p, k in ((a, ka), (b, kb)) if k}, 'labels': {a: la, b: lb},
-                'bb': 1, 'live': False, 'finished': False, 'updated': 0, 'times': []})
+                'bb': 1, 'live': False, 'finished': False, 'failed': 0, 'updated': 0, 'times': []})
     return by
 
 
 def roster(root: Path, run: str) -> list:
     """Every player of a run, from its plan when there is one, with where it stands: awaiting its first
-    matchup, playing, or done."""
+    matchup, playing, done, or stopped (every deal it started ended on a backend error and none finished)."""
     ms = _runs_and_matchups(root, run).get(run, [])
     plan = _json((root if run == '.' else root / run) / 'plan.json') or {}
     names = list(plan.get('players') or [])
@@ -332,7 +401,9 @@ def roster(root: Path, run: str) -> list:
     out = []
     for p in names:
         mine = [m for m in ms if p in (m['a'], m['b'])]
+        stuck = [m for m in mine if m['started'] and not m['finished']]
         status = ('done' if mine and all(m['finished'] for m in mine)
+                  else 'stopped' if stuck and all(m.get('failed') for m in stuck) and not any(m['pairs_done'] for m in mine)
                   else 'playing' if any(m['started'] for m in mine) else 'awaiting')
         out.append({'player': p, 'status': status})
     return out
@@ -354,12 +425,12 @@ def _design(plan: dict):
 
 def lifecycle(root: Path, run: str, ms: list) -> dict:
     """Where a run stands: {status: 'running'|'finished'|'stopped', round, pairings: {"a|b": {status, verdict,
-    looks_used}}}. From the runner's tournament.json when there is one; else from plan.json and decisions.json
+    looks_used}}}; a pairing stopped by backend errors reads 'failed' (see `_with_failures`). From the runner's tournament.json when there is one; else from plan.json and decisions.json
     (a pairing is over on a terminal verdict or once its planned rounds are played); else from the folders."""
     base = root if run == '.' else root / run
     t = _json(base / 'tournament.json')
     if isinstance(t, dict) and t.get('status'):
-        return {'source': 'tournament', 'round': t.get('round'), 'pairings': t.get('pairings') or {},
+        return {'source': 'tournament', 'round': t.get('round'), 'pairings': _with_failures(t.get('pairings') or {}, ms),
                 'status': t['status'], 'updated': t.get('updated')}
     plan = _json(base / 'plan.json')
     if not plan or not plan.get('matchups'):
@@ -387,7 +458,66 @@ def lifecycle(root: Path, run: str, ms: list) -> dict:
                                 'rounds_played': played, 'rounds_planned': rounds}
     over = all(p['status'] in ('decided', 'exhausted', 'ineligible', 'done') for p in pairings.values())
     return {'source': 'plan', 'status': 'finished' if over else 'running',
-            'round': max((m['round'] for m in ms if m['started']), default=None), 'pairings': pairings}
+            'round': max((m['round'] for m in ms if m['started']), default=None),
+            'pairings': _with_failures(pairings, ms)}
+
+
+def _with_failures(pairings: dict, ms: list) -> dict:
+    """The pairings' recorded states, with what the call logs show the runner's file does not say plainly: a
+    pairing still recorded as waiting or playing, none of whose conversations is being played and whose every
+    unfinished one gave up on a backend error, is 'failed'; any pairing with such conversations carries
+    `failed_deals` and the error in words (`error`, replacing the runner's truncated repr, kept as `error_raw`)."""
+    out = {}
+    for key, p in pairings.items():
+        p = dict(p) if isinstance(p, dict) else {}
+        mine = [m for m in ms if m['started'] and '|'.join((m['a'], m['b'])) == key]
+        bad = _open_failures(mine)
+        if bad:
+            last = max(bad, key=lambda x: x[2].get('at') or 0)[2]
+            p['failed_deals'] = len({(m['id'], f['hand']) for m, _, f in bad})
+            if p.get('error'):
+                p['error_raw'] = p['error']
+            p.update(error=last['message'], error_kind=last['kind'], error_title=last['title'],
+                     error_from_cli=last['from_cli'])
+            open_ = [m for m in mine if not m['finished']]
+            if p.get('status') in ('waiting', 'playing', None) and not any(m['live'] for m in mine) \
+                    and all(m.get('_failures') for m in open_):
+                p['status'] = 'failed'
+        out[key] = p
+    return out
+
+
+def _open_failures(ms: list) -> list:
+    """[(conversation, side, failure)] for every play that gave up and has not been replayed since."""
+    return [(m, s, f) for m in ms if m['started'] and not m['finished'] for s, f in (m.get('_failures') or {}).items()]
+
+
+def failures(root: Path, run: str, ms: list | None = None) -> dict:
+    """The deals of a run that a model's backend gave up on and nothing has replayed: {'deals', 'conversations',
+    'players': [{'player', 'deals', 'started', 'kinds': [{'kind', 'title', 'deals', 'message', 'example', 'last'}]}],
+    'interrupted'}. 'deals' counts deals, each once; a player's 'started' is the conversations it has begun, so
+    'deals' of 'started' says how much of its play is lost; 'example' is the match to open (RUN/MATCHUP/side);
+    'interrupted' counts conversations that stopped with no result and no recorded error (the run was stopped, or
+    their other play failed), which a rerun resumes. Read from the raw call log by `play_failure`."""
+    ms = _runs_and_matchups(root, run).get(run, []) if ms is None else ms
+    by: dict = {}
+    for m, side, f in sorted(_open_failures(ms), key=lambda x: (x[0]['id'], x[1])):
+        p = by.setdefault(f.get('player') or '?', {'deals': set(), 'kinds': {}})
+        p['deals'].add((m['id'], f['hand']))
+        k = p['kinds'].setdefault(f['kind'], {'kind': f['kind'], 'title': f['title'], 'deals': set(),
+                                              'message': f['message'], 'from_cli': f['from_cli'],
+                                              'example': f"{m['id']}/{side}", 'last': None})
+        k['deals'].add((m['id'], f['hand']))
+        if f.get('at') and (k['last'] is None or f['at'] >= k['last']):
+            k.update(last=f['at'], message=f['message'], from_cli=f['from_cli'], example=f"{m['id']}/{side}")
+    players = [{'player': pid, 'deals': len(p['deals']),
+                'started': sum(1 for m in ms if m['started'] and pid in (m['a'], m['b'])),
+                'kinds': sorted(({**k, 'deals': len(k['deals'])} for k in p['kinds'].values()), key=lambda k: -k['deals'])}
+               for pid, p in by.items()]
+    players.sort(key=lambda p: (-p['deals'], p['player']))
+    bad = {m['id'] for m, _, _ in _open_failures(ms)}
+    return {'deals': len({d for p in by.values() for d in p['deals']}), 'conversations': len(bad), 'players': players,
+            'interrupted': sum(1 for m in ms if m['started'] and not m['finished'] and not m['live'] and m['id'] not in bad)}
 
 
 MATCH_KEYS = ('id', 'hands_total', 'hands_done', 'finished', 'live')
@@ -432,7 +562,7 @@ def runs(root: Path):
                     'players': sorted({m['a'] for m in ms} | {m['b'] for m in ms}),
                     'hands': done, 'hands_planned': planned, 'live': live,
                     'finished': life['status'] == 'finished', 'status': life['status'], 'round': life['round'],
-                    'pairings': life['pairings'],
+                    'pairings': life['pairings'], 'failures': failures(root, run, ms),
                     'between_rounds': life['status'] == 'running' and not live and bool(ms) and all(m['finished'] for m in ms if m['started']),
                     'updated': max((m['updated'] for m in ms), default=0),
                     'started_at': times[0] if times else None,
@@ -497,6 +627,7 @@ def match(root: Path, mid: str):
     conv = conversation_status(d.parent) if d.name in SIDES else None
     return {'summary': match_summary(root, d), 'config': _json(d / 'config.json'),
             'hands': _lines(d / 'hands.jsonl'), 'events': events, 'result': _json(d / 'result.json'),
+            'failure': play_failure(d),
             **({'status': {str(k): v for k, v in conv['status'].items()}, 'rejected': conv['rejected'], 'checked': conv['checked']} if conv else {})}
 
 
@@ -515,7 +646,8 @@ def conversation_status(m: Path) -> dict:
         return hit[1]
     written = {s: {h.get('hand') for h in _lines(m / s / 'hands.jsonl')} for s in SIDES}
     every = {k for ks in written.values() for k in ks if isinstance(k, int)}
-    out = {'status': {}, 'rejected': [], 'checked': False}
+    out = {'status': {}, 'rejected': [], 'checked': False,
+           'failed': {s: f for s in SIDES for f in [play_failure(m / s)] if f}}   # as the inventory reads them
     try:
         from .ratings import read_conversation
         conv = read_conversation(m)
@@ -547,9 +679,10 @@ def conversation_status(m: Path) -> dict:
 def pairing(root: Path, run: str, a: str, b: str) -> dict | None:
     """Every conversation of one pairing in playing order (round, then replicate) with each deal's result from
     a's side: {'a', 'b', 'conversations': [{'id', 'round', 'replicate', 'deals_total', 'live', 'finished',
-    'deals': [[deal, net_bb or None, status, reach]], 'rejected'}], 'totals': {...}}. A deal's status is the shared
-    reader's (verified, provisional, rejected, or unchecked without it), plus 'playing' for the deal a live
-    conversation is on. Totals count verified deals only (unchecked ones when nothing could be checked)."""
+    'deals': [[deal, net_bb or None, status, reach]], 'rejected', 'failed'}], 'totals': {...}}. A deal's status is
+    the shared reader's (verified, provisional, rejected, or unchecked without it), plus 'playing' for the deal a
+    live conversation is on and 'failed' for the deal a play gave up on after a backend error (`play_failure`).
+    Totals count verified deals only (unchecked ones when nothing could be checked)."""
     from .history import ALL
     if run in (None, '', ALL):
         return None
@@ -561,13 +694,19 @@ def pairing(root: Path, run: str, a: str, b: str) -> dict | None:
         return None
     ms.sort(key=lambda m: (m['round'], m['replicate'], m['id']))
     convs, tot = [], {'verified': 0, 'net_bb': 0.0, 'won': 0, 'lost': 0, 'even': 0, 'provisional': 0, 'rejected': 0,
-                      'unchecked': 0, 'playing': 0}
+                      'unchecked': 0, 'playing': 0, 'failed': 0}
     for m in ms:
         st = conversation_status(root / m['id'])
         sign = 1 if m['a'] == a else -1
         bb = m['bb'] or 1
         deals = []
-        for k, status in sorted(st['status'].items()):
+        # a deal one play gave up on is 'failed', not forever 'in progress': it counts nowhere until it is replayed
+        failed = {} if m['finished'] else st.get('failed') or {}
+        statuses = dict(st['status'])
+        for f in failed.values():
+            if statuses.get(f['hand']) not in ('verified', 'rejected'):
+                statuses[f['hand']] = 'failed'
+        for k, status in sorted(statuses.items()):
             d = m['_deals'].get(k)
             net = round(sign * d[0] / bb, 2) if d else None
             deals.append([k, net if status != 'rejected' else None, status, d[1] if d else None])
@@ -575,12 +714,15 @@ def pairing(root: Path, run: str, a: str, b: str) -> dict | None:
             if status in ('verified', 'unchecked') and net is not None:
                 tot['net_bb'] += net
                 tot['won' if net > 0 else 'lost' if net < 0 else 'even'] += 1
-        nxt = max(st['status'], default=-1) + 1
-        if m['live'] and nxt < m['deals_total']:
+        nxt = max(statuses, default=-1) + 1
+        if m['live'] and not failed and nxt < m['deals_total']:
             deals.append([nxt, None, 'playing', None])
             tot['playing'] += 1
         convs.append({'id': m['id'], 'round': m['round'], 'replicate': m['replicate'], 'deals_total': m['deals_total'],
-                      'live': m['live'], 'finished': m['finished'], 'deals': deals, 'rejected': st['rejected']})
+                      'live': m['live'], 'finished': m['finished'], 'deals': deals, 'rejected': st['rejected'],
+                      'failed': [{'side': s, 'hand': f['hand'], 'player': f['player'], 'kind': f['kind'],
+                                  'title': f['title'], 'from_cli': f['from_cli'], 'message': f['message']}
+                                 for s, f in failed.items()]})
     checked = any(conversation_status(root / m['id'])['checked'] for m in ms)
     tot['net_bb'] = round(tot['net_bb'], 2)
     tot['counted'] = tot['verified'] if checked else tot['unchecked']
@@ -830,7 +972,11 @@ def ratings_for(root: Path, run, boot=200):
         return None
     r = ratings(base, boot=boot)
     key = run if run not in (None, '') else '.'
-    r.setdefault('roster', roster(root, key))
+    mine = roster(root, key)
+    r.setdefault('roster', mine)
+    stopped = {x['player'] for x in mine if x['status'] == 'stopped'}   # the ratings' own roster can't see call logs
+    r['roster'] = [{**x, 'status': 'stopped'} if isinstance(x, dict) and x.get('player') in stopped
+                   and x.get('status') in ('playing', 'awaiting') else x for x in r['roster']]
     labels, kinds = {}, {}
     for m in _runs_and_matchups(root, key).get(key, []):
         labels.update(m['labels'])
@@ -1140,6 +1286,25 @@ def key(s: str) -> str:
                    for b in s.encode())
 
 
+NOT_EXPORTED = "The error text is in the run's call log, which a static export leaves out."
+
+
+def _exportable(x):
+    """An API answer without what a static export must not carry about a failed call: raw CLI output (it can
+    hold local paths, session ids and account details) and the runner's raw error. A message the CLI itself
+    gave as its result stays; a tail of raw output is replaced by a note."""
+    if isinstance(x, list):
+        return [_exportable(v) for v in x]
+    if not isinstance(x, dict):
+        return x
+    out = {k: _exportable(v) for k, v in x.items() if k not in ('detail', 'error_raw') or 'from_cli' not in x and 'error_from_cli' not in x}
+    if x.get('from_cli') is False and 'message' in out:
+        out['message'] = NOT_EXPORTED
+    if 'error_kind' in x and not x.get('error_from_cli'):
+        out['error'] = NOT_EXPORTED
+    return out
+
+
 def export(root, out, players_file='players.toml') -> int:
     """A static copy of the viewer for the runs under root: the app plus every API answer as a file."""
     root, out = Path(root).resolve(), Path(out)
@@ -1164,7 +1329,7 @@ def export(root, out, players_file='players.toml') -> int:
     for r in rs:
         r['live'] = False
         r['eta_seconds'] = None
-    put('runs.json', rs)
+    put('runs.json', _exportable(rs))
     done = set()
     for r in rs:
         ms = index(root, r['run'])
@@ -1179,13 +1344,14 @@ def export(root, out, players_file='players.toml') -> int:
                 specs = data_['config'].get('specs', {})  # only what the viewer shows: no commands, paths or URLs
                 data_['config']['specs'] = {p: {k: v for k, v in s.items() if k in ('label', 'model', 'bot', 'effort')}
                                             for p, s in specs.items()}
+                data_['failure'] = _exportable(data_.get('failure'))
                 put(f'match-{key(x["id"])}.json', data_)
         put(f'index-{key(r["run"])}.json', ms)
         if not r.get('all'):
             for a, b in sorted({tuple(sorted((m['a'], m['b']))) for m in ms if m['started']}):
                 pr = pairing(root, r['run'], a, b)
                 if pr:
-                    put(f'pairing-{key(pairing_key(r["run"], a, b))}.json', pr)
+                    put(f'pairing-{key(pairing_key(r["run"], a, b))}.json', _exportable(pr))
         put(f'ratings-{key(r["run"])}.json', ratings_for(root, r['run'], boot=300))
         if not r.get('all'):
             for name, fn in (('scorecard', scorecard_for), ('forensics', forensics_for)):

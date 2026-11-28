@@ -359,6 +359,37 @@ class TestPairing(unittest.TestCase):
             self.assertAlmostEqual(pr['totals']['net_bb'], sum(c['deals'][0][1] for c in pr['conversations'][1:]), places=6)
             self.assertTrue(pr['conversations'][0]['rejected'])
 
+    def test_failed_play_is_shown_and_never_counted(self):
+        """A play its model's CLI gave up on: the deal is 'failed' (not forever in progress), the error is
+        readable on the match, it counts nowhere, and the conversation is not live."""
+        with tempfile.TemporaryDirectory() as d:
+            runs = Path(d).resolve()
+            shutil.copytree(self.runs / 'one', runs / 'one')
+            conv = server.pairing(runs, 'one', 'rule', 'station')['conversations'][0]
+            play = runs / conv['id'] / 'a-first'
+            for f in ('result.json', 'hands.jsonl', 'state.json'):
+                (play / f).unlink()
+            tail = '"is_error":true,"result":"API Error: the safeguards flagged this message.\\n\\nDetails: `[x]`","type":"result"}'
+            call = {'hand': 0, 'seat': 0, 'player': 'rule', 'decision_id': 'h0.d0', 'call_id': 'h0.d0.c0', 'output': None,
+                    'error': 'claude exited 1: ' + tail, 'backend_failed': True,
+                    'failed_attempts': [{'t': 5.0, 'error': 'x'}, {'t': 9.0, 'error': 'x'}]}
+            (play / 'calls.jsonl').write_text(json.dumps(call) + '\n')
+            f = server.match(runs, conv['id'] + '/a-first')['failure']
+            self.assertEqual((f['hand'], f['player'], f['tries'], f['at']), (0, 'rule', 2, 9.0))
+            self.assertEqual(f['message'], 'API Error: the safeguards flagged this message.')
+            self.assertIn('Details: `[x]`', f['detail'])
+            self.assertIsNone(server.match(runs, conv['id'] + '/b-first')['failure'])
+            pr = server.pairing(runs, 'one', 'rule', 'station')
+            first = pr['conversations'][0]
+            self.assertEqual(first['deals'], [[0, None, 'failed', None]])
+            self.assertEqual((first['failed'][0]['side'], first['live']), ('a-first', False))
+            self.assertEqual((pr['totals']['failed'], pr['totals']['verified'], pr['totals']['provisional']), (1, 5, 0))
+            m = next(x for x in server.index(runs, 'one') if x['id'] == conv['id'])
+            self.assertEqual((m['failed'], m['live'], m['finished']), (1, False, False))
+            # a resume that plays past the failed call clears it
+            (play / 'calls.jsonl').write_text(json.dumps(call) + '\n' + json.dumps({**call, 'backend_failed': False, 'error': None}) + '\n')
+            self.assertIsNone(server.match(runs, conv['id'] + '/a-first')['failure'])
+
     def test_inventory_reads_each_conversation_once(self):
         reads = []
         real = server.Inventory._read

@@ -69,6 +69,26 @@ Each seat is one conversation for the duration of a match (`1` deal on the `offi
 
 ---
 
+## Deals that stop on a model error
+
+When a model's CLI fails a decision and every retry fails too (a provider refusal, a usage limit, a timeout, a signed-out or missing CLI), the runner logs the call with `backend_failed: true` as the last line of that play's `calls.jsonl`, stops both plays of the deal, and moves on to the other deals. The play has no `result.json`.
+
+The viewer and `status` read that state from the raw call log (`server.play_failure`), never from a summary:
+
+| Where | What it shows |
+|---|---|
+| Deal replay | Which play stopped, which model and reasoning level, the kind of error, the CLI's own message, the full error on demand, and a "failed · not counted" tag |
+| Deal strip, scoreboard, matchup list | Failed deals marked and counted apart from deals in progress |
+| Standings and run header | How many deals failed, per model, with the message and a link to one |
+| `status RUNS_DIR` | The same per-model summary, with the path of a `calls.jsonl` to read |
+| `/api/runs` | `failures` per run, and each pairing as `failed` with `failed_deals`, `error`, `error_kind` |
+
+A static export keeps the kind of error and the CLI's own message, and leaves out raw CLI output and the full error.
+
+A failed deal is never a result: it stays out of totals, ratings and verdicts. Running the same plan again replays it, and once a play gets past the failed call nothing reports it as failed any more. A play that stopped with no error on record (the run was killed) is shown as not finished, not as failed.
+
+---
+
 ## CLI backend isolation & caveats
 
 Every CLI runs inside an isolated empty working directory per seat. When a subscription hits a rate limit, `RateGate` pauses sibling seats on that CLI (`rate_limit_wait` = 15m default, `max_wait` = 6h).
