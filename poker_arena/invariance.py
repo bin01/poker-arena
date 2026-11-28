@@ -159,12 +159,25 @@ def _value(values: dict, kind: str):
     return values.get(kind) if not kind.startswith('_') else None
 
 
+def _spot_prompt(spot: dict, ep, hero: int, req, combos: list) -> str:
+    """Full model-ready prompt for an invariance spot (includes stated villain range and seat names)."""
+    opp = ep.names[1 - hero]
+    lines = [f'Stacks were {spot["stack_bb"]} big blinds ({2 * spot["stack_bb"]} chips) each at the start of the hand.']
+    if spot.get('kind') == 'shove':
+        lines.append(f'{opp}, in the big blind, calls an all-in with exactly this range and folds every other hand: '
+                     f'{spot["range"]}. Their hand is otherwise random.')
+    elif spot.get('range'):
+        lines.append(f'{opp}\'s range here is exactly: {spot["range"]} ({len(combos)} combinations possible with the cards you see).')
+    return '\n'.join(lines) + '\n\n' + req.prompt
+
+
 async def _decide(agent_factory, spot: dict) -> dict:
-    ep, hero, req, _ = build_spot(spot)
+    from .quiz import SYSTEM
+    ep, hero, req, combos = build_spot(spot)
     agent = agent_factory()
-    agent.start('', {})
+    agent.start(SYSTEM, {})
     validate = lambda act, ep=ep: copy.deepcopy(ep).apply(hero, act)
-    d = await agent.act(req.prompt, req, validate)
+    d = await agent.act(_spot_prompt(spot, ep, hero, req, combos), req, validate)
     action = d.action if not d.fallback else ep.fallback(hero)
     kind, amount = _abstract(action, req)
     return {'action': kind, 'amount': amount, 'reasoning': d.reasoning}
@@ -177,21 +190,48 @@ def _binom_sf(k: int, n: int, p: float) -> float:
     return min(1.0, sum(math.comb(n, i) * p ** i * (1 - p) ** (n - i) for i in range(k, n + 1)))
 
 
-async def arun_invariance_test(agent_factory, spots=None, n_spots=12, n_perms=3, seed=0, sims=1500) -> dict:
+async def arun_invariance_test(agent_factory, spots=None, n_spots=12, n_perms=3, seed=0, sims=1500,
+                               concurrency: int = 1) -> dict:
     """See `run_invariance_test`; for callers already inside an event loop."""
     spots = list(spots) if spots is not None else base_spots(n_spots, seed)
     rng = random.Random(seed)
-    flips, deltas, examples, sizing_cvs, per_spot = 0, [], [], [], []
-    n_variants = 0
+    plan = []
     for k, spot in enumerate(spots):
-        values = spot_values(spot, sims=sims)
-        base = await _decide(agent_factory, spot)
         perms = rng.sample(ALL_SUIT_PERMS, min(n_perms, len(ALL_SUIT_PERMS)))
-        variants = []
+        vars_ = []
         for j, perm in enumerate(perms):
             names = SEAT_NAMES[(k + j) % len(SEAT_NAMES)]
-            var = permute_spot(spot, perm, names)
-            got = await _decide(agent_factory, var)
+            vars_.append((perm, names, permute_spot(spot, perm, names)))
+        plan.append((spot, spot_values(spot, sims=sims), vars_))
+
+    if concurrency > 1:
+        sem = asyncio.Semaphore(concurrency)
+
+        async def run_one(sp):
+            async with sem:
+                return await _decide(agent_factory, sp)
+
+        all_spots = []
+        for spot, _, vars_ in plan:
+            all_spots.append(spot)
+            for _, _, var in vars_:
+                all_spots.append(var)
+        all_results = await asyncio.gather(*(run_one(sp) for sp in all_spots))
+        it = iter(all_results)
+        evaluated = [(spot, values, next(it), [(perm, names, var, next(it)) for perm, names, var in vars_])
+                     for spot, values, vars_ in plan]
+    else:
+        evaluated = []
+        for spot, values, vars_ in plan:
+            base = await _decide(agent_factory, spot)
+            ev_vars = [(perm, names, var, await _decide(agent_factory, var)) for perm, names, var in vars_]
+            evaluated.append((spot, values, base, ev_vars))
+
+    flips, deltas, examples, sizing_cvs, per_spot = 0, [], [], [], []
+    n_variants = 0
+    for spot, values, base, ev_vars in evaluated:
+        variants = []
+        for perm, names, var, got in ev_vars:
             n_variants += 1
             flipped = got['action'] != base['action']
             flips += flipped
@@ -226,12 +266,14 @@ async def arun_invariance_test(agent_factory, spots=None, n_spots=12, n_perms=3,
             'examples': examples, 'spots': per_spot}
 
 
-def run_invariance_test(agent_factory, spots=None, n_spots=12, n_perms=3, seed=0, sims=1500) -> dict:
+def run_invariance_test(agent_factory, spots=None, n_spots=12, n_perms=3, seed=0, sims=1500,
+                        concurrency: int = 1) -> dict:
     """{'n_spots', 'n_variants', 'action_flip_rate', 'ev_delta_mbb', 'sizing_cv', 'invariance_score' (0..1, 1 =
     the same decision whatever the labels), 'p_value', 'biased', 'examples', 'spots'} for the agents
     `agent_factory()` makes (each decision gets a fresh one, so memory cannot explain a flip)."""
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(arun_invariance_test(agent_factory, spots, n_spots, n_perms, seed, sims))
+        return asyncio.run(arun_invariance_test(agent_factory, spots, n_spots, n_perms, seed, sims,
+                                                concurrency=concurrency))
     raise RuntimeError('run_invariance_test called inside an event loop; await arun_invariance_test instead')

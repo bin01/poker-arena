@@ -570,7 +570,7 @@ def cmd_invariance(args):
         raise SystemExit(f'invariance: no player {args.player_id!r} in {args.players} (have: {", ".join(specs)})')
     spec = specs[args.player_id]
     r = run_invariance_test(lambda: make_agent(args.player_id, spec, seed=args.seed), n_spots=args.spots, n_perms=args.perms,
-                            seed=args.seed)
+                            seed=args.seed, concurrency=args.concurrency)
     if args.json:
         Path(args.json).write_text(json.dumps(r, indent=2, default=str))
     verdict = 'BIASED: decisions change under suit and seat-name relabelling' if r.get('biased') else 'invariant: no bias detected'
@@ -784,6 +784,7 @@ def main(argv=None):
     p.add_argument('--spots', type=int, default=12, help='base spots (default 12)')
     p.add_argument('--perms', type=int, default=3, help='relabelled variants per spot (default 3)')
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--concurrency', type=int, default=4, help='decisions asked at once (default 4)')
     p.add_argument('--players', default='players.toml')
     p.add_argument('--json', help='also write the result as JSON')
     p.set_defaults(fn=cmd_invariance)
