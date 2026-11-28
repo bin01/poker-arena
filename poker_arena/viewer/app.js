@@ -772,7 +772,7 @@ async function renderBoard(query) {
   if (!rt.players.length) {
     html += `<div class="card-box empty"><div class="big-suits">♠ ♥ ♦ ♣</div><h2>The cards are in the air</h2>
       <p>A deal counts once both seat-swapped plays finish. ${state.index.some(m => m.started) ? `Watch the first hands on the <a href="${runLink(state.run, '/m')}"><u>Watch</u></a> page.` : ''}</p>
-      ${waiting.length ? `<div class="waiting-list">${waiting.map(x => player(x.player, `<div class="small soft">${x.status === 'playing' ? 'playing its first deals' : 'waiting to play'}</div>`)).join('')}</div>` : ''}</div>`;
+      ${waiting.length ? `<div class="waiting-list">${waiting.map(x => player(x.player, `<div class="small soft">${x.status === 'stopped' ? '<span class="neg">every deal so far stopped on an error</span>' : x.status === 'playing' ? 'playing its first deals' : 'waiting to play'}</div>`)).join('')}</div>` : ''}</div>`;
     $app.innerHTML = html;
     bindBoard();
     return;
@@ -1044,7 +1044,7 @@ function standingRow(rt, g, p, ax, ranked, inBlock = false) {
 
 function waitingRows(waiting, ranked) {
   return waiting.map(x => `<div class="brow waiting">${ranked ? '<span class="rank">·</span>' : ''}
-    ${player(x.player, `<div class="small soft">${x.status === 'playing' ? 'playing its first deals' : x.status === 'done' ? 'no finished deals' : 'waiting to play'}</div>`)}
+    ${player(x.player, `<div class="small soft">${x.status === 'stopped' ? '<span class="neg">every deal so far stopped on an error</span>' : x.status === 'playing' ? 'playing its first deals' : x.status === 'done' ? 'no finished deals' : 'waiting to play'}</div>`)}
     <span class="r strength soft">–</span><span class="axis"></span><span class="hide-sm"></span><span class="col-more"></span><span class="col-more"></span><span></span></div>`).join('');
 }
 
@@ -1512,6 +1512,7 @@ function pairingsOf(index) {
     P.ms.sort((x, y) => x.round - y.round || x.replicate - y.replicate);
     P.started = P.ms.filter(m => m.started);
     P.live = P.ms.some(m => m.live);
+    P.failed = P.started.filter(m => m.failed && !m.finished).length;
     P.rounds = [...new Set(P.started.map(m => m.round))];
     P.reps = [...new Set(P.started.map(m => m.replicate))];
     P.deals = P.started.reduce((s, m) => s + m.pairs_done, 0);
@@ -1538,7 +1539,7 @@ function matchNav(P, cur, rt) {
   const edge = e != null ? `<b class="${cls(e)}" title="${own(P.a)}'s win rate (bb/100) across finished deals">${signed(e, 0)}<small>/100</small></b>` : '';
   const deals = pr && pr.deals != null ? pr.deals : P.deals;
   const status = !P.started.length ? 'waiting to start'
-    : `${v && notable(pr, v) ? `${v.decided ? '<span class="decided-badge">Decided</span>' : ''}<span class="vword ${v.tone}">${esc(plainVerdictShort(v.short))}</span> · ` : ''}${plural(deals, 'deal')}${scopeText(P) ? ` · ${scopeText(P)}` : ''}`;
+    : `${v && notable(pr, v) ? `${v.decided ? '<span class="decided-badge">Decided</span>' : ''}<span class="vword ${v.tone}">${esc(plainVerdictShort(v.short))}</span> · ` : ''}${plural(deals, 'deal')}${scopeText(P) ? ` · ${scopeText(P)}` : ''}${P.failed ? ` · <span class="neg" title="Deals where a model's CLI returned an error; they are not counted">${P.failed} failed</span>` : ''}`;
   return `<div class="pgroup ${active ? 'active' : ''} ${P.started.length ? '' : 'planned'}"><a class="phead" ${P.latest ? `href="${matchLink(P.latest.id)}"` : ''}>
       <span class="duo">${monogram(P.a, 'sm')}${monogram(P.b, 'sm')}</span>
       <span class="pair-names">${own(P.a)} <span class="vs">vs</span> ${own(P.b)}</span>${P.live ? '<span class="live-dot" title="Playing now"></span>' : ''}${edge}</a>
@@ -1659,7 +1660,27 @@ function chipColor(v, max) {
 }
 
 const timelineMode = () => state.mode;
-const STATUS_WORD = { verified: 'checked', unchecked: 'not checked', provisional: 'in progress (not counted yet)', playing: 'playing now', rejected: 'failed replay check (excluded)' };
+const STATUS_WORD = { verified: 'checked', unchecked: 'not checked', provisional: 'in progress (not counted yet)', playing: 'playing now', rejected: 'failed replay check (excluded)', failed: 'stopped on an error (not counted)' };
+
+// A play that stopped because a model's CLI gave up on a decision (the server's `failure`), in words.
+const TRY_ORDINAL = ['first', 'second', 'third', 'fourth', 'fifth'];
+function failureNote(plays, pick) {
+  const bad = plays.filter(p => p.failure);
+  if (!bad.length) return '';
+  const rows = bad.map(p => {
+    const f = p.failure;
+    const n = Number((/\.d(\d+)$/.exec(f.decision || '') || [])[1]);
+    const which = Number.isFinite(n) ? `its ${TRY_ORDINAL[n] || `${n + 1}th`} decision` : 'a decision';
+    const long = f.detail && f.detail !== f.message;
+    return `<div class="fail-row"><p><b>Play ${p.j + 1} stopped on an error.</b> ${name(f.player)} gave no answer for ${which} of this deal${f.tries > 1 ? ` after ${f.tries} tries` : ''}${f.at ? ` (${ago(f.at)})` : ''}.</p>
+      <blockquote class="fail-msg">${esc(f.message)}</blockquote>
+      ${long ? `<details class="fail-more"><summary>Full error</summary><pre>${esc(f.detail)}</pre></details>` : ''}</div>`;
+  }).join('');
+  const other = plays.filter(p => !p.failure && !p.log.some(e => e.kind === 'result'));
+  const halted = other.length ? ` Play ${other[0].j + 1} was stopped with it.` : '';
+  return `<div class="fail-note card-box" role="status"><span class="fail-icon" aria-hidden="true">!</span><div class="fail-body">${rows}
+    <p class="small soft">This deal is not counted in any total or standing.${halted} Running the same plan again replays it.</p></div></div>`;
+}
 
 // Every deal of the pairing as a small chip, one row per session (or per round of one-deal sessions),
 // coloured by who won it over both plays. Clicking one opens it.
@@ -1712,6 +1733,9 @@ async function matchBody(cur, params, rt, P) {
   const own = pr || { a: L, b: R, conversations: [{ id: cur.id, round: cur.round, replicate: cur.replicate, deals_total: total,
     deals: done.map(k => [k, status[k] === 'rejected' ? null : sign * nets[k] / bb, status[k] || 'unchecked', reach(ha[k])]) }] };
   const seq = Core.dealSequence(own, { [cur.id]: [...played] });
+  // a deal one of this session's plays gave up on is failed, whatever the pairing answer (or its absence) says
+  const gaveUp = new Set(loaded.filter(m => m && m.failure && !m.result).map(m => m.failure.hand));
+  for (const x of seq) if (x.id === cur.id && gaveUp.has(x.deal) && !['verified', 'unchecked', 'rejected'].includes(x.status)) Object.assign(x, { status: 'failed', net: null });
   const pos = Math.max(0, seq.findIndex(x => x.id === cur.id && x.deal === pick));
   const tot = Core.sequenceTotals(seq);
   const planned = Math.max(seq.length, (own.conversations || []).reduce((t, c) => t + (c.deals_total || 0), 0));
@@ -1724,8 +1748,8 @@ async function matchBody(cur, params, rt, P) {
   const amount = trim(Math.abs(Math.round(tot.net * 10) / 10));
   const rate = tot.counted ? Math.abs(tot.net) / (2 * tot.counted) * 100 : 0;
   const face = (p, side) => `<div class="sb-face ${side} ${lead === p ? 'ahead' : ''}">${monogram(p, 'lg')}<div class="sb-name">${name(p)}</div></div>`;
-  const left = [tot.playing ? '1 playing' : '', tot.provisional ? `${tot.provisional} in progress` : '', tot.rejected ? `${tot.rejected} excluded` : ''].filter(Boolean);
-  const leftTip = 'Deals still waiting for their seat-swapped replay (or flagged by replay checks) are not counted in totals yet.';
+  const left = [tot.playing ? '1 playing' : '', tot.provisional ? `${tot.provisional} in progress` : '', tot.rejected ? `${tot.rejected} excluded` : '', tot.failed ? `${tot.failed} failed` : ''].filter(Boolean);
+  const leftTip = 'Deals still waiting for their seat-swapped replay, flagged by replay checks, or stopped by an error are not counted in totals.';
   const scorebar = `<div class="scorebar card-box">
       ${face(L, 'left')}
       <div class="sb-mid">
@@ -1738,10 +1762,11 @@ async function matchBody(cur, params, rt, P) {
 
   const order = [...played].sort((x, y) => x - y);
   const dealNet = pick in nets ? sign * nets[pick] : null;
-  const outcome = dealNet == null ? 'in progress' : dealNet === 0 ? 'even over both plays'
+  const failedHere = (seq[pos] || {}).status === 'failed';
+  const outcome = failedHere ? '<b class="neg">stopped on an error</b> · not counted' : dealNet == null ? 'in progress' : dealNet === 0 ? 'even over both plays'
     : `<b>${short3(dealNet > 0 ? L : R)}</b> wins it by <b class="gold">${trim(Math.abs(dealNet) / bb)} bb</b> over both plays`;
 
-  const plays = [ma, mb].filter(Boolean).map((m, j) => ({ m, j, names: m.config.players.map(x => esc(nameParts(labelText(x))[0])),
+  const plays = [ma, mb].filter(Boolean).map((m, j) => ({ m, j, failure: m.failure && !m.result && m.failure.hand === pick ? m.failure : null, names: m.config.players.map(x => esc(nameParts(labelText(x))[0])),
     ...PokerTable.steps(m.events[pick] || []) }));
   const mode = timelineMode();
   const frames = PokerTable.timeline(plays.map(p => p.steps), mode);
@@ -1783,6 +1808,7 @@ async function matchBody(cur, params, rt, P) {
   const here = seq[pos] || { status: 'playing' };
   const st = here.status;
   const popTag = st === 'rejected' ? `<span class="chip bad" title="${esc(((own.conversations[here.conv] || {}).rejected || []).map(x => x.reason).join('; ') || 'Replay check failed for this deal')}">excluded · not counted</span>`
+    : st === 'failed' ? `<span class="chip bad" title="${esc(plays.filter(p => p.failure).map(p => p.failure.message).join(' · ') || 'A play of this deal stopped on an error')}">failed · not counted</span>`
     : st === 'playing' || st === 'provisional' ? '<span class="chip warn" title="Still in progress; counts once both seat-swapped hands finish">in progress</span>'
     : st === 'unchecked' ? '<span class="chip quiet" title="Replay check was not run on this deal">unverified</span>' : '';
   const where = multiConv ? `${P && P.rounds.length > 1 ? `Round ${cur.round} · ` : ''}session ${cur.replicate}${total > 1 ? ` · deal ${pick + 1}/${total}` : ''}` : '';
@@ -1822,15 +1848,16 @@ async function matchBody(cur, params, rt, P) {
   const rejects = own.conversations.flatMap(c => (c.rejected || []).map(x => `${x.hand == null ? 'whole session' : `deal ${x.hand + 1}`}${multiConv ? ` of session ${c.replicate}${c.round > 1 ? `, round ${c.round}` : ''}` : ''}: ${esc(x.reason)}`));
   const population = `Totals count ${tot.checked ? '<b>checked deals</b> only (both seat-swapped plays finished and verified from the deal log)' : '<b>finished deals</b> (replay checks were not run)'}
     (${plural(tot.counted, 'deal')}).${tot.provisional || tot.playing ? ` ${plural(tot.provisional + tot.playing, 'deal')} still in progress ${tot.provisional + tot.playing === 1 ? 'is' : 'are'} not counted yet.` : ''}
-    ${tot.rejected ? ` ${plural(tot.rejected, 'deal')} that failed replay checks ${tot.rejected === 1 ? 'is' : 'are'} excluded.` : ''}`;
+    ${tot.rejected ? ` ${plural(tot.rejected, 'deal')} that failed replay checks ${tot.rejected === 1 ? 'is' : 'are'} excluded.` : ''}
+    ${tot.failed ? ` ${plural(tot.failed, 'deal')} stopped by a model error ${tot.failed === 1 ? 'is' : 'are'} not counted.` : ''}`;
   const about = `<details class="about card-box"><summary><span>About this result</span><span class="soft small">${v ? esc(plainVerdictShort(v.short)) : 'score pending'} · how this matchup is counted</span></summary>
     <div class="about-body">${verdictLong}<p class="small soft">${population}</p>${rejects.length ? `<ul class="small soft rejects">${rejects.slice(0, 6).map(x => `<li>${x}</li>`).join('')}</ul>` : ''}</div></details>`;
   const nav = `<div class="dealnav card-box"><div class="dn-head"><h3>${planned > seq.length ? `${seq.length} of ${plural(planned, 'deal')} played` : `All ${plural(seq.length, 'deal')}`}</h3>
-      <span class="dn-legend"><span><i class="sw pos"></i>${short3(L)} won it</span><span><i class="sw neg"></i>${short3(R)} won it</span><span><i class="sw sd"></i>showdown</span>${tot.provisional || tot.playing ? '<span><i class="sw prov"></i>in progress</span>' : ''}${tot.rejected ? '<span><i class="sw rej"></i>excluded</span>' : ''}</span></div>
+      <span class="dn-legend"><span><i class="sw pos"></i>${short3(L)} won it</span><span><i class="sw neg"></i>${short3(R)} won it</span><span><i class="sw sd"></i>showdown</span>${tot.provisional || tot.playing ? '<span><i class="sw prov"></i>in progress</span>' : ''}${tot.rejected ? '<span><i class="sw rej"></i>excluded</span>' : ''}${tot.failed ? '<span><i class="sw fail"></i>failed</span>' : ''}</span></div>
     ${dealNav(seq, pos, L, R, swings)}
     ${swingBtns ? `<div class="jumps"><span class="jump-k">Big swings</span><span class="jump-list">${swingBtns}</span></div>` : ''}
     <div class="keys small soft"><span class="kbd">←</span><span class="kbd">→</span> deals · <span class="kbd">space</span> play · <span class="kbd">,</span><span class="kbd">.</span> step · <span class="kbd">d</span> where they differ · <span class="kbd">m</span> mind · <span class="kbd">r</span> expand thoughts</div></div>`;
-  const body = `${scorebar}${controls}${sync}${v2ReplayBar(plays)}
+  const body = `${scorebar}${controls}${failureNote(plays, pick)}${sync}${v2ReplayBar(plays)}
     <div class="pair ${state.mind ? 'show-mind' : ''} ${state.mindPanel ? 'show-mp' : ''} ${state.split && plays.length === 2 ? 'split' : ''}" data-show="${state.showPlay}">${plays.map(p => playPanel(p, cur, bb)).join('')}</div>
     ${nav}${about}
     <p class="omni small soft">The viewer shows both players' private cards; each model saw only its own. A seat's hand name uses its own cards and the board.</p>
@@ -1945,7 +1972,7 @@ function comparePanel(plays, cur, bb) {
   }).join('');
   const results = plays.map((p, j) => {
     const r = p.log.find(e => e.kind === 'result');
-    if (!r) return `<div class="cmp-cell" data-play="${j}"><span class="soft small">not finished</span></div>`;
+    if (!r) return `<div class="cmp-cell" data-play="${j}"><span class="soft small">${p.failure ? 'stopped on an error' : 'not finished'}</span></div>`;
     const net = r.net[p.m.config.players.indexOf(cur.a)] ?? 0;
     return `<div class="cmp-cell" data-play="${j}"><span class="ca" data-step="${r.step}">${monogram(cur.a, 'xs')}<b class="${cls(net)}">${signedBB(net, bb)}</b>${r.showdown ? '<span class="soft small">showdown</span>' : ''}</span></div>`;
   }).join('');

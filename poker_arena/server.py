@@ -138,6 +138,40 @@ def match_summary(root: Path, d: Path, hands=None):
             'live': res is None and time.time() - _mtime(d / 'events.jsonl') < LIVE_SECONDS}
 
 
+def _error_text(err: str) -> str:
+    """The readable part of a backend error: the CLI's own final message when its JSON output carries one
+    (`"result": "API Error: ..."`), else the tail of whatever it printed."""
+    err = str(err or '')
+    found = re.findall(r'"result"\s*:\s*("(?:[^"\\]|\\.)*")', err)
+    for raw in reversed(found):
+        try:
+            text = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    return err.strip()[-600:]
+
+
+def play_failure(d: Path) -> dict | None:
+    """Why a play stopped before its last hand, when a model's backend gave up on a decision: {'hand', 'seat',
+    'player', 'decision', 'tries', 'at', 'message', 'detail'}; None for a finished play, one still being played,
+    or one that simply has not got further yet. The runner writes a `backend_failed` call as the last line of
+    calls.jsonl when every try of a decision failed, then abandons the play; a later resume appends past it."""
+    if (d / 'result.json').exists():
+        return None
+    calls = _lines(d / 'calls.jsonl')
+    last = calls[-1] if calls else None
+    if not isinstance(last, dict) or not last.get('backend_failed') or not isinstance(last.get('hand'), int):
+        return None
+    tries = last.get('failed_attempts') if isinstance(last.get('failed_attempts'), list) else []
+    text = _error_text(last.get('error'))
+    stamps = [x.get('t') for x in tries if isinstance(x, dict) and isinstance(x.get('t'), (int, float))]
+    return {'hand': last['hand'], 'seat': last.get('seat'), 'player': last.get('player'),
+            'decision': last.get('decision_id'), 'tries': len(tries) or 1, 'at': max(stamps, default=None),
+            'message': re.split(r'\n\s*\n', text)[0][:400], 'detail': text[:2000]}
+
+
 def run_of(root: Path, m: Path) -> str:
     rel = m.parent.relative_to(root)
     return str(rel) if str(rel) != '.' else '.'
@@ -201,7 +235,8 @@ class Inventory:
         x = hit[1]
         now = time.time()
         ages = {s: _mtime(m / s / 'events.jsonl') for s in SIDES}
-        matches = [{**y, 'live': not y['finished'] and now - ages[y['side']] < LIVE_SECONDS} for y in x['matches']]
+        matches = [{**y, 'live': not y['finished'] and not x['failed'] and now - ages[y['side']] < LIVE_SECONDS}
+                   for y in x['matches']]
         return {**x, 'matches': matches, 'live': any(y['live'] for y in matches),
                 'updated': max(ages.values(), default=0)}
 
@@ -236,6 +271,7 @@ class Inventory:
                 'labels': {p: LABELS.get(p) or display_name(p, s) for p, s in specs.items()},
                 'bb': game.get('big_unit') or game.get('bb') or 1,
                 'finished': len(matches) == 2 and all(x['finished'] for x in matches),
+                'failed': sum(play_failure(m / s) is not None for s in SIDES),
                 'times': [h['t'] for s in hands.values() for h in s if h.get('t')],
                 '_specs': specs, '_deals': deals,
                 '_written': {s: sorted({h['hand'] for h in hands[s] if isinstance(h.get('hand'), int)}) for s in SIDES}}
@@ -318,13 +354,13 @@ def _runs_and_matchups(root: Path, only: str | None = None):
                 'id': str(rel / f'{a}__vs__{b}') if run != '.' else f'{a}__vs__{b}', 'run': run, 'a': a, 'b': b,
                 'started': False, 'round': 1, 'replicate': 1, 'matches': [], 'deals_total': plan.get('deals', 0), 'pairs_done': 0,
                 'pair_net_a': 0, 'kinds': {p: k for p, k in ((a, ka), (b, kb)) if k}, 'labels': {a: la, b: lb},
-                'bb': 1, 'live': False, 'finished': False, 'updated': 0, 'times': []})
+                'bb': 1, 'live': False, 'finished': False, 'failed': 0, 'updated': 0, 'times': []})
     return by
 
 
 def roster(root: Path, run: str) -> list:
     """Every player of a run, from its plan when there is one, with where it stands: awaiting its first
-    matchup, playing, or done."""
+    matchup, playing, done, or stopped (every deal it started ended on a backend error and none finished)."""
     ms = _runs_and_matchups(root, run).get(run, [])
     plan = _json((root if run == '.' else root / run) / 'plan.json') or {}
     names = list(plan.get('players') or [])
@@ -332,7 +368,9 @@ def roster(root: Path, run: str) -> list:
     out = []
     for p in names:
         mine = [m for m in ms if p in (m['a'], m['b'])]
+        stuck = [m for m in mine if m['started'] and not m['finished']]
         status = ('done' if mine and all(m['finished'] for m in mine)
+                  else 'stopped' if stuck and all(m.get('failed') for m in stuck) and not any(m['pairs_done'] for m in mine)
                   else 'playing' if any(m['started'] for m in mine) else 'awaiting')
         out.append({'player': p, 'status': status})
     return out
@@ -497,6 +535,7 @@ def match(root: Path, mid: str):
     conv = conversation_status(d.parent) if d.name in SIDES else None
     return {'summary': match_summary(root, d), 'config': _json(d / 'config.json'),
             'hands': _lines(d / 'hands.jsonl'), 'events': events, 'result': _json(d / 'result.json'),
+            'failure': play_failure(d),
             **({'status': {str(k): v for k, v in conv['status'].items()}, 'rejected': conv['rejected'], 'checked': conv['checked']} if conv else {})}
 
 
@@ -515,7 +554,8 @@ def conversation_status(m: Path) -> dict:
         return hit[1]
     written = {s: {h.get('hand') for h in _lines(m / s / 'hands.jsonl')} for s in SIDES}
     every = {k for ks in written.values() for k in ks if isinstance(k, int)}
-    out = {'status': {}, 'rejected': [], 'checked': False}
+    out = {'status': {}, 'rejected': [], 'checked': False,
+           'failed': {s: f for s in SIDES for f in [play_failure(m / s)] if f}}
     try:
         from .ratings import read_conversation
         conv = read_conversation(m)
@@ -547,9 +587,10 @@ def conversation_status(m: Path) -> dict:
 def pairing(root: Path, run: str, a: str, b: str) -> dict | None:
     """Every conversation of one pairing in playing order (round, then replicate) with each deal's result from
     a's side: {'a', 'b', 'conversations': [{'id', 'round', 'replicate', 'deals_total', 'live', 'finished',
-    'deals': [[deal, net_bb or None, status, reach]], 'rejected'}], 'totals': {...}}. A deal's status is the shared
-    reader's (verified, provisional, rejected, or unchecked without it), plus 'playing' for the deal a live
-    conversation is on. Totals count verified deals only (unchecked ones when nothing could be checked)."""
+    'deals': [[deal, net_bb or None, status, reach]], 'rejected', 'failed'}], 'totals': {...}}. A deal's status is
+    the shared reader's (verified, provisional, rejected, or unchecked without it), plus 'playing' for the deal a
+    live conversation is on and 'failed' for the deal a play gave up on after a backend error (`play_failure`).
+    Totals count verified deals only (unchecked ones when nothing could be checked)."""
     from .history import ALL
     if run in (None, '', ALL):
         return None
@@ -561,13 +602,19 @@ def pairing(root: Path, run: str, a: str, b: str) -> dict | None:
         return None
     ms.sort(key=lambda m: (m['round'], m['replicate'], m['id']))
     convs, tot = [], {'verified': 0, 'net_bb': 0.0, 'won': 0, 'lost': 0, 'even': 0, 'provisional': 0, 'rejected': 0,
-                      'unchecked': 0, 'playing': 0}
+                      'unchecked': 0, 'playing': 0, 'failed': 0}
     for m in ms:
         st = conversation_status(root / m['id'])
         sign = 1 if m['a'] == a else -1
         bb = m['bb'] or 1
         deals = []
-        for k, status in sorted(st['status'].items()):
+        # a deal one play gave up on is 'failed', not forever 'in progress': it counts nowhere until it is replayed
+        failed = {} if m['finished'] else st.get('failed') or {}
+        statuses = dict(st['status'])
+        for f in failed.values():
+            if statuses.get(f['hand']) not in ('verified', 'rejected'):
+                statuses[f['hand']] = 'failed'
+        for k, status in sorted(statuses.items()):
             d = m['_deals'].get(k)
             net = round(sign * d[0] / bb, 2) if d else None
             deals.append([k, net if status != 'rejected' else None, status, d[1] if d else None])
@@ -575,12 +622,14 @@ def pairing(root: Path, run: str, a: str, b: str) -> dict | None:
             if status in ('verified', 'unchecked') and net is not None:
                 tot['net_bb'] += net
                 tot['won' if net > 0 else 'lost' if net < 0 else 'even'] += 1
-        nxt = max(st['status'], default=-1) + 1
-        if m['live'] and nxt < m['deals_total']:
+        nxt = max(statuses, default=-1) + 1
+        if m['live'] and not failed and nxt < m['deals_total']:
             deals.append([nxt, None, 'playing', None])
             tot['playing'] += 1
         convs.append({'id': m['id'], 'round': m['round'], 'replicate': m['replicate'], 'deals_total': m['deals_total'],
-                      'live': m['live'], 'finished': m['finished'], 'deals': deals, 'rejected': st['rejected']})
+                      'live': m['live'], 'finished': m['finished'], 'deals': deals, 'rejected': st['rejected'],
+                      'failed': [{'side': s, 'hand': f['hand'], 'player': f['player'], 'message': f['message']}
+                                 for s, f in failed.items()]})
     checked = any(conversation_status(root / m['id'])['checked'] for m in ms)
     tot['net_bb'] = round(tot['net_bb'], 2)
     tot['counted'] = tot['verified'] if checked else tot['unchecked']
