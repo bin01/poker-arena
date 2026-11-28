@@ -277,7 +277,7 @@ class TestCoreV2(unittest.TestCase):
         self.assertEqual((r[4], r[5], r[6]), (0, 400, True))
         self.assertEqual([x['action'] for x in r[7]], ['call', 'raise', 'fold'])
         self.assertTrue(r[7][0]['taken'])
-        self.assertEqual(r[8]['text'], 'AIVAT: ran lucky 1.5 bb')
+        self.assertEqual(r[8]['text'], 'AIVAT: ran lucky $30')
         self.assertEqual(r[9], 'AIVAT: no luck to remove')
 
     def test_note_diff_marks_what_changed(self):

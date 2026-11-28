@@ -14,6 +14,48 @@
   const trim = v => Number.isInteger(v) ? String(v) : v.toFixed(1).replace(/\.0$/, '');
   const approx = n => n < 100 ? String(n) : Number(n.toPrecision(2)).toLocaleString('en-US');
 
+  // ---- stakes: chips shown as dollars --------------------------------------------------------------
+  // The engine and the models count chips (blinds 1/2, 200-chip stacks). The pages show the same game as a
+  // $10/$20 no-limit cash game: a big blind is always $20, so the default stack reads $2,000 and a bet of 6
+  // chips reads $60. Display only: nothing recorded, rated or sent to a model changes. Win rates stay in
+  // bb/100 (big blinds won per 100 hands), the measure that does not depend on the stakes.
+  const BB_DOLLARS = 20;
+  // 1240 -> "$1,240". Whole dollars; an average under $10 that is not whole keeps its cents ("$1.60").
+  function usd(d) {
+    d = Math.abs(Number(d) || 0);
+    const whole = Math.round(d);
+    if (d >= 10 || Math.abs(d - whole) < 0.005) return '$' + whole.toLocaleString('en-US');
+    const c = Math.round(d * 100) / 100;
+    return c === 0 ? '$0' : '$' + c.toFixed(2);
+  }
+  // An amount in big blinds, as dollars: money(62) -> "$1,240"; moneySigned(-3) -> "−$60"; zero is "$0".
+  const money = bb => bb == null || !isFinite(bb) ? '' : usd(bb * BB_DOLLARS);
+  function moneySigned(bb) {
+    if (bb == null || !isFinite(bb)) return '';
+    const t = usd(bb * BB_DOLLARS);
+    return t === '$0' ? t : (bb > 0 ? '+' : MINUS) + t;
+  }
+  // The same for an amount in chips of a game whose big blind is `bb` chips.
+  const chipMoney = (chips, bb) => money(chips / (bb || 2));
+  const chipMoneySigned = (chips, bb) => moneySigned(chips / (bb || 2));
+  // A win rate in bb/100 as dollars: perHundred(50) -> "+$1,000 per 100 hands".
+  const perHundred = rate => rate == null || !isFinite(rate) ? '' : `${moneySigned(rate)} per 100 hands`;
+  // The table a game config describes: {sb, bb, stack, stackBB, blinds: "$10/$20", line: "$10/$20 No-Limit Hold'em · $2,000 stacks"}
+  function stakesOf(game) {
+    game = game || {};
+    const bb = game.big_unit || game.bb || 2, sb = game.sb ?? bb / 2, stack = game.stack ?? 100 * bb;
+    const o = { sb: chipMoney(sb, bb), bb: chipMoney(bb, bb), stack: chipMoney(stack, bb), stackBB: trim(stack / bb), chip: usd(BB_DOLLARS / bb) };
+    o.blinds = `${o.sb}/${o.bb}`;
+    o.line = `${o.blinds} No-Limit Hold'em · ${o.stack} stacks`;
+    return o;
+  }
+  // Authored text that counts in big blinds ("bets 10 bb into 30 bb", "20+ bb"), in dollars. Never for a
+  // model's own words, which stay exactly as it wrote them.
+  const bbProse = text => String(text ?? '').replace(/(\d[\d,]*(?:\.\d+)?)(\+?)[ -]?(?:bb|big blinds?)\b(?!\/)/g,
+    (_, n, plus) => usd(Number(n.replace(/,/g, '')) * BB_DOLLARS) + plus);
+  // Beside a model's own words, which count in chips.
+  const chipNote = bb => `Models count in chips, and their words are shown as written: 1 chip is ${usd(BB_DOLLARS / (bb || 2))} at this table.`;
+
   // "GPT-6 Luna · High" -> ['GPT-6 Luna', 'High', '']; a level's parenthetical is the third part:
   // "Claude Sonnet · Default effort (protocol not recorded)" -> ['Claude Sonnet', 'Default effort', 'protocol not recorded']
   function nameParts(text) {
@@ -444,19 +486,23 @@
     return (ACT[a.action] || a.action) + amt;
   }
   const KIND = { sizing: 'resized', retry: 'asked again', fallback: 'auto-played', note: 'changed', tool_use: 'tool rejected', unverified: 'unaudited, asked again' };
+  // The engine's own note on a size it changed ("7 is below the minimum: raised to 8") counts in chips: its
+  // amounts go through the same formatter as the table's.
+  const SIZE_NOTE = /^(\d+)( rounded to | is more than you have: all in for | is below the minimum: raised to )(\d+)$/;
+  const sizeNote = (text, bbFmt) => String(text || '').replace(SIZE_NOTE, (_, a, mid, b) => bbFmt(Number(a)) + mid + bbFmt(Number(b)));
   // From a thought event (and its action): null, or {kind, label, requested, executed, reason}.
   function correction(thought, action, bbFmt = String) {
     const t = thought || {};
     const c = t.correction || (action && action.correction);
     if (c) {
       return { kind: c.kind, label: KIND[c.kind] || c.kind, requested: actText(t.requested || (action && action.requested), bbFmt),
-        executed: actText(t.executed || action, bbFmt), reason: c.reason || '' };
+        executed: actText(t.executed || action, bbFmt), reason: sizeNote(c.reason, bbFmt) };
     }
     if ('correction' in t) return null;
     if (t.fallback) return { kind: 'fallback', label: KIND.fallback, requested: '', executed: actText(action, bbFmt),
       reason: 'no playable answer, so the game checked or folded for it' };
     if (action && action.note) return { kind: 'sizing', label: KIND.note, requested: t.action ? actText({ action: t.action, amount: t.amount }, bbFmt) : '',
-      executed: actText(action, bbFmt), reason: action.note };
+      executed: actText(action, bbFmt), reason: sizeNote(action.note, bbFmt) };
     return null;
   }
 
@@ -852,7 +898,7 @@
     if (!av || !av.luck_correction) return null;
     const luck = Number(av.luck_correction[seat]) || 0;
     const bbs = luck / (bb || 2);
-    return { luck_bb: bbs, text: Math.abs(bbs) < 0.05 ? 'AIVAT: no luck to remove' : `AIVAT: ${bbs > 0 ? 'ran lucky' : 'ran unlucky'} ${Math.abs(bbs).toFixed(1)} bb`,
+    return { luck_bb: bbs, text: Math.abs(bbs) < 0.05 ? 'AIVAT: no luck to remove' : `AIVAT: ${bbs > 0 ? 'ran lucky' : 'ran unlucky'} ${money(Math.abs(bbs))}`,
       allin: !!av.all_in, street: av.all_in_street || null };
   }
 
@@ -976,5 +1022,6 @@
     evBadge, gtoBars, pctText, decisionAt, aivatPill, noteDiff, noteChanged, forensicsPill, metaRows, cycleText, aivatOf, zOf, planParams, planCommand, planFallback, hoursText,
     STABLE_NOTE, dealSequence, sequenceSwings, sequenceTotals, standingBlocks, cycleResults, cohorts, cohortName, protocolOf, populationOf, testOf, isFallback, provenanceOf, leakNote, quizOf, firstDifference, bigSwings, IDENTITY, esc, MINUS, signed, plural, trim, approx, nameParts, family, isContract, normalize, verdict, verdictSides, powerLine, correction, actText,
     isDecided, decidedLeader, driftQualified, countsForLeader, driftWords, officialInterval, ciKind, DESCRIPTIVE_TIP, spotPrompt, spotTitle, handCode, playerId, rateOf, targetEdge, isUnregistered, scenarios, conversationsShort,
-    assumptionsOf, ineligible, sourceOf, basisOf, fitOf, identityOf, ASSUME };
+    assumptionsOf, ineligible, sourceOf, basisOf, fitOf, identityOf, ASSUME,
+    BB_DOLLARS, usd, money, moneySigned, chipMoney, chipMoneySigned, perHundred, stakesOf, bbProse, chipNote };
 });
