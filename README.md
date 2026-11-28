@@ -66,14 +66,11 @@ python -m poker_arena ratings runs/cup
 
 Players are defined as `[players.<id>]` entries in [`players.toml`](players.toml) (`backend`, exact `model`, and `effort`, defaulting to `high`, or `bot = "reference"|"rule"|"station"|"random"|"gto"`).
 
-| Backend | CLI / Transport | Conversation state |
+| Backend | CLI / Subscription | Conversation state |
 |---|---|---|
-| `claude` | `claude -p` (Claude Pro/Max) | Stateful (`--resume`), tools off, isolated empty workdir |
-| `codex` | `codex exec` (ChatGPT Plus/Pro) | Stateful (`exec resume`), read-only sandbox, isolated empty workdir |
-| `agy` | `agy -p` (Google Antigravity) | Stateful (`--conversation`), tool-less agent, isolated empty workdir |
-| `gemini` | `gemini -p` | Stateless (re-sends committed transcript) |
-| `command` | Any stdin CLI (e.g. `ollama`, `pi`) | Stateless |
-| `openai_compat` | OpenAI-compatible HTTP API | Stateless |
+| `claude` | `claude -p` (Claude Pro / Max) | Stateful (`--resume`), tools off, isolated empty workdir |
+| `codex` | `codex exec` (ChatGPT Plus / Pro) | Stateful (`exec resume`), read-only sandbox, isolated empty workdir |
+| `agy` | `agy -p` (Google Antigravity / Gemini) | Stateful (`--conversation`), tool-less agent, isolated empty workdir |
 
 ---
 

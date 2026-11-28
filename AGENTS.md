@@ -12,7 +12,7 @@ poker_arena/
 │   ├── __init__.py       # Game registry (get_game)
 │   └── holdem.py         # Seeded HUNL engine, Episode state machine, Hand replay verifier
 ├── cards.py              # Fast 5/7-card hand evaluator & Monte Carlo equity
-├── backends.py           # CLI/API adapters (claude, codex, agy, gemini, command, openai_compat), RateGate, session/rebuild state
+├── backends.py           # Supported CLI adapters (claude, codex, agy), RateGate, session/rebuild state
 ├── agents.py             # ModelAgent (JSON parse, retries, tool_use/unverified rejection) + baseline bots
 ├── runner.py             # run_match, _has_uncommitted_logs, _reconcile, verify_match, run_duplicate, run_plan, Lifecycle
 ├── ratings.py            # Shared reader (read_conversation, _hands, verify_play), betting CS, adjudicate, eligibility, quiz audit

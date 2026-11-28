@@ -76,15 +76,14 @@ Every CLI runs inside an isolated empty working directory per seat. When a subsc
 - **`claude`** (`claude -p --resume`): system prompt replaced, `--tools ""` and `--strict-mcp-config`, `--setting-sources project` skips user hooks/settings (`isolate = false` to keep them), thinking returned as summaries.
 - **`codex`** (`codex exec` / `exec resume`): coding instructions replaced by the game prompt; tools cannot be fully disabled so read-only sandbox + empty folder + post-turn tool audit enforce isolation; Codex does not attest served model IDs (`identity_match: "unattested"`).
 - **`agy`** (`agy -p --conversation`): tool-less agent with MCP/commands/files/URLs denied; always pin an explicit `model` in `players.toml` so `agy` does not fall back to personal defaults.
-- **`gemini` / `command` / `openai_compat`**: stateless backends that re-send the committed transcript each turn. Do not mix CLI and API runs of the same model on one leaderboard.
 
 ### Why official CLIs?
 
-Full agent harnesses (e.g. Hermes) add their own tools, prompts, and memory loops that confound what the poker eval measures. Official CLIs use your existing subscriptions within provider terms; third-party harnesses can still be benchmarked explicitly via the `command` backend.
+Full agent harnesses (e.g. Hermes) add their own tools, prompts, and memory loops that confound what the poker eval measures. Official CLIs use your existing subscriptions within provider terms.
 
 ---
 
 ## Extending Poker Arena
 
-- **Add a model:** Add a `[players.<id>]` section to `players.toml` specifying `backend`, exact `model`, and `effort`. Any stdin-reading CLI works via `backend = "command"`.
+- **Add a model:** Add a `[players.<id>]` section to `players.toml` specifying `backend` (`claude`, `codex`, or `agy`), exact `model`, and `effort`.
 - **Add a game:** Create a module in `poker_arena/games/` subclassing `Game` and `Episode`, then register it in `poker_arena/games/__init__.py`. Runner, duplicate pairing, logging, ratings, and viewer work unchanged (aside from game-specific rendering).
