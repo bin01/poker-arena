@@ -1188,6 +1188,11 @@ details.fold[open] .fold-mark::before { content: "−"; }
 .fail-body p:last-child { margin-bottom: 0; }
 .fail-msg { margin: 0 0 8px; padding: 8px 12px; border-left: 2px solid var(--neg); background: rgba(0, 0, 0, .18); border-radius: 0 6px 6px 0; font-size: 13px; overflow-wrap: anywhere; }
 .fail-more { margin: 0 0 8px; font-size: 12.5px; }
+.fail-count { color: var(--neg); font-weight: 600; margin-left: 4px; }
+.fail-open { margin-left: 8px; white-space: nowrap; text-decoration: underline; text-underline-offset: 3px; }
+.run-errors { margin: 0 0 16px; }
+.run-errors .fail-row + .fail-row { margin-top: 10px; }
+a.label.neg { text-decoration: underline; text-underline-offset: 3px; }
 .fail-more summary { cursor: pointer; color: var(--ink-2); }
 .fail-more pre { margin: 8px 0 0; padding: 10px 12px; white-space: pre-wrap; overflow-wrap: anywhere; background: rgba(0, 0, 0, .22); border-radius: 6px; font-size: 12px; max-height: 260px; overflow: auto; }
 .dealnav .keys { margin-top: 10px; }
@@ -1254,6 +1259,7 @@ details.fold[open] .fold-mark::before { content: "−"; }
   .deal-title h2 { font-size: 17px; }
   .deal-title .round { font-size: 9px; letter-spacing: .06em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .deal-title .chip { display: none; }
+  .deal-title .chip.bad { display: inline-flex; }   /* a failed or excluded deal is said on every screen */
   .opts-toggle { display: inline-block; padding: 5px 11px; font-size: 12px; }
   .opts { display: none; }
   .opts.open { display: flex; }

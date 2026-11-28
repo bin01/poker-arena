@@ -47,7 +47,7 @@ players.toml              # Configured model and bot players
 | Statistical verdicts, eligibility, cache, history | `ratings.py`, `history.py`, `docs/methodology.md` | `pytest tests/test_ratings.py tests/test_evidence.py tests/test_publication.py tests/test_calibration.py tests/test_history.py` |
 | Solver, AIVAT, meta-ranking | `solver.py`, `aivat.py`, `meta_rank.py`, `docs/v2-architecture.md` | `pytest tests/test_solver_aivat.py tests/test_verification_suite.py` |
 | Forensics, invariance, 6-axis scorecard | `forensics.py`, `invariance.py`, `scorecard.py` | `pytest tests/test_forensics_invariance.py tests/test_scorecard.py tests/test_harness_readiness.py` |
-| Web viewer, API endpoints, static export | `server.py`, `viewer/*` | `pytest tests/test_viewer.py tests/test_v2_ui.py tests/test_review_r*.py` |
+| Web viewer, API endpoints, static export | `server.py`, `viewer/*` | `pytest tests/test_viewer.py tests/test_v2_ui.py tests/test_failures.py tests/test_review_r*.py` |
 | Docs (`README.md`, `docs/methodology.md`) | `README.md`, `docs/methodology.md` | `pytest tests/test_review_r9.py` (checks required wording such as `stable model` & `no drift detected`) |
 
 ---
@@ -99,4 +99,5 @@ verification/run_tlc.sh --check-each
 - **Python `bool` is an `int`:** Always guard JSON integer checks with `isinstance(x, int) and not isinstance(x, bool)` (especially on `hands_committed` and `record_version`).
 - **In-memory verification cache:** `ratings._VERIFIED` caches `verify_play` by `(path, _stamp(d), cfg_sig)` and per-hand payload signature; tests mutating files within the same filesystem mtime tick should call `ratings._VERIFIED.clear()`.
 - **Gitignored local tools:** `.tools/` holds optional local binaries (Eclipse Temurin JRE, `tla2tools.jar`, `TexasSolver`); never commit `.tools/` or `runs/`.
+- **Failed plays are read from the raw log:** a play with no `result.json` whose last `calls.jsonl` line is `backend_failed` gave up on a model error (`server.play_failure`). The viewer, `status` and exports all report it from there; such a deal is `failed`, never `provisional`, and a static export must not carry raw CLI output (`server._exportable`). See `tests/test_failures.py`.
 - **Doc wording assertions:** `tests/test_review_r9.py` asserts exact strings in `README.md` (`"stable model"`) and `docs/methodology.md` (`"no drift detected"`). Run it after doc edits.

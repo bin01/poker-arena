@@ -270,7 +270,9 @@ function renderStatus(cur) {
   if (STATIC) { $status.innerHTML = `<span class="label">Snapshot · ${new Date(STATIC.exported * 1000).toLocaleDateString()}</span>`; return; }
   if (!cur) { $status.innerHTML = ''; return; }
   const playing = state.index.filter(m => m.live).length;
-  const checked = state.checked ? `<span class="label checked" title="When this page last asked for news">checked ${clock(state.checked)}</span>` : '';
+  const bad = cur.failures && cur.failures.deals;
+  const checked = (bad ? `<a class="label neg" href="${runLink(state.run)}" title="Deals a model's CLI returned an error on; they are not counted. Open the standings for the errors.">${plural(bad, 'deal')} failed</a>` : '')
+    + (state.checked ? `<span class="label checked" title="When this page last asked for news">checked ${clock(state.checked)}</span>` : '');
   if (playing) $status.innerHTML = `<span class="live-dot"></span><span>Live<span class="label"> · ${plural(playing, 'table')}</span></span>${checked}`;
   else if (cur.finished) $status.innerHTML = `<span class="label">Finished</span>`;
   else if (cur.status === 'stopped') $status.innerHTML = `<span class="idle-dot"></span><span>Stopped<span class="label"> · last action ${ago(cur.updated)}</span></span>${checked}`;
@@ -317,6 +319,7 @@ function runHeader(r, rt, raw) {
     else when = `Paused · last action ${ago(r.updated)}`;
     const hands = r.finished || !r.hands_planned ? plural(r.hands || 0, 'hand') : `${(r.hands || 0).toLocaleString('en-US')} of ${plural(r.hands_planned, 'hand')}`;
     bits = [whoText(ids), hands, when];
+    if (r.failures && r.failures.deals) bits.push(`<span class="neg" title="Deals a model's CLI returned an error on; they are not counted">${plural(r.failures.deals, 'deal')} failed</span>`);
     if (!r.finished && r.hands_planned) meter = `<div class="meter thin rh-meter"><span style="width:${(Math.min(1, r.hands / r.hands_planned) * 100).toFixed(1)}%"></span></div>`;
   }
   const fx = raw ? Core.forensicsPill(raw.forensics_summary) : null;
@@ -767,7 +770,7 @@ async function renderBoard(query) {
   const aiv = raw.aivat && raw.aivat.summary && raw.aivat.summary.pairings
     ? `<b>Luck reduction (AIVAT):</b> cuts score noise by ${trim(Math.round(raw.aivat.summary.mean_variance_reduction_ratio * 10) / 10)}× on average across ${plural(raw.aivat.summary.pairings, 'matchup')}.` : '';
   const extras = [r?.all ? historyNotes(r, rt) : designLine(rt), trackNote(rt), yardstickNote(view), aiv];
-  let html = runHeader(r, rt, raw) + planPanel(rt, extras) + trackBar(state.run) + staleNote(raw) + (cohort ? cohortBar(all, cohort) : '');
+  let html = runHeader(r, rt, raw) + planPanel(rt, extras) + trackBar(state.run) + staleNote(raw) + errorsPanel(r) + (cohort ? cohortBar(all, cohort) : '');
   const waiting = cohort && cohort !== all[0] ? [] : rt.roster.filter(x => !rt.players.some(p => p.player === x.player));
   if (!rt.players.length) {
     html += `<div class="card-box empty"><div class="big-suits">♠ ♥ ♦ ♣</div><h2>The cards are in the air</h2>
@@ -839,12 +842,26 @@ function renderBoardPending(r) {
     return `<a class="pend-row" href="${matchLink(P.latest.id)}">${monogram(lead, 'sm')}<span class="dr-n">${short3(lead)}</span><i>${P.netA ? 'ahead of' : 'level with'}</i>
       <span class="dr-n">${short3(trail)}</span><b>${trim(Math.round(rate))}<small> bb/100</small></b><small class="soft">${plural(P.deals, 'deal')}</small></a>`;
   }).join('');
-  $app.innerHTML = runHeader(r, none, null) + `<div class="card-box pending-board" aria-live="polite">
+  $app.innerHTML = runHeader(r, none, null) + errorsPanel(r) + `<div class="card-box pending-board" aria-live="polite">
     <div class="deal-in-suits" aria-hidden="true"><span>♠</span><span class="red">♥</span><span class="red">♦</span><span>♣</span></div>
     <h2>Checking every hand and working out the standings</h2>
     <p>Each hand is replayed from its seed and checked before it counts. For a big run that takes a few seconds the first time; this page fills in by itself. Meanwhile, the raw chip score of each matchup (unchecked, and not a verdict):</p>
     ${rows ? `<div class="pend-list">${rows}</div>` : ''}
     <a class="cta" href="${runLink(state.run, '/m')}"><span class="cta-icon">▶</span>Watch the hands meanwhile</a></div>`;
+}
+
+// The run's deals that a model's CLI gave up on (the server's `failures`): who, how many, what the CLI said, and
+// a deal to open. Shown wherever the standings are, so a model that is missing from them is explained.
+function errorsPanel(r) {
+  const f = r && r.failures;
+  if (!f || !f.deals) return '';
+  const rows = f.players.flatMap(p => p.kinds.map(k => `<div class="fail-row">
+      <p>${name(p.player)} <span class="fail-count">${k.deals} of ${plural(p.started, 'deal')} stopped</span> · ${esc(k.title)}${k.last ? ` <span class="soft">· last ${ago(k.last)}</span>` : ''}
+        <a class="fail-open" href="${matchLink(k.example)}">Open one ›</a></p>
+      <blockquote class="fail-msg">${esc(k.message)}</blockquote></div>`)).join('');
+  return `<div class="fail-note card-box run-errors" role="status"><span class="fail-icon" aria-hidden="true">!</span><div class="fail-body">
+    <p><b>${plural(f.deals, 'deal')} stopped on a model error and ${f.deals === 1 ? 'is' : 'are'} not counted.</b> Standings use finished, checked deals only, so a model whose deals all stopped has no rank yet.</p>
+    ${rows}<p class="small soft">Running the same plan again replays these deals.</p></div></div>`;
 }
 
 const staleNote = raw => raw && raw.cache && raw.cache.error
@@ -1672,7 +1689,7 @@ function failureNote(plays, pick) {
     const n = Number((/\.d(\d+)$/.exec(f.decision || '') || [])[1]);
     const which = Number.isFinite(n) ? `its ${TRY_ORDINAL[n] || `${n + 1}th`} decision` : 'a decision';
     const long = f.detail && f.detail !== f.message;
-    return `<div class="fail-row"><p><b>Play ${p.j + 1} stopped on an error.</b> ${name(f.player)} gave no answer for ${which} of this deal${f.tries > 1 ? ` after ${f.tries} tries` : ''}${f.at ? ` (${ago(f.at)})` : ''}.</p>
+    return `<div class="fail-row"><p><b>Play ${p.j + 1} stopped: ${esc(f.title || 'the CLI returned an error')}.</b> ${name(f.player)} gave no answer for ${which} of this deal${f.tries > 1 ? ` after ${f.tries} tries` : ''}${f.at ? ` (${ago(f.at)})` : ''}.</p>
       <blockquote class="fail-msg">${esc(f.message)}</blockquote>
       ${long ? `<details class="fail-more"><summary>Full error</summary><pre>${esc(f.detail)}</pre></details>` : ''}</div>`;
   }).join('');
@@ -1809,6 +1826,7 @@ async function matchBody(cur, params, rt, P) {
   const st = here.status;
   const popTag = st === 'rejected' ? `<span class="chip bad" title="${esc(((own.conversations[here.conv] || {}).rejected || []).map(x => x.reason).join('; ') || 'Replay check failed for this deal')}">excluded · not counted</span>`
     : st === 'failed' ? `<span class="chip bad" title="${esc(plays.filter(p => p.failure).map(p => p.failure.message).join(' · ') || 'A play of this deal stopped on an error')}">failed · not counted</span>`
+    : (st === 'playing' || st === 'provisional') && !cur.live && !cur.finished ? '<span class="chip warn" title="This deal stopped before both seat-swapped plays finished, with no error recorded (the run was stopped or is between moves). It is not counted; running the same plan again resumes it.">not finished · not counted</span>'
     : st === 'playing' || st === 'provisional' ? '<span class="chip warn" title="Still in progress; counts once both seat-swapped hands finish">in progress</span>'
     : st === 'unchecked' ? '<span class="chip quiet" title="Replay check was not run on this deal">unverified</span>' : '';
   const where = multiConv ? `${P && P.rounds.length > 1 ? `Round ${cur.round} · ` : ''}session ${cur.replicate}${total > 1 ? ` · deal ${pick + 1}/${total}` : ''}` : '';

@@ -229,6 +229,11 @@ def cmd_tournament(args):
         if len(plans) > 1:
             print(f'\n== {track} track ({plan["out"]}) ==')
         print(summary(ratings(plan['out'])))
+        from .server import failures   # last, so a run that lost deals to errors never ends on a clean-looking table
+        out = Path(plan['out']).resolve()
+        lines = _failure_lines(failures(out, '.'), out.name)
+        if lines:
+            print('\n' + '\n'.join(lines).replace('/./', '/'))
 
 
 def cmd_ratings(args):
@@ -311,8 +316,26 @@ def cmd_export(args):
           f'  python -m http.server -d {args.out} 8000')
 
 
+def _failure_lines(bad: dict | None, where: str) -> list[str]:
+    """The deals of a run that stopped on a model error (server.failures), as lines for the terminal: how many,
+    then per model the count, the kind of error, what the CLI said and a call log to read. Nothing when none."""
+    if not bad or not bad.get('deals'):
+        return []
+    n = bad['deals']
+    lines = [f"  errors: {n} deal{'s' if n != 1 else ''} stopped on a model error and {'are' if n != 1 else 'is'} "
+             f"not counted (rerun the same command to replay them)"]
+    for p in bad['players']:
+        for k in p['kinds']:
+            said = ' '.join(k['message'].split())
+            lines.append(f"    {p['player']}: {k['deals']} of {p['started']} deals, {k['title']}: "
+                         f"\"{said[:240]}{'...' if len(said) > 240 else ''}\" (full error: "
+                         f"{where}/{k['example']}/calls.jsonl)")
+    return lines
+
+
 def cmd_status(args):
-    """Progress of every run under a folder: hands played, matchups playing, pace and time left."""
+    """Progress of every run under a folder: hands played, matchups playing, pace and time left, and the deals a
+    model's CLI gave up on (who, how many, what the CLI said, and the call log to read)."""
     from .server import index, runs
     root = Path(args.root).resolve()
     for r in runs(root):
@@ -330,9 +353,12 @@ def cmd_status(args):
         for m in index(root, r['run']):
             if m['finished'] and not args.all:
                 continue
-            mark = 'playing' if m['live'] else 'not started' if not m['started'] else 'done' if m['finished'] else 'paused'
+            mark = 'playing' if m['live'] else 'not started' if not m['started'] else 'done' if m['finished'] \
+                else 'stopped on an error' if m.get('failed') else 'paused'
             net = f", {m['a']} {m['pair_net_a'] / m['bb']:+.1f} bb" if m['pairs_done'] else ''
             print(f"  {m['a']} vs {m['b']}: {m['pairs_done']}/{m['deals_total']} deals, {mark}{net}")
+        for line in _failure_lines(r.get('failures'), root.name):
+            print(line)
         if args.health:
             from .stats import collect
             base = root if r['run'] == '.' else root / r['run']
