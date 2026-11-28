@@ -232,6 +232,24 @@ LOGS = ('hands.jsonl', 'events.jsonl', 'calls.jsonl', 'raw.jsonl')
 RECORD_VERSION = 2   # 2: decisions, calls, raw rows and executed actions are linked by decision_id / call_id
 
 
+def _has_uncommitted_logs(out: Path, done: int) -> bool:
+    """Whether any log holds rows past `done` or torn lines that `_reconcile` will remove."""
+    for fname in LOGS:
+        path = out / fname
+        if not path.exists():
+            continue
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                return True
+            if r.get('episode', r.get('hand', 0)) >= done:
+                return True
+    return False
+
+
 def _reconcile(out: Path, done: int, resume: int) -> tuple[dict, dict]:
     """Cut every log back to the first `done` hands. Rows of later hands move to interrupted.jsonl; lines a
     kill left half-written are dropped. Returns ({file: rows moved}, {file: torn lines})."""
@@ -549,9 +567,20 @@ def verify_match(d: Path, cfg: dict | None = None, hands=None, events=None) -> d
     cfg = cfg if cfg is not None else (json.loads((d / 'config.json').read_text()) if (d / 'config.json').exists() else {})
     hands = hands if hands is not None else _read_jsonl(d / 'hands.jsonl')
     events = events if events is not None else _read_jsonl(d / 'events.jsonl')
-    state = json.loads((d / 'state.json').read_text()) if (d / 'state.json').exists() else {}
-    committed = state.get('hands_committed', state.get('hands', len(hands)))
-    hands = hands[:committed]
+    state_path = d / 'state.json'
+    state = None
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text())
+        except (OSError, ValueError):
+            state = None
+    committed = state.get('hands_committed', state.get('hands')) if isinstance(state, dict) else None
+    rv = cfg.get('record_version') if isinstance(cfg, dict) else None
+    modern = isinstance(rv, int) and not isinstance(rv, bool) and rv >= 2
+    if isinstance(committed, int) and not isinstance(committed, bool):
+        hands = hands[:committed]
+    elif (state_path.exists() and not isinstance(state, dict)) or modern:
+        hands = []
     failed = []
     try:
         game = game_of(cfg)
@@ -697,12 +726,25 @@ async def run_match(game, seat_players: list[tuple[str, dict]], seeds: list[int]
         _write(out / 'config.json', stored, indent=2)
     system_sha = [hashlib.sha1(p.encode()).hexdigest()[:12] for p in fresh['system_prompts']]
 
-    state = json.loads((out / 'state.json').read_text()) if (out / 'state.json').exists() else {}
+    state_path = out / 'state.json'
+    state = json.loads(state_path.read_text()) if state_path.exists() else {}
     done = state.get('hands_committed', state.get('hands', 0))
     pending = state.get('pending', [''] * n)
     resumes = state.get('resumes', [])
     for a, st in zip(agents, state.get('agents', [])):
         a.restore(st)
+    # Persist CLI session rebuild intent BEFORE _reconcile removes uncommitted/torn log rows on disk,
+    # so a second crash during recovery cannot lose the signal and silently reuse a dirty CLI session.
+    needs_rebuild = _has_uncommitted_logs(out, done)
+    rebuilt = []
+    if needs_rebuild or any(a.kind == 'model' and a.backend.rebuilding for a in agents):
+        for i, a in enumerate(agents):
+            if a.kind == 'model' and (needs_rebuild or a.backend.rebuilding):
+                a.backend.rebuild()
+                rebuilt.append(i)
+        if state_path.exists() and rebuilt:
+            state['agents'] = [a.state() for a in agents]
+            _write(state_path, state)
     # rows of a hand the stopped run had started: moved to interrupted.jsonl, so the logs match what is
     # replayed, and the CLI conversations (which may still hold those turns) are rebuilt from the committed ones
     dropped, torn = _reconcile(out, done, len(resumes) + 1)
@@ -714,11 +756,6 @@ async def run_match(game, seat_players: list[tuple[str, dict]], seeds: list[int]
         if check['failed']:
             raise RuntimeError(f'{out}: committed hands fail verification against their seeds '
                                f'({check["failed"][0]}); the record is damaged')
-    rebuilt = []
-    for i, a in enumerate(agents):
-        if a.kind == 'model' and (dropped or a.backend.rebuilding):
-            a.backend.rebuild()
-            rebuilt.append(i)
     if done or dropped or torn:
         resumes.append({'t': round(time.time()), 'after_hand': done, 'code_version': code_version(),
                         'implementation': impl['fingerprint'], 'code_changed': bool(change), 'cli_versions': versions,
@@ -885,15 +922,17 @@ async def run_duplicate(game, a: tuple[str, dict], b: tuple[str, dict], seeds, o
     meta = {'pairing': [a[0], b[0]], 'round': round_, 'replicate': replicate}
 
     async def one(order, label, s):
-        for sem in sems:
-            await sem.acquire()
-        if on_start:
-            on_start()
+        acquired = []
         try:
+            for sem in sems:
+                await sem.acquire()
+                acquired.append(sem)
+            if on_start:
+                on_start()
             return await run_match(game, order, seeds, out / label, log=log, agent_seed=s,
                                    meta={**meta, 'order': label}, allow_code_change=allow_code_change)
         finally:
-            for sem in sems:
+            for sem in reversed(acquired):
                 sem.release()
 
     tasks = [asyncio.ensure_future(one([a, b], 'a-first', 1)), asyncio.ensure_future(one([b, a], 'b-first', 2))]

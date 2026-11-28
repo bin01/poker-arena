@@ -328,15 +328,28 @@ def _json(p: Path):
         return None
 
 
-def _hands(d: Path):
+def _is_modern_record(d: Path, cfg: dict | None = None) -> bool:
+    if cfg is None:
+        cfg = _json(d / 'config.json')
+    rv = cfg.get('record_version') if isinstance(cfg, dict) else None
+    return isinstance(rv, int) and not isinstance(rv, bool) and rv >= 2
+
+
+def _hands(d: Path, cfg: dict | None = None):
     """{hand: record} of a match folder's committed hands: rows past state.json's hands_committed (a hand
-    written before an interruption, which a resume replays) are not part of the record. A folder without a
-    state.json is a legacy record (written before commits were recorded): every hand it holds is taken as
-    committed, and still counts only if it verifies (`read_conversation` says so in `commit`)."""
+    written before an interruption, which a resume replays) are not part of the record. A modern folder
+    (record_version >= 2) without a readable state.json has 0 committed hands (fail-closed during the
+    first-hand commit window). A legacy folder without a state.json takes every written hand as committed,
+    and it still counts only if it verifies (`read_conversation` says so in `commit`)."""
     out = {}
     p = d / 'hands.jsonl'
-    state = _json(d / 'state.json') if (d / 'state.json').exists() else None
+    state_path = d / 'state.json'
+    state = _json(state_path) if state_path.exists() else None
     committed = state.get('hands_committed', state.get('hands')) if isinstance(state, dict) else None
+    valid_committed = isinstance(committed, int) and not isinstance(committed, bool)
+    if not valid_committed:
+        if (state_path.exists() and not isinstance(state, dict)) or _is_modern_record(d, cfg):
+            return {}
     if p.exists():
         for line in p.read_text().splitlines():
             try:
@@ -344,8 +357,8 @@ def _hands(d: Path):
                 out[h['hand']] = h
             except (ValueError, KeyError, TypeError):
                 pass
-    if isinstance(committed, int):
-        out = {k: h for k, h in out.items() if isinstance(k, int) and k < committed}
+    if valid_committed:
+        out = {k: h for k, h in out.items() if isinstance(k, int) and not isinstance(k, bool) and k < committed}
     return out
 
 
@@ -527,10 +540,14 @@ def verify_play(d: Path, cfg: dict, hands: dict) -> dict:
     (version 2: what an official decision is bound to); `audit` is `linked_audit` of the hand. Cached by the
     folder's file sizes and times."""
     d = Path(d)
-    key = (str(d.resolve()), _stamp(d))
+    cfg_sig = json.dumps({'game': cfg.get('game'), 'players': cfg.get('players'), 'seeds': cfg.get('seeds')},
+                         sort_keys=True, default=str)
+    key = (str(d.resolve()), _stamp(d), cfg_sig)
     hit = _VERIFIED.get(key)
-    if hit is not None:
-        return hit
+    sigs = {k: json.dumps(h, sort_keys=True, default=str) for k, h in hands.items()}
+    missing = {k: h for k, h in hands.items() if hit is None or k not in hit or hit[k][0] != sigs[k]}
+    if not missing:
+        return {k: hit[k][1] for k in hands}
     seeds, n = cfg.get('seeds') or [], len(cfg.get('players') or []) or 2
     events = _rows_by_hand(d / 'events.jsonl', 'episode')
     calls = _rows_by_hand(d / 'calls.jsonl', 'hand') or {}
@@ -539,8 +556,8 @@ def verify_play(d: Path, cfg: dict, hands: dict) -> dict:
         from .runner import replay_decisions
     except ImportError:
         replay_decisions = None
-    out = {}
-    for k, h in hands.items():
+    out = dict(hit) if hit is not None else {}
+    for k, h in missing.items():
         evs = None if events is None else events.get(k, [])
         if not isinstance(k, int) or k >= len(seeds):
             v = {'ok': False, 'errors': [f'hand {k} has no seed in the config']}
@@ -549,14 +566,14 @@ def verify_play(d: Path, cfg: dict, hands: dict) -> dict:
         blob = json.dumps({'hand': h, 'events': evs}, sort_keys=True, default=str)
         linked = json.dumps({'hand': h, 'events': evs, 'calls': calls.get(k, []), 'raw': raw.get(k, [])},
                             sort_keys=True, default=str)
-        out[k] = {**v, 'digest': hashlib.sha256(blob.encode()).hexdigest()[:24],
+        out[k] = (sigs[k], {**v, 'digest': hashlib.sha256(blob.encode()).hexdigest()[:24],
                   'digest_linked': hashlib.sha256(linked.encode()).hexdigest()[:24],
                   'audit': linked_audit(cfg, k, evs or [], calls.get(k, []), raw.get(k, []), _replayed(
-                      replay_decisions, cfg, h, evs, calls.get(k, [])))}
+                      replay_decisions, cfg, h, evs, calls.get(k, [])))})
     if len(_VERIFIED) > 4096:
         _VERIFIED.clear()
     _VERIFIED[key] = out
-    return out
+    return {k: out[k][1] for k in hands}
 
 
 EVIDENCE_VERSION = 2        # 1: hands and events; 2: also their call records and raw backend output
@@ -606,7 +623,7 @@ def read_conversation(mdir) -> dict | None:
     if not ca:
         return None
     cb = _json(b_dir / 'config.json') if (b_dir / 'config.json').exists() else None
-    ha, hb = _hands(a_dir), _hands(b_dir) if cb else {}
+    ha, hb = _hands(a_dir, ca), _hands(b_dir, cb) if cb else {}
     unreadable = cb is None and (b_dir / 'config.json').exists()
     written = {side: {h.get('hand') for h in _rows(d / 'hands.jsonl') if isinstance(h, dict)}
                for side, d in (('a-first', a_dir), ('b-first', b_dir))}
@@ -633,8 +650,9 @@ def read_conversation(mdir) -> dict | None:
                                           and k not in out['verified'] and k not in bad
                                           and (k not in mine or k not in other))
     out['commit'] = {side: 'state.json' if (d / 'state.json').exists() else
-                     'legacy: no state.json, so every written hand is taken as committed and counts only if it verifies'
-                     for side, d in (('a-first', a_dir), ('b-first', b_dir))}
+                     ('state.json (none yet: 0 committed)' if _is_modern_record(d, cfg) else
+                      'legacy: no state.json, so every written hand is taken as committed and counts only if it verifies')
+                     for side, d, cfg in (('a-first', a_dir, ca), ('b-first', b_dir, cb))}
     good = set(out['verified'])
     out['status'] = {side: {k: 'verified' if k in good else 'rejected' if whole or k in bad else 'provisional'
                             for k in sorted(x for x in written[side] if isinstance(x, int))}

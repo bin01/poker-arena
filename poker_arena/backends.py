@@ -298,13 +298,15 @@ class Backend:
 
     # ---- state for resuming a stopped match -------------------------------------------------
     def state(self):
-        return {'turns': self.turns, 'session': self.session, 'workdir': self.workdir}
+        return {'turns': self.turns, 'session': self.session, 'workdir': self.workdir,
+                'rebuilding': self.rebuilding}
 
     def restore(self, st):
         self.turns, self.session = st.get('turns', []), st.get('session')
         workdir = st.get('workdir')
         self.workdir = workdir if workdir and os.path.isdir(workdir) else None
-        if self.session and not self.workdir:   # the CLI's session lived in a folder that is gone
+        self.rebuilding = bool(st.get('rebuilding')) if self.stateful else False
+        if self.stateful and ((self.session and not self.workdir) or (not self.session and self.turns)):
             self.rebuild()
 
     def rebuild(self):
@@ -405,6 +407,8 @@ class Backend:
                 reply.meta['raw'] = {'synthetic': {'text': reply.text, 'tools': reply.meta.get('tool_use') or [],
                                                    'models': models, 'audit': reply.meta['audit']}}
             self.turns.append([text, reply.text])
+            if self.stateful and not self.session:
+                self.rebuilding = True
             return reply
 
     async def _call(self, text: str) -> Reply:
