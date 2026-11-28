@@ -402,6 +402,28 @@ class ReferenceBot(SeededBot):
 
 BOTS = {'random': RandomBot, 'station': CallingStation, 'rule': RuleBot, 'reference': ReferenceBot}
 
+_EXTENDED_BOTS_LOADED = False
+
+
+def all_bots() -> dict:
+    """Core bots plus v2 solver, forensic, and ablation bots (loaded lazily to avoid import cycles)."""
+    global _EXTENDED_BOTS_LOADED
+    if not _EXTENDED_BOTS_LOADED:
+        _EXTENDED_BOTS_LOADED = True
+        for mod_name, attr in (('solver', 'SOLVER_BOTS'), ('forensics', 'FORENSIC_BOTS'), ('scorecard', 'ABLATION_BOTS')):
+            try:
+                mod = __import__(f'{__package__}.{mod_name}', fromlist=[attr])
+                for k, v in getattr(mod, attr, {}).items():
+                    BOTS.setdefault(k, v)
+            except Exception:
+                pass
+        try:
+            from .solver import SlumbotBot
+            BOTS.setdefault('slumbot', SlumbotBot)
+        except Exception:
+            pass
+    return BOTS
+
 
 def make_agent(player_id: str, spec: dict, seed: int = 0) -> Agent:
     """An agent from a player entry in players.toml: {bot = "rule"} or {backend = "claude", model = ...}."""
@@ -409,7 +431,8 @@ def make_agent(player_id: str, spec: dict, seed: int = 0) -> Agent:
     spec.pop('label', None)
     spec.pop('description', None)
     if 'bot' in spec:
-        agent = BOTS[spec['bot']](seed=seed, **{k: v for k, v in spec.items() if k != 'bot'})
+        bots = BOTS if spec['bot'] in BOTS else all_bots()
+        agent = bots[spec['bot']](seed=seed, **{k: v for k, v in spec.items() if k != 'bot'})
         agent.spec = {**spec, 'seed': seed}
         return agent
     if 'backend' not in spec:

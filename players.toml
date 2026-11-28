@@ -85,3 +85,23 @@ bot = "rule"      # equity vs pot odds, value bets, never bluffs
 [players.reference]
 label = "Reference bot"
 bot = "reference" # fixed, versioned (reference-1): tight-aggressive, position-aware, equity vs range and pot odds
+
+[players.gto]
+label = "GTO DCFR bot"
+bot = "gto"       # approximate-Nash DCFR solver baseline
+
+[players.noisy_gto]
+label = "Noisy GTO bot"
+bot = "noisy_gto" # deliberately degraded GTO baseline (20% noise) for calibration ladders
+
+[players.lbr]
+label = "Local Best Response"
+bot = "lbr"       # Lisý & Bowling lookahead best-response exploiter
+
+[players.exploiter]
+label = "Adaptive Exploiter"
+bot = "exploiter" # tracks opponent VPIP/fold/river rates and exploits leaks
+
+[players.canary_injector]
+label = "Canary Injector"
+bot = "canary_injector" # plays solid poker while injecting prompt-injection canaries via table talk

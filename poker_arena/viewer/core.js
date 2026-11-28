@@ -761,7 +761,219 @@
       checked: !c.length || c.some(x => x.status === 'verified') };
   }
 
-  return { STABLE_NOTE, dealSequence, sequenceSwings, sequenceTotals, standingBlocks, cycleResults, cohorts, cohortName, protocolOf, populationOf, testOf, isFallback, provenanceOf, leakNote, quizOf, firstDifference, bigSwings, IDENTITY, esc, MINUS, signed, plural, trim, approx, nameParts, family, isContract, normalize, verdict, verdictSides, powerLine, correction, actText,
+
+  // ---- v2: the six-axis scorecard, the solver overlay, forensic status, the planner ---------------------
+  const AXIS_ORDER = ['intelligence', 'wisdom', 'endurance', 'creativity', 'knowledge', 'alignment'];
+  const AXIS_META = {
+    intelligence: ['INTELLIGENCE', 'able to reason and solve hard problems'],
+    wisdom: ['WISDOM', 'knowing when to act, ask, verify, change course, or stop'],
+    endurance: ['ENDURANCE', 'sticking to a task, following instructions, checking edge cases'],
+    creativity: ['CREATIVITY', 'finding new approaches and ideas'],
+    knowledge: ['KNOWLEDGE', 'remembering relevant facts and concepts, storing and reading memory'],
+    alignment: ['ALIGNMENT', 'follow both instructions and intent of those instructions'],
+  };
+  const PIPS = 20;
+  const clampPip = x => Math.max(0, Math.min(PIPS, Math.round(Number(x) || 0)));
+
+  // The 20 segments of an axis bar: 'solid' up to the low end of the 95% interval (or the score, with no
+  // interval), 'band' across the interval, 'empty' after it.
+  function pipSegments(ax) {
+    if (!ax || (ax.pips == null && ax.score == null)) return Array(PIPS).fill('empty');
+    const pips = clampPip(ax.pips ?? ax.score);
+    const low = ax.pips_low != null ? clampPip(ax.pips_low) : pips;
+    const high = Math.max(ax.pips_high != null ? clampPip(ax.pips_high) : low, low);
+    return Array.from({ length: PIPS }, (_, i) => i < low ? 'solid' : i < high ? 'band' : 'empty');
+  }
+  // What sits beside the bar: '16.4 / 20', '95% CI 14.8–17.9', and whether the sample is thin or missing.
+  function axisReadout(ax) {
+    const ok = ax && ax.score != null && isFinite(ax.score);
+    const ci = ok && ax.ci95 && ax.ci95.length === 2 ? `95% CI ${Number(ax.ci95[0]).toFixed(1)}–${Number(ax.ci95[1]).toFixed(1)}` : '';
+    return { score: ok ? `${Number(ax.score).toFixed(1)} / ${PIPS}` : '–', ci, status: ax ? ax.status : 'insufficient_data',
+      low: !!ax && ax.status === 'low_sample', none: !ok || ax.status === 'insufficient_data' };
+  }
+  // The axes in sheet order with their titles, from the scorecard's own list when it has one.
+  function axisList(sc) {
+    const given = Object.fromEntries(((sc && sc.axes) || []).map(a => [a.axis, a]));
+    return AXIS_ORDER.map(k => ({ axis: k, label: (given[k] && given[k].label) || AXIS_META[k][0],
+      subtitle: (given[k] && given[k].subtitle) || AXIS_META[k][1], anchors: (given[k] && given[k].anchors) || null }));
+  }
+  // The hand an evidence item points to, as a page of the viewer: the match under the run, deal = hand + 1.
+  function evidenceHref(run, ev) {
+    const id = String(ev.match_id || '');
+    const full = !run || run === '.' || id.startsWith(run + '/') ? id : `${run}/${id}`;
+    return `#/r/${encodeURIComponent(run || '.')}/m/${encodeURIComponent(full)}${ev.hand != null ? `?deal=${Number(ev.hand) + 1}` : ''}`;
+  }
+  const EVIDENCE_KIND = { ev_loss: 'Blunder', late_blunder: 'Late blunder', exemplar: 'Exemplar', best: 'Exemplar', incident: 'Incident' };
+  const evidenceKind = k => EVIDENCE_KIND[k] || String(k || 'evidence').replace(/_/g, ' ').replace(/^./, c => c.toUpperCase());
+  // A subscore's share of its axis, for the drawer's weight column: '60%'.
+  const weightText = w => w == null ? '' : `${Math.round(Number(w) * 100)}%`;
+
+  // Reliability words for one axis' split-half record.
+  function reliability(x) {
+    if (!x || x.spearman_brown == null) return { tone: 'quiet', text: 'too few players to say' };
+    const sb = Number(x.spearman_brown).toFixed(2);
+    return x.reliable === false ? { tone: 'warn', text: `unreliable · Spearman-Brown ${sb}` } : { tone: 'ok', text: `reliable · Spearman-Brown ${sb}` };
+  }
+  // The inter-axis correlations as rows of cells in sheet order; null where undefined.
+  function corrMatrix(psy) {
+    const m = (psy && psy.inter_axis_corr) || {};
+    return AXIS_ORDER.map(a => AXIS_ORDER.map(b => (m[a] && m[a][b] != null) ? Number(m[a][b]) : null));
+  }
+
+  // ---- the solver's reading of one decision --------------------------------------------------------
+  const BLUNDER_MBB = 250;
+  function evBadge(d) {
+    if (!d) return null;
+    const loss = d.ev_loss_mbb;
+    if (d.is_blunder || (loss != null && loss >= BLUNDER_MBB)) return { kind: 'blunder', text: 'BLUNDER' };
+    if (d.is_indifferent) return { kind: 'indifferent', text: 'INDIFFERENT' };
+    return null;
+  }
+  // GTO frequencies as [{action, freq, taken}] largest first, dropping dust.
+  function gtoBars(d) {
+    return Object.entries((d && d.gto_freqs) || {}).filter(([, f]) => f > 0.005).map(([action, freq]) => ({ action, freq, taken: action === d.taken_action }))
+      .sort((a, b) => b.freq - a.freq);
+  }
+  const pctText = x => x == null ? '–' : `${Math.round(x * 100)}%`;
+  // The decision a replay is on: the last action at or before step k of the play's log, else the next one.
+  // Actions of the log and of the solver's `decisions` line up one to one (action_idx).
+  function decisionAt(log, decisions, k) {
+    const acts = (log || []).filter(e => e.kind === 'action');
+    if (!acts.length) return null;
+    let i = -1;
+    acts.forEach((e, n) => { if (e.step <= k) i = n; });
+    const idx = i < 0 ? 0 : i;
+    const byIdx = (decisions || []).find(d => d.action_idx === idx) || (decisions || [])[idx] || null;
+    return { index: idx, action: acts[idx], decision: byIdx, upcoming: i < 0 };
+  }
+  // AIVAT's reading of a hand for seat `seat`: how many chips of luck it removes, in big blinds.
+  function aivatPill(av, seat, bb = 2) {
+    if (!av || !av.luck_correction) return null;
+    const luck = Number(av.luck_correction[seat]) || 0;
+    const bbs = luck / (bb || 2);
+    return { luck_bb: bbs, text: Math.abs(bbs) < 0.05 ? 'AIVAT: no luck to remove' : `AIVAT: ${bbs > 0 ? 'ran lucky' : 'ran unlucky'} ${Math.abs(bbs).toFixed(1)} bb`,
+      allin: !!av.all_in, street: av.all_in_street || null };
+  }
+
+  // ---- what changed in the notes a model keeps, word by word (an LCS diff, capped for long notes) ----
+  function noteDiff(before, after) {
+    const A = String(before || '').split(/\s+/).filter(Boolean).slice(0, 300), B = String(after || '').split(/\s+/).filter(Boolean).slice(0, 300);
+    const n = A.length, m = B.length;
+    const L = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
+    for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) L[i][j] = A[i] === B[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+    const out = [];
+    const push = (t, text) => { const l = out[out.length - 1]; if (l && l.t === t) l.text += ' ' + text; else out.push({ t, text }); };
+    let i = 0, j = 0;
+    while (i < n && j < m) {
+      if (A[i] === B[j]) { push('same', B[j]); i++; j++; }
+      else if (L[i + 1][j] >= L[i][j + 1]) push('del', A[i++]);
+      else push('add', B[j++]);
+    }
+    while (i < n) push('del', A[i++]);
+    while (j < m) push('add', B[j++]);
+    return out;
+  }
+  const noteChanged = segs => segs.some(x => x.t !== 'same');
+
+  // ---- forensic status for the standings pill ---------------------------------------------------------
+  function forensicsPill(fs) {
+    if (!fs) return null;
+    const n = fs.total_incidents || 0, flagged = (fs.flagged_players || []).length;
+    if (!n) return { tone: 'ok', text: 'Clean · 0 incidents', total: 0, flagged: 0 };
+    return { tone: n >= 5 || flagged >= 2 ? 'bad' : 'warn', text: `${n} incident${n === 1 ? '' : 's'} · ${flagged} flagged`, total: n, flagged };
+  }
+  const CHANNELS = [['sandbox', 'Sandbox & tools'], ['prompt_injection', 'Table-talk prompt injection'], ['parser_fuzzing', 'Parser fuzzing'], ['covert_intent', 'Covert private intent']];
+
+  // ---- the meta-game: Nash averaging, alpha-Rank, cycles -------------------------------------------------
+  function metaRows(meta) {
+    if (!meta || meta.available === false) return null;
+    const nash = meta.nash || meta.nash_averaging || {}, alpha = meta.alpha_rank || {};
+    const players = meta.players || nash.players || alpha.players || [];
+    if (!players.length) return null;
+    const rows = players.map(p => ({ player: p, weight: (nash.nash_weights || {})[p] ?? null, score: (nash.nash_scores || {})[p] ?? null,
+      mass: (alpha.stationary || {})[p] ?? null }));
+    rows.forEach(r => { r.nash_rank = (nash.ranking || []).indexOf(r.player) + 1 || null; r.alpha_rank = (alpha.ranking || []).indexOf(r.player) + 1 || null; });
+    rows.sort((a, b) => (a.nash_rank || 99) - (b.nash_rank || 99));
+    return { rows, cycles: meta.cycles || [], nonTransitive: !!meta.non_transitive || (meta.cycles || []).length > 0, alpha: alpha.alpha ?? null,
+      residual: nash.residual ?? null };
+  }
+  const cycleText = (cycle, label = x => x) => cycle.concat(cycle.slice(0, 1)).map(label).join(' > ');
+  // AIVAT's estimate for one pairing, in either order of its players: {raw, aivat, se, vr, multiplier} in bb/100 for `a`.
+  function aivatOf(av, a, b) {
+    const pr = av && (av.pairings || []).find(x => (x.a === a && x.b === b) || (x.a === b && x.b === a));
+    if (!pr) return null;
+    const f = pr.a === a ? 1 : -1;
+    return { raw: f * pr.raw_bb100, raw_se: pr.raw_se, aivat: f * pr.aivat_bb100, se: pr.aivat_se, vr: pr.variance_reduction_ratio,
+      multiplier: pr.effective_sample_multiplier, deals: pr.deals };
+  }
+
+  // ---- the planner, offline: the same questions the server answers, by closed formulas ---------------------
+  // The inverse of the standard normal CDF (Acklam's approximation).
+  function zOf(p) {
+    const a = [-39.69683028665376, 220.9460984245205, -275.9285104469687, 138.357751867269, -30.66479806614716, 2.506628277459239];
+    const b = [-54.47609879822406, 161.5858368580409, -155.6989798598866, 66.80131188771972, -13.28068155288572];
+    const c = [-0.007784894002430293, -0.3223964580411365, -2.400758277161838, -2.549732539343734, 4.374664141464968, 2.938163982698783];
+    const d = [0.007784695709041462, 0.3224671290700398, 2.445134137142996, 3.754408661907416];
+    const lo = 0.02425;
+    if (p < lo) { const q = Math.sqrt(-2 * Math.log(p)); return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1); }
+    if (p > 1 - lo) { const q = Math.sqrt(-2 * Math.log(1 - p)); return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1); }
+    const q = p - 0.5, r = q * q;
+    return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1);
+  }
+  const PLAN_DEFAULTS = { players: 4, deals: 50, replicates: 25, target: 50, stack: 100, alpha: 0.05, aivat_vr: 1, sd: 350, track: 'official' };
+  const PLAN_RANGE = { players: [2, 12], deals: [2, 200], replicates: [1, 200], target: [15, 150], stack: [20, 200], alpha: [0.001, 0.2], aivat_vr: [1, 5], sd: [100, 1000] };
+  const CALLS_PER_HAND = 5, SECONDS_PER_CALL = 12, CONCURRENCY = 2;
+  function planParams(q = {}) {
+    const track = q.track === 'adaptation' ? 'adaptation' : 'official';
+    const get = (k, d) => { const lo = PLAN_RANGE[k][0], hi = PLAN_RANGE[k][1], v = Number(q[k] ?? d); return Math.max(lo, Math.min(hi, isFinite(v) ? v : d)); };
+    return { track, players: Math.round(get('players', 4)), deals: track === 'official' ? 1 : Math.round(get('deals', 50)),
+      replicates: Math.round(get('replicates', track === 'official' ? 25 : 4)), target: get('target', 50), stack: Math.round(get('stack', 100)),
+      alpha: get('alpha', 0.05), aivat_vr: get('aivat_vr', 1), sd: get('sd', 350) };
+  }
+  const gcol = x => Number(x.toPrecision(3));
+  function planCommand(p) {
+    const names = Array.from({ length: p.players }, (_, i) => `model${i + 1}`).join(' ');
+    const parts = ['python -m poker_arena plan', names, `--tracks ${p.track}`];
+    if (p.track === 'official') parts.push('--deals 1', `--replicates ${p.replicates}`);
+    else parts.push(`--adaptation-deals ${p.deals}`, `--adaptation-replicates ${p.replicates}`);
+    parts.push(`--stack ${2 * p.stack}`, `--target-edge ${gcol(p.target)}`, `--alpha ${gcol(p.alpha)}`, `--prior-sd ${gcol(p.sd)}`, `--out runs/${p.track}-run`, '--write plan.json');
+    return parts.join(' ');
+  }
+  // An estimate of what the server's simulation gives: the official test's conversations from the betting
+  // bar (calibrated on the default plan), the adaptation gate's from a t-test at the same bar.
+  function planFallback(raw) {
+    const p = planParams(raw);
+    const pairings = p.players * (p.players - 1) / 2;
+    const alphaPairing = p.alpha / pairings;
+    const threshold = 2 / alphaPairing;
+    const R = p.track === 'official' ? 1 : p.deals, icc = 0.01, ar1 = 0.2;
+    let de = 1;
+    for (let k = 1; k < R; k++) de += 2 * (1 - k / R) * Math.pow(ar1, k);
+    const sdConv = Math.sqrt(icc * p.sd * p.sd + (1 - icc) * p.sd * p.sd * de / R);
+    let conv;
+    if (p.track === 'official') conv = 6.1 * Math.pow(p.sd / p.target, 2) * Math.log(threshold);
+    else { const z = zOf(1 - alphaPairing / 16) + zOf(0.8); conv = 1.34 * z * z * Math.pow(sdConv / p.target, 2); }
+    conv = Math.max(p.track === 'official' ? 10 : 12, Math.ceil(conv));
+    const rounds = Math.max(1, Math.ceil(conv / p.replicates));
+    const convPairing = rounds * p.replicates, dealsPairing = convPairing * R, handsPairing = 2 * dealsPairing;
+    const handsTotal = handsPairing * pairings, calls = handsTotal * CALLS_PER_HAND, vr = p.aivat_vr;
+    return { params: p, track: p.track, approximate: true, pairings, round_deals: R, replicates: p.replicates, max_rounds: rounds,
+      conversations_per_pairing: convPairing, deals_per_pairing: dealsPairing, hands_per_pairing: handsPairing, hands_total: handsTotal,
+      conversations_total: convPairing * pairings, raw_deals_per_pairing: dealsPairing,
+      aivat_effective_deals_per_pairing: Math.round(dealsPairing / vr * 10) / 10, aivat_deals_saved_per_pairing: Math.round((dealsPairing - dealsPairing / vr) * 10) / 10,
+      aivat_hands_total: Math.round(handsTotal / vr), aivat_vr: vr, alpha_pairing: alphaPairing, threshold,
+      stopping_boundary: { rule: p.track === 'official' ? 'betting confidence sequence' : 'model-based gate', threshold, alpha_pairing: alphaPairing, formula: '2 / alpha_pairing' },
+      power_scenarios: [], power_at_max: 0.8, underpowered: false,
+      estimated_calls: Math.round(calls), estimated_calls_with_aivat: Math.round(calls / vr),
+      estimated_runtime_hours: Math.round(calls * SECONDS_PER_CALL / CONCURRENCY / 360) / 10,
+      estimated_runtime_hours_with_aivat: Math.round(calls / vr * SECONDS_PER_CALL / CONCURRENCY / 360) / 10,
+      assumptions: { calls_per_hand: CALLS_PER_HAND, seconds_per_call: SECONDS_PER_CALL, concurrency: CONCURRENCY }, command: planCommand(p) };
+  }
+  const hoursText = h => h == null ? '–' : h < 1 ? `${Math.max(1, Math.round(h * 60))} min` : h < 48 ? `${trim(h)} h` : `${trim(Math.round(h / 24 * 10) / 10)} days`;
+
+  return { AXIS_ORDER, AXIS_META, PIPS, BLUNDER_MBB, CHANNELS, PLAN_DEFAULTS, PLAN_RANGE, pipSegments, axisReadout, axisList, evidenceHref, evidenceKind, weightText, reliability, corrMatrix,
+    evBadge, gtoBars, pctText, decisionAt, aivatPill, noteDiff, noteChanged, forensicsPill, metaRows, cycleText, aivatOf, zOf, planParams, planCommand, planFallback, hoursText,
+    STABLE_NOTE, dealSequence, sequenceSwings, sequenceTotals, standingBlocks, cycleResults, cohorts, cohortName, protocolOf, populationOf, testOf, isFallback, provenanceOf, leakNote, quizOf, firstDifference, bigSwings, IDENTITY, esc, MINUS, signed, plural, trim, approx, nameParts, family, isContract, normalize, verdict, verdictSides, powerLine, correction, actText,
     isDecided, decidedLeader, driftQualified, countsForLeader, driftWords, officialInterval, ciKind, DESCRIPTIVE_TIP, spotPrompt, spotTitle, handCode, playerId, rateOf, targetEdge, isUnregistered, scenarios, conversationsShort,
     assumptionsOf, ineligible, sourceOf, basisOf, fitOf, identityOf, ASSUME };
 });

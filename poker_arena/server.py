@@ -13,6 +13,10 @@ mixing a smoke test with a tournament makes neither readable.
                                     cache at once (its `cache` key says whether it is current); when a record file
                                     changed it is recomputed in the background. 202 {pending} the first time only.
     /api/quiz?run=RUN               the run's poker-fundamentals quiz (quiz.json), when it has one
+    /api/scorecard?run=RUN          the six-axis character sheet of every player (scorecard.py), cached like the ratings
+    /api/forensics?run=RUN          the four-channel adversarial audit and the interface-vs-strategy EV split
+    /api/hand_eval?id=MATCH&hand=H  one hand replayed through the solver, with its AIVAT luck adjustment
+    /api/plan_preview?players=N&... the pre-flight planner: deals, hands, calls, time and power of a design
 The run `*` is every run together: its leaderboard comes from the history database (history.py), one player
 per model and reasoning level, and keeps runs whose folders have since been deleted.
 Running matches are followed live: the app polls while a match is unfinished. Conversations are summarized once
@@ -38,7 +42,15 @@ LIVE_SECONDS = 180    # a match without a result that wrote an event this recent
 PACE_SECONDS = 1800   # the ETA uses the pace over the last half hour of finished hands
 
 
-BOT_NAMES = {'random': 'Random bot', 'station': 'Calling station', 'rule': 'Rule bot', 'reference': 'Reference bot'}
+BOT_NAMES = {
+    'random': 'Random bot', 'station': 'Calling station', 'rule': 'Rule bot', 'reference': 'Reference bot',
+    'gto': 'GTO DCFR bot', 'noisy_gto': 'Noisy GTO bot', 'lbr': 'Local Best Response', 'exploiter': 'Adaptive Exploiter',
+    'slumbot': 'Slumbot', 'rps_rock': 'Rock (cycle)', 'rps_paper': 'Paper (cycle)', 'rps_scissors': 'Scissors (cycle)',
+    'canary_injector': 'Canary Injector', 'redteam_injector': 'Red-Team Injector',
+    'redteam_fuzzer': 'Red-Team Fuzzer', 'redteam_schemer': 'Red-Team Schemer', 'redteam_tool': 'Red-Team Tooler',
+    'fatigue': 'Fatigue bot', 'amnesiac': 'Amnesiac bot', 'notetaker': 'Note-Taker bot',
+    'random_spewer': 'Random Spewer', 'mixed_creative': 'Mixed Creative bot',
+}
 FAMILIES = {'claude': 'Claude', 'codex': 'GPT', 'agy': 'Gemini', 'gemini': 'Gemini'}
 LABELS: dict = {}   # labels from the current players.toml, which win over the ones recorded in old runs
 PLAYERS_FILE = ['players.toml']
@@ -826,7 +838,299 @@ def ratings_for(root: Path, run, boot=200):
     r['labels'] = {**labels, **(r.get('labels') or {})}
     r['kinds'] = {**kinds, **(r.get('kinds') or {})}
     r['run_audit'] = audit(root, key)
+    r.update(_v2_extras(base))
     return r
+
+
+def _v2_extras(base: Path) -> dict:
+    """What the v2 modules add to a run's ratings, each None until its module (and the run) can give it:
+    the meta-game ranking, a lightweight forensic summary and the AIVAT estimates. Never raises."""
+    out = {'meta_rank': None, 'forensics_summary': None, 'aivat': None}
+    try:
+        out['forensics_summary'] = forensics_summary(base)
+    except Exception:
+        pass
+    mr = _optional_module('meta_rank')
+    sc = _optional_module('scorecard')
+    if mr is not None and sc is not None:
+        try:
+            pairs = sc._pairings(base)
+            out['meta_rank'] = mr.meta_rankings(pairs) if pairs else None
+        except Exception:
+            pass
+    av = _optional_module('aivat')
+    if av is not None:
+        try:
+            out['aivat'] = av.evaluate_run_aivat(base)
+        except Exception:
+            pass
+    return out
+
+
+# ---- v2: scorecards, forensics, solver hand evaluation and the pre-flight planner --------------------------------
+
+def _optional_module(name: str):
+    """A v2 module, or None while it is not there yet (or fails to import): every v2 answer degrades cleanly."""
+    import importlib
+    try:
+        return importlib.import_module(f'.{name}', __package__)
+    except Exception:
+        return None
+
+
+def _run_base(root: Path, run) -> Path | None:
+    base = root if run in (None, '', '.') else (root / run).resolve()
+    return base if base == root or root in base.parents else None
+
+
+def _run_labels(root: Path, run) -> tuple[dict, dict]:
+    labels, kinds = {}, {}
+    for m in _runs_and_matchups(root, run if run not in (None, '') else '.').get(run if run not in (None, '') else '.', []):
+        labels.update(m['labels'])
+        kinds.update(m['kinds'])
+    return {**labels, **{p: v for p, v in LABELS.items() if p in labels}}, kinds
+
+
+def scorecard_for(root: Path, run, solver='dcfr') -> dict | None:
+    """The six-axis scorecard of a run with display labels and kinds merged in; None for a run outside the root."""
+    from . import history
+    if run == history.ALL:
+        return None
+    base = _run_base(root, run)
+    if base is None or not base.exists():
+        return None
+    mod = _optional_module('scorecard')
+    if mod is None:
+        return {'available': False, 'reason': 'poker_arena/scorecard.py is not available', 'players': {}, 'axes': []}
+    data = mod.build_scorecard(base, solver=solver)
+    labels, kinds = _run_labels(root, run)
+    data['labels'] = labels
+    data['kinds'] = {**kinds, **{p: v.get('kind') for p, v in data.get('players', {}).items() if v.get('kind')}}
+    data['run'] = run if run not in (None, '') else '.'
+    return data
+
+
+def _forensics_labelled(root: Path, run) -> dict | None:
+    base = _run_base(root, run)
+    mod = _optional_module('forensics')
+    if base is None or not base.exists() or mod is None:
+        return None
+    data = mod.audit_run_forensics(base)
+    labels, kinds = _run_labels(root, run)
+    data['labels'] = labels
+    data['kinds'] = kinds
+    data['run'] = run if run not in (None, '') else '.'
+    return data
+
+
+FORENSICS_MEMO: dict = {}
+
+
+def forensics_for(root: Path, run) -> dict | None:
+    """The four-channel forensic audit with display labels, kept in memory until a record file of the run changes."""
+    from . import history
+    if run == history.ALL:
+        return None
+    base = _run_base(root, run)
+    if base is None:
+        return None
+    stamp = repr(signature(base, PLAYERS_FILE[0]))
+    hit = FORENSICS_MEMO.get((str(root), run))
+    if hit and hit[0] == stamp:
+        return hit[1]
+    data = _forensics_labelled(root, run)
+    if data is not None:
+        FORENSICS_MEMO[(str(root), run)] = (stamp, data)
+    return data
+
+
+def forensics_summary(base: Path) -> dict | None:
+    """The small part of the audit the standings show: incident counts per channel and who is flagged."""
+    mod = _optional_module('forensics')
+    if mod is None:
+        return None
+    try:
+        s = mod.audit_run_forensics(base)
+    except Exception:
+        return None
+    summary = s.get('summary') or {}
+    return {'total_incidents': summary.get('total_incidents', 0), 'flagged_players': summary.get('flagged_players', []),
+            'channels': {c: (v or {}).get('incidents', 0) for c, v in (summary.get('channels') or {}).items()},
+            'players': {p: {'total_incidents': v.get('total_incidents', 0), 'clean': v.get('clean', True)}
+                        for p, v in (s.get('players') or {}).items()}}
+
+
+def _compute_scorecard_in_child(root: str, run, players_file: str, labels: dict):
+    LABELS.update(labels)
+    PLAYERS_FILE[0] = players_file
+    return scorecard_for(Path(root), run)
+
+
+HAND_EVALS: dict = {}
+
+
+def _fallback_decisions(rec: dict, config: dict, events: list) -> list:
+    """Pot odds, minimum defence frequency and a rough equity for each decision, from the hand record alone,
+    for when the solver cannot be used."""
+    from . import cards
+    import random as _random
+    players = config.get('players') or []
+    rng = _random.Random(rec.get('seed') or 0)
+    bb = (config.get('game') or {}).get('big_unit') or (config.get('game') or {}).get('bb') or 2
+    board_all = list(rec.get('board') or [])
+    out = []
+    for i, a in enumerate(rec.get('actions') or []):
+        seat = a.get('seat', 0)
+        street = a.get('street') or 'preflop'
+        shown = board_all[:{'preflop': 0, 'flop': 3, 'turn': 4, 'river': 5}.get(street, len(board_all))]
+        hole = (rec.get('hole') or [[], []])[seat]
+        to_call, pot = a.get('to_call') or 0, a.get('pot_before') or 0
+        try:
+            eq = round(cards.equity(hole, shown, rng, sims=150), 3)
+        except Exception:
+            eq = None
+        out.append({'street': street, 'solver': 'pot_odds', 'pot_bb': round(pot / bb, 2), 'to_call_bb': round(to_call / bb, 2),
+                    'pot_odds': round(to_call / (pot + to_call), 3) if to_call else 0.0,
+                    'mdf': round(pot / (pot + to_call), 3) if to_call else 1.0, 'equity': eq, 'best_action': None,
+                    'gto_freqs': {}, 'action_evs_bb': {}, 'taken_action': a.get('action'), 'ev_loss_mbb': None,
+                    'is_blunder': False, 'is_indifferent': False, 'seat': seat,
+                    'player': players[seat] if seat < len(players) else None, 'decision_id': a.get('decision_id'),
+                    'action_idx': i, 'amount': a.get('amount'), 'board': shown, 'hole': hole})
+    return out
+
+
+def hand_eval(root: Path, mid: str, hand: int) -> dict | None:
+    """One recorded hand, replayed through the solver (`solver.evaluate_hand`) with the AIVAT luck adjustment
+    (`aivat.aivat_hand`): {hand, decisions, per_seat_ev_loss_mbb, aivat, source}. When the solver is missing or
+    fails, the decisions carry pot odds, MDF and an equity estimate only, and `source` says so."""
+    d = (root / mid).resolve()
+    if root not in d.parents or not (d / 'config.json').exists():
+        return None
+    stamp = (_mtime(d / 'hands.jsonl'), _mtime(d / 'events.jsonl'))
+    hit = HAND_EVALS.get((str(d), hand))
+    if hit and hit[0] == stamp:
+        return hit[1]
+    rec = next((h for h in _lines(d / 'hands.jsonl') if h.get('hand') == hand), None)
+    if rec is None:
+        return None
+    config = _json(d / 'config.json') or {}
+    events = [e for e in _lines(d / 'events.jsonl') if e.get('episode', 0) == hand]
+    game = config.get('game') or {}
+    players = config.get('players') or []
+    out = {'hand': hand, 'players': players, 'decisions': [], 'per_seat_ev_loss_mbb': [None, None], 'aivat': None,
+           'source': 'solver', 'note': None}
+    sol = _optional_module('solver')
+    try:
+        if sol is None:
+            raise RuntimeError('poker_arena/solver.py is not available')
+        ev = sol.evaluate_hand(rec, events=events, solver='dcfr')
+        out['decisions'] = ev.get('decisions', [])
+        out['per_seat_ev_loss_mbb'] = ev.get('per_seat_ev_loss_mbb', [None, None])
+        for x in out['decisions']:
+            if x.get('seat') is not None and x['seat'] < len(players):
+                x['player_id'] = players[x['seat']]
+    except Exception as e:
+        out['source'] = 'pot_odds'
+        out['note'] = f'solver unavailable ({type(e).__name__}); showing pot odds and a rough equity only'
+        out['decisions'] = _fallback_decisions(rec, config, events)
+    av = _optional_module('aivat')
+    if av is not None:
+        try:
+            x = av.aivat_hand(rec, bb=game.get('big_unit') or game.get('bb') or 2, stack=game.get('stack') or 200)
+            out['aivat'] = {k: v for k, v in x.items() if k != 'equities'}
+        except Exception:
+            out['aivat'] = None
+    HAND_EVALS[(str(d), hand)] = (stamp, out)
+    return out
+
+
+CALLS_PER_HAND = 5.0      # model decisions per hand, both seats together, counting the occasional retry
+SECONDS_PER_CALL = 12.0   # a typical reasoning-model reply
+PLAN_PREVIEWS: dict = {}
+
+
+def plan_command(p: dict) -> str:
+    names = ' '.join(f'model{i + 1}' for i in range(p['players']))   # the stack is in big blinds here, chips (2 a blind) on the command line
+    parts = ['python -m poker_arena plan', names, f'--tracks {p["track"]}']
+    if p['track'] == 'official':
+        parts += ['--deals 1', f'--replicates {p["replicates"]}']
+    else:
+        parts += [f'--adaptation-deals {p["deals"]}', f'--adaptation-replicates {p["replicates"]}']
+    parts += [f'--stack {2 * p["stack"]}', f'--target-edge {p["target"]:g}', f'--alpha {p["alpha"]:g}', f'--prior-sd {p["sd"]:g}',
+              f'--out runs/{p["track"]}-run', '--write plan.json']
+    return ' '.join(parts)
+
+
+def plan_params(q: dict) -> dict:
+    """The planner's inputs from a query string (each value a list, as parse_qs gives them), clamped to the ranges
+    the page offers."""
+    def num(name, default, lo, hi, cast=float):
+        try:
+            v = cast(float(q.get(name, [default])[0]))
+        except (TypeError, ValueError):
+            v = cast(default)
+        return max(lo, min(hi, v))
+    track = q.get('track', ['official'])[0]
+    track = track if track in ('official', 'adaptation') else 'official'
+    return {'players': num('players', 4, 2, 12, int), 'track': track,
+            'deals': 1 if track == 'official' else num('deals', 50, 2, 200, int),
+            'replicates': num('replicates', 25 if track == 'official' else 4, 1, 200, int),
+            'target': num('target', 50, 15, 150), 'stack': num('stack', 100, 20, 200, int),
+            'alpha': num('alpha', 0.05, 0.001, 0.2), 'aivat_vr': num('aivat_vr', 1.0, 1.0, 5.0),
+            'sd': num('sd', 350, 100, 1000)}
+
+
+def plan_preview(p: dict) -> dict:
+    """The planner's answer for plan_params `p`: the design the official (or adaptation) track would get, in raw
+    duplicate deals and, with the expected AIVAT variance reduction, in effective deals; its price and its
+    power. Read-only: nothing is written."""
+    from .ratings import normalize_design
+    from .runner import make_tournament
+    memo = tuple(sorted(p.items()))
+    if memo in PLAN_PREVIEWS:
+        return PLAN_PREVIEWS[memo]
+    ids = [f'model{i + 1}' for i in range(p['players'])]
+    shared = {'alpha': p['alpha'], 'target_edge_bb100': p['target'], 'prior_sd_bb100': p['sd']}
+    spec = {'deals': p['deals'], 'replicates': p['replicates'], 'design': shared}
+    doc = make_tournament(ids, out='runs/preview', tracks=[p['track']], seed=1000, game_config={'stack': 2 * p['stack']},
+                          **{p['track']: spec})
+    plan = doc['tracks'][p['track']]
+    plan['design'].pop('max_rounds', None)
+    d = normalize_design(plan)
+    pairings = len(plan['matchups'])
+    R, reps, rounds = d['round_deals'], d['replicates'], d['max_rounds']
+    deals_pairing = d.get('max_deals') or R * reps * rounds
+    conv_pairing = d.get('conversations_needed') or reps * rounds
+    vr = p['aivat_vr']
+    hands_pairing = 2 * deals_pairing
+    hands_total = hands_pairing * pairings
+    calls = hands_total * CALLS_PER_HAND
+    concurrency = 2
+    out = {'params': p, 'track': p['track'], 'pairings': pairings,
+           'round_deals': R, 'replicates': reps, 'max_rounds': rounds, 'max_rounds_basis': d.get('max_rounds_basis'),
+           'conversations_per_pairing': conv_pairing, 'deals_per_pairing': deals_pairing,
+           'hands_per_pairing': hands_pairing, 'hands_total': hands_total,
+           'conversations_total': conv_pairing * pairings,
+           'raw_deals_per_pairing': deals_pairing,
+           'aivat_effective_deals_per_pairing': round(deals_pairing / vr, 1),
+           'aivat_deals_saved_per_pairing': round(deals_pairing - deals_pairing / vr, 1),
+           'aivat_hands_total': round(hands_total / vr), 'aivat_vr': vr,
+           'alpha_pairing': d.get('alpha_pairing'), 'threshold': d.get('threshold'),
+           'stopping_boundary': {'rule': 'betting confidence sequence', 'threshold': d.get('threshold'),
+                                 'alpha_pairing': d.get('alpha_pairing'), 'outcome_bound_bb100': d.get('outcome_bound_bb100'),
+                                 'formula': '2 / alpha_pairing'},
+           'power_scenarios': d.get('power_scenarios') or [], 'power_by_edge': d.get('power_by_edge') or {},
+           'power_at_max': d.get('power_at_max'), 'underpowered': d.get('underpowered', False),
+           'official': bool(d.get('official')), 'label': d.get('label'),
+           'estimated_calls': round(calls), 'estimated_calls_with_aivat': round(calls / vr),
+           'estimated_runtime_hours': round(calls * SECONDS_PER_CALL / concurrency / 3600, 1),
+           'estimated_runtime_hours_with_aivat': round(calls / vr * SECONDS_PER_CALL / concurrency / 3600, 1),
+           'assumptions': {'calls_per_hand': CALLS_PER_HAND, 'seconds_per_call': SECONDS_PER_CALL, 'concurrency': concurrency},
+           'command': plan_command(p)}
+    if len(PLAN_PREVIEWS) > 256:
+        PLAN_PREVIEWS.clear()
+    PLAN_PREVIEWS[memo] = out
+    return out
 
 
 def key(s: str) -> str:
@@ -883,6 +1187,14 @@ def export(root, out, players_file='players.toml') -> int:
                 if pr:
                     put(f'pairing-{key(pairing_key(r["run"], a, b))}.json', pr)
         put(f'ratings-{key(r["run"])}.json', ratings_for(root, r['run'], boot=300))
+        if not r.get('all'):
+            for name, fn in (('scorecard', scorecard_for), ('forensics', forensics_for)):
+                try:
+                    obj = fn(root, r['run'])
+                except Exception:
+                    obj = None
+                if obj is not None:
+                    put(f'{name}-{key(r["run"])}.json', obj)
         q = quiz(root, r['run'])
         if q is not None:
             put(f'quiz-{key(r["run"])}.json', q)
@@ -931,6 +1243,9 @@ class RatingsCache:
     before waits, briefly; past that the answer is 'pending' and the page asks again. The computing happens in
     a separate process, so pages and replays are served at full speed meanwhile."""
 
+    child_fn = staticmethod(_compute_in_child)
+    prefix = 'ratings'
+
     def __init__(self, root: Path, players_file='players.toml', compute=None, wait=0.5):
         import threading
         self.root, self.players_file, self.wait = root, players_file, wait
@@ -950,7 +1265,7 @@ class RatingsCache:
             if self.pool is None:
                 self.pool = ProcessPoolExecutor(max_workers=1)
             try:
-                return self.pool.submit(_compute_in_child, str(self.root), run, self.players_file, dict(LABELS)).result()
+                return self.pool.submit(self.child_fn, str(self.root), run, self.players_file, dict(LABELS)).result()
             except BrokenProcessPool:
                 self.pool = None
                 if attempt:
@@ -966,7 +1281,7 @@ class RatingsCache:
         return hashlib.sha256(repr((self.code, signature(self.base(run), self.players_file))).encode()).hexdigest()[:24]
 
     def _file(self, run) -> Path:
-        return self.root / CACHE_DIR / f'ratings-{key(run or ".")}.json'
+        return self.root / CACHE_DIR / f'{self.prefix}-{key(run or ".")}.json'
 
     def _load(self, run):
         hit = self.mem.get(run)
@@ -1053,11 +1368,35 @@ class RatingsCache:
         return 'ok', {**hit['data'], 'cache': meta}
 
 
+class ScorecardCache(RatingsCache):
+    """The same cache for the six-axis scorecards: computed in a separate process, served at once, stamped by the
+    run's record files and the code."""
+    child_fn = staticmethod(_compute_scorecard_in_child)
+    prefix = 'scorecard'
+
+
+def _cache_answer(handler, cache, run):
+    if run == '*':
+        return handler.send(404, '{"error": "the all-runs view has no scorecard; pick a run"}')
+    base = _run_base(cache.root, run)
+    if base is None or not base.is_dir():
+        return handler.send(404, '{"error": "no such run"}')
+    status, data = cache.get(run)
+    if status == 'ok':
+        return handler.send(200, json.dumps(data))
+    if status == 'pending':
+        return handler.send(202, json.dumps({'pending': True, 'run': run}))
+    if status == 'error':
+        return handler.send(500, json.dumps({'error': data}))
+    return handler.send(404, '{"error": "no such run"}')
+
+
 def serve(root, port=8800, host='127.0.0.1', players_file='players.toml'):
     root = Path(root).resolve()  # match folders are resolved before use, so the root must be too
     LABELS.update(load_labels(players_file))
     PLAYERS_FILE[0] = players_file
     cache = RatingsCache(root, players_file)
+    scores = ScorecardCache(root, players_file)
     order = [r['run'] for r in sorted(runs(root), key=lambda r: (bool(r.get('all')), -r['updated']))]
     cache.warm(order)
     warm_conversations(root, [r for r in order if r != '*'])
@@ -1098,6 +1437,20 @@ def serve(root, port=8800, host='127.0.0.1', players_file='players.toml'):
                 if url.path == '/api/quiz':
                     data = quiz(root, run)
                     return self.send(200, json.dumps(data)) if data is not None else self.send(404, '{"error": "no quiz in this run"}')
+                if url.path == '/api/scorecard':
+                    return _cache_answer(self, scores, run)
+                if url.path == '/api/forensics':
+                    data = forensics_for(root, run)
+                    return self.send(200, json.dumps(data)) if data is not None else self.send(404, '{"error": "no such run"}')
+                if url.path == '/api/hand_eval':
+                    try:
+                        hand = int(q.get('hand', ['0'])[0])
+                    except ValueError:
+                        return self.send(400, '{"error": "hand must be a number"}')
+                    data = hand_eval(root, q.get('id', [''])[0], hand)
+                    return self.send(200, json.dumps(data)) if data is not None else self.send(404, '{"error": "no such hand"}')
+                if url.path == '/api/plan_preview':
+                    return self.send(200, json.dumps(plan_preview(plan_params(q))))
                 if url.path == '/api/ratings':
                     status, data = cache.get(run)
                     if status == 'ok':

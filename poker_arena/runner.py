@@ -896,7 +896,14 @@ async def run_duplicate(game, a: tuple[str, dict], b: tuple[str, dict], seeds, o
             for sem in sems:
                 sem.release()
 
-    return await asyncio.gather(one([a, b], 'a-first', 1), one([b, a], 'b-first', 2))
+    tasks = [asyncio.ensure_future(one([a, b], 'a-first', 1)), asyncio.ensure_future(one([b, a], 'b-first', 2))]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:   # one order failed (or this pair was cancelled): the other must not run on, orphaned
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 DESIGN = {'alpha': 0.05, 'block': 10}   # plus round_deals = the plan's deals; max_rounds comes from the power target (ratings.normalize_design)
@@ -1282,10 +1289,12 @@ class Lifecycle:
         self.write()
 
 
-async def run_plan(plan: dict, *, only=None, concurrency=None, log=print, allow_code_change=False):
+async def run_plan(plan: dict, *, only=None, concurrency=None, log=print, allow_code_change=False, sems=None):
     """Every matchup of the plan as duplicate pairs, on the same deals (so every player sees the same
     cards across the whole tournament). `concurrency` caps how many matches use each backend (each CLI)
-    at once, so one subscription's rate limits don't stall the others; bot-only matches run freely.
+    at once, so one subscription's rate limits don't stall the others; bot-only matches run freely. Plans that run
+    at the same time (the tracks of a tournament) pass one `sems` dict, so they share those slots instead of each
+    taking `concurrency` of its own.
 
     The plan's `design` is enforced here, and only through the judge: after each round of a pairing,
     `ratings.adjudicate` judges all of its deals so far with the pairing's eligibility facts (see `eligibility`);
@@ -1377,7 +1386,7 @@ async def run_plan(plan: dict, *, only=None, concurrency=None, log=print, allow_
                                'created': (stored or {}).get('created') or round(time.time())},
            indent=2)  # for the viewer, and the manifest a rerun must match
     life = Lifecycle(out, plan, rounds)
-    sems = {}
+    sems = {} if sems is None else sems   # {backend kind: Semaphore}; shared by plans that run at the same time
     tasks = []
     held = {'reg': reg}
 

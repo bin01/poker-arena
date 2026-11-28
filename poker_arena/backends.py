@@ -51,12 +51,127 @@ import time
 import urllib.request
 from dataclasses import dataclass, field
 
-RATE_LIMIT = re.compile(r'usage limit|rate.?limit|quota|too many requests|429|resource.?exhausted|limit reached'
+RATE_LIMIT = re.compile(r'usage limit|rate.?limit|quota|too many requests|\b429\b|resource.?exhausted|limit reached'
                         r'|try again (?:at|in|later)', re.I)
+_JSON_NUMBER = re.compile(r'"[^"]*"\s*:\s*-?\d[\d.eE+-]*')   # `"input_tokens": 14290`: a number, never an error status
+_ERROR_FIELDS = ('message', 'result', 'detail', 'reason', 'code', 'status', 'type')
 
 
 class BackendError(RuntimeError):
     pass
+
+
+def _error_strings(ev) -> list[str]:
+    """The text of the error an event (or output document) reports: its message-like fields, never its usage numbers."""
+    if not isinstance(ev, dict):
+        return [ev] if isinstance(ev, str) else []
+    err = ev.get('error')
+    if not (ev.get('type') in ('turn.failed', 'error') or ev.get('is_error') or err
+            or ev.get('status') not in (None, 'SUCCESS')):
+        return []
+
+    def fields(d):
+        return [str(d[k]) for k in _ERROR_FIELDS if isinstance(d.get(k), (str, int)) and not isinstance(d.get(k), bool)]
+    return fields(ev) + (fields(err) if isinstance(err, dict) else [err] if isinstance(err, str) else [])
+
+
+def limit_text(raw, msg: str = '') -> str:
+    """The text a rate limit could be read from: a CLI's stderr and the error messages in its output (a failed
+    event's message, a non-JSON line), never the usage numbers and ids in its raw stdout JSON. A failure with no CLI
+    output (an API call) is read from its own message, numeric JSON fields removed."""
+    if not isinstance(raw, dict) or not ('stdout' in raw or 'stderr' in raw):
+        return _JSON_NUMBER.sub('', msg or '')
+    parts, out = [raw.get('stderr') or ''], (raw.get('stdout') or '').strip()
+    try:
+        whole = json.loads(out) if out.startswith('{') else None   # one document (agy), possibly pretty-printed
+    except ValueError:
+        whole = None
+    if isinstance(whole, dict):
+        return '\n'.join(parts + _error_strings(whole))
+    for line in out.splitlines():
+        try:
+            parts += _error_strings(json.loads(line))
+        except ValueError:
+            parts.append(_JSON_NUMBER.sub('', line))
+    return '\n'.join(parts)
+
+
+_DURATION = re.compile(r'(\d+(?:\.\d+)?)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b', re.I)
+_IN = re.compile(r'(?:try again|retry(?: again)?|resets?)\s+(?:in|after)\s+((?:\d+(?:\.\d+)?\s*[a-z]+[,\s]*(?:and\s+)?)+)', re.I)
+_AT = re.compile(r'try again at\s+([^\n]{3,60})', re.I)
+_CLOCK = re.compile(r'(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([ap]\.?m\.?)?', re.I)
+_ISO = re.compile(r'(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}(?::\d{2})?)(Z|[+-]\d{2}:?\d{2})?')
+_DATE = re.compile(r'([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s*(\d{4}))?')
+_EPOCH = re.compile(r'limit reached\s*\|\s*(\d{9,11})\b', re.I)
+_UNIT = {'d': 86400, 'h': 3600, 'm': 60, 's': 1}
+
+
+def retry_wait(text: str, now: float | None = None) -> float | None:
+    """Seconds a rate-limit message says to wait ('try again in 7 minutes', 'in 1h 30m', 'try again at 4:02 PM' or
+    'at Nov 28th, 2026 3:45 PM', an ISO time, Claude's 'limit reached|<epoch>'); None when it names no time."""
+    import datetime as dt
+    now = time.time() if now is None else now
+    if m := _EPOCH.search(text):
+        return max(0.0, int(m[1]) - now) or None
+    if m := _IN.search(text):
+        total = sum(float(n) * _UNIT[u[0].lower()] for n, u in _DURATION.findall(m[1]))
+        return total or None
+    if not (m := _AT.search(text)):
+        return None
+    tail = m[1]
+    try:
+        if iso := _ISO.search(tail):
+            stamp = dt.datetime.fromisoformat(f'{iso[1]}T{iso[2]}' + (iso[3].replace('Z', '+00:00') if iso[3] else ''))
+            return max(0.0, stamp.timestamp() - now) or None
+        clock = _CLOCK.search(tail)
+        if not clock:
+            return None
+        hour, minute = int(clock[1]) % (12 if clock[4] else 24), int(clock[2])
+        if clock[4] and clock[4][0].lower() == 'p':
+            hour += 12
+        local = dt.datetime.fromtimestamp(now)
+        date = _DATE.search(tail)
+        if date:
+            month = dt.datetime.strptime(date[1].title(), '%b').month
+            target = local.replace(year=int(date[3] or local.year), month=month, day=int(date[2]), hour=hour,
+                                   minute=minute, second=0, microsecond=0)
+        else:
+            target = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if target <= local:
+                target += dt.timedelta(days=1)
+        return max(0.0, target.timestamp() - now) or None
+    except (ValueError, OverflowError):
+        return None
+
+
+class RateGate:
+    """One per backend kind (one CLI, one subscription): when a seat hits a rate limit it holds the gate, and every
+    sibling seat waits at it before its next call, instead of each one hitting the limit on its own. A resume time,
+    not an Event, so it works across event loops."""
+
+    def __init__(self):
+        self.until = 0.0
+
+    def hold(self, seconds: float):
+        self.until = max(self.until, time.monotonic() + max(0.0, seconds))
+
+    async def wait(self):
+        while (delay := self.until - time.monotonic()) > 0:
+            held = self.until
+            await asyncio.sleep(delay)
+            if self.until <= held:   # unless another seat extended the hold meanwhile, it is over
+                return
+
+
+_GATES: dict[str, RateGate] = {}
+
+
+def rate_gate(key: str) -> RateGate:
+    return _GATES.setdefault(key, RateGate())
+
+
+def reset_rate_gates():
+    _GATES.clear()
 
 
 _ARTIFACTS: dict = {}
@@ -234,7 +349,9 @@ class Backend:
 
     async def send(self, text: str) -> Reply:
         waited, attempt, failed = 0.0, 0, []
+        gate = rate_gate(self.exe or type(self).__name__)
         while True:
+            await gate.wait()   # a sibling seat of this CLI that hit a rate limit holds everyone here
             payload = self.transcript(text, system=False) if self.rebuilding else text
             start, t, before = time.monotonic(), round(time.time(), 1), self.session
             self.last_call = {}
@@ -253,11 +370,14 @@ class Backend:
                     self.rebuild()
                     rec['rebuilt'] = True
                 failed.append(rec)
-                if RATE_LIMIT.search(msg) and waited < self.max_wait:
-                    rec.update(rate_limited=True, waited=self.rate_limit_wait)
-                    print(f'[{self.label}] rate limited; waiting {self.rate_limit_wait:.0f}s: {msg[:200]}', flush=True)
-                    await asyncio.sleep(self.rate_limit_wait)
-                    waited += self.rate_limit_wait
+                said = limit_text(raw, msg)
+                if RATE_LIMIT.search(said) and waited < self.max_wait:
+                    hint = retry_wait(said)
+                    wait = self.rate_limit_wait if hint is None else min(hint + 2, self.max_wait)
+                    rec.update(rate_limited=True, waited=wait, **({'retry_hint': round(hint)} if hint else {}))
+                    print(f'[{self.label}] rate limited; waiting {wait:.0f}s: {said.strip()[:200]}', flush=True)
+                    gate.hold(wait)   # the wait itself happens at the top of the loop, for this seat and its siblings
+                    waited += wait
                     continue
                 attempt += 1
                 if attempt > self.retries:
@@ -572,7 +692,40 @@ class CodexCLI(Backend):
         if not p['messages']:
             raise BackendError(f'codex returned no message: {out.strip()[-1500:]}')
         meta = {'session': self.session, **_audit_of(p), **({'tool_use': p['tools']} if p['tools'] else {})}
+        echo = await asyncio.to_thread(self.rollout_context, self.session)
+        if echo:   # what the CLI says it ran with: a client-side echo, so identity_match stays 'unattested'
+            meta.update(identity_evidence='client_echo', client_reported_model=echo.get('model'),
+                        client_reported_effort=echo.get('effort'), sandbox_policy=echo.get('sandbox_policy'))
         return Reply(p['messages'][-1], '\n'.join(p['thinking']), p['usage'], meta=meta)
+
+    SESSIONS = os.path.join(os.environ.get('CODEX_HOME') or os.path.expanduser('~/.codex'), 'sessions')
+
+    def rollout_context(self, thread_id: str | None) -> dict | None:
+        """{model, effort, sandbox_policy} of the last `turn_context` in the thread's rollout
+        (`sessions/YYYY/MM/DD/rollout-*-<thread_id>.jsonl`), the turn that just ran; None when it can't be read."""
+        if not thread_id:
+            return None
+        import glob
+        paths = glob.glob(os.path.join(glob.escape(self.SESSIONS), '*', '*', '*', f'rollout-*-{glob.escape(thread_id)}.jsonl'))
+        if not paths:
+            return None
+        last = None
+        try:
+            with open(max(paths, key=os.path.getmtime), 'rb') as f:
+                for line in f:
+                    if b'"turn_context"' in line:
+                        try:
+                            row = json.loads(line)
+                        except ValueError:
+                            continue
+                        if isinstance(row, dict) and row.get('type') == 'turn_context':
+                            last = row.get('payload') if isinstance(row.get('payload'), dict) else row
+        except OSError:
+            return None
+        if not last:
+            return None
+        return {'model': last.get('model'), 'effort': last.get('effort') or last.get('reasoning_effort'),
+                'sandbox_policy': last.get('sandbox_policy')}
 
     @staticmethod
     def parse(out: str) -> dict:
@@ -694,6 +847,30 @@ class AgyCLI(Backend):
             return 'no response to this turn in the transcript'
         return None
 
+    NOT_THIS_TURN = 'transcript not this turn'
+
+    @staticmethod
+    def bind_problem(rows, prompt: str | None, response: str | None, strict: bool = True) -> str | None:
+        """None when the transcript turn is this call's: its user input holds the tail of the prompt sent and its
+        last response says what agy printed. Otherwise 'transcript not this turn' (a late write would leave an
+        earlier turn's rows here). `strict` False (a replay from raw output, which has no prompt) only rejects a
+        response that is there and differs."""
+        users = [r for r in rows or [] if isinstance(r, dict) and r.get('type') == 'USER_INPUT']
+        answers = [r['content'] for r in rows or [] if isinstance(r, dict) and r.get('type') == 'PLANNER_RESPONSE'
+                   and isinstance(r.get('content'), str)]
+        if prompt is not None and users[:1]:
+            tail = prompt.strip()[-200:]
+            if not isinstance(users[0].get('content'), str) or tail not in users[0]['content']:
+                return AgyCLI.NOT_THIS_TURN
+        elif prompt is not None and strict:
+            return AgyCLI.NOT_THIS_TURN
+        if response is not None and answers:
+            if answers[-1].strip() != response.strip():
+                return AgyCLI.NOT_THIS_TURN
+        elif strict and response is not None:
+            return AgyCLI.NOT_THIS_TURN
+        return None
+
     @staticmethod
     def read_turn(rows) -> tuple:
         """(thinking, models, tool calls, audit) of a turn's transcript rows. audit is 'unverified' when there are
@@ -727,7 +904,11 @@ class AgyCLI(Backend):
         if not isinstance(raw, dict) or not isinstance(raw.get('stdout'), str):
             return None
         data = cls._response(raw['stdout']) or {}
-        _, models, tools, audit = cls.read_turn(raw.get('transcript'))
+        rows = raw.get('transcript')
+        _, models, tools, audit = cls.read_turn(rows)
+        if audit == 'verified' and (raw.get('transcript_problem')
+                                    or cls.bind_problem(rows, None, data.get('response') or '', strict=False)):
+            audit = 'unverified'
         return {'text': (data.get('response') or '') if data.get('status') == 'SUCCESS' else None, 'tools': tools,
                 'models': models, 'audit': audit}
 
@@ -757,8 +938,14 @@ class AgyCLI(Backend):
         if rows is not None:
             self.last_call['raw']['transcript'] = rows
         thinking, models, tools, audit = self.read_turn(rows)
+        reason = self.turn_problem(rows)
+        if audit == 'verified':
+            reason = self.bind_problem(rows, prompt, data.get('response') or '')
+            if reason:   # rows that are not this call's say nothing about its tools or its model
+                audit = 'unverified'
+                self.last_call['raw']['transcript_problem'] = reason
         meta = {'session': self.session, 'audit': audit,
-                **({'audit_reason': self.turn_problem(rows)} if audit == 'unverified' else {}), 'observed_model': models[0] if len(models) == 1 else None,
+                **({'audit_reason': reason} if audit == 'unverified' else {}), 'observed_model': models[0] if len(models) == 1 else None,
                 **({'observed_models': models} if models else {}), **({'tool_use': tools} if tools else {})}
         return Reply(data.get('response') or '', thinking, data.get('usage') or {}, meta=meta)
 

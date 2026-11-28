@@ -6,3 +6,6 @@ runs/
 .pytest_cache/
 tests/.tmp/*
 !tests/.tmp/.gitkeep
+.tools/
+.solver-cache/
+
